@@ -478,24 +478,47 @@ export class ToolCallTracker extends EventEmitter {
 
     const { getTerminalManager } =
       await import("../integrations/TerminalManager.js");
-    const state = getTerminalManager().getBackgroundState(terminalId);
+    const tm = getTerminalManager();
+    const state = tm.getBackgroundState(terminalId);
 
     if (!state) {
+      // Terminal not in managed list — try force-reading output as last resort
+      const directOutput = tm.getCurrentOutput(terminalId, { force: true });
       call.forceResolve(
-        makeToolResult({
-          error: `Terminal "${terminalId}" not found. It may have been closed.`,
-        }),
+        makeToolResult(
+          directOutput
+            ? {
+                terminal_id: terminalId,
+                is_running: false,
+                exit_code: null,
+                output_captured: true,
+                output: directOutput,
+                status: "force-completed",
+                message:
+                  "Output returned immediately — wait was interrupted by user.",
+              }
+            : {
+                error: `Terminal "${terminalId}" not found. It may have been closed.`,
+              },
+        ),
       );
       return;
     }
+
+    // Use background state output when captured, otherwise force-read
+    // the output buffer directly (covers foreground terminals that were
+    // never transitioned to background mode).
+    const output = state.output_captured
+      ? state.output
+      : (tm.getCurrentOutput(terminalId, { force: true }) ?? "");
 
     call.forceResolve(
       makeToolResult({
         terminal_id: terminalId,
         is_running: state.is_running,
         exit_code: state.exit_code,
-        output_captured: state.output_captured,
-        output: state.output_captured ? state.output : "",
+        output_captured: state.output_captured || !!output,
+        output: output || "[No output captured]",
         status: "force-completed",
         message: "Output returned immediately — wait was interrupted by user.",
       }),

@@ -10,6 +10,7 @@ function sleep(ms: number): Promise<void> {
 export async function handleGetTerminalOutput(params: {
   terminal_id: string;
   wait_seconds?: number;
+  kill?: boolean;
   output_head?: number;
   output_tail?: number;
   output_offset?: number;
@@ -24,31 +25,37 @@ export async function handleGetTerminalOutput(params: {
     `[get_terminal_output] ENTER terminal_id=${params.terminal_id} wait_seconds=${params.wait_seconds ?? "none"}`,
   );
 
-  // If wait_seconds is specified, poll until new output arrives, command finishes,
-  // or the wait time expires.
+  // If wait_seconds is specified, poll until the command finishes or the wait
+  // time expires.  We intentionally do NOT break on "new output" — for
+  // continuously-producing commands that would exit after ~250ms, making
+  // wait_seconds effectively useless.
   if (params.wait_seconds && params.wait_seconds > 0) {
     const deadline = Date.now() + params.wait_seconds * 1000;
     const initialState = terminalManager.getBackgroundState(params.terminal_id);
-    const initialLength = initialState?.output?.length ?? 0;
-    const initialRunning = initialState?.is_running ?? false;
 
     log?.(
-      `[get_terminal_output] POLL_START initial_len=${initialLength} initial_running=${initialRunning}`,
+      `[get_terminal_output] POLL_START is_running=${initialState?.is_running ?? "unknown"}`,
     );
 
     while (Date.now() < deadline) {
       const current = terminalManager.getBackgroundState(params.terminal_id);
       if (!current) break;
 
-      // Stop waiting if: command finished, or new output appeared
-      const hasNewOutput = (current.output?.length ?? 0) > initialLength;
-      const finished = !current.is_running && initialRunning;
-      if (hasNewOutput || finished) break;
+      // Stop waiting only when the command has finished
+      if (!current.is_running) break;
 
       await sleep(Math.min(250, deadline - Date.now()));
     }
 
     log?.(`[get_terminal_output] POLL_END elapsed=${Date.now() - startTime}ms`);
+  }
+
+  // Kill the running process if requested
+  if (params.kill) {
+    log?.(`[get_terminal_output] KILL terminal_id=${params.terminal_id}`);
+    terminalManager.interruptTerminal(params.terminal_id);
+    // Brief wait for the process to respond to SIGINT
+    await sleep(500);
   }
 
   const state = terminalManager.getBackgroundState(params.terminal_id);
@@ -71,6 +78,7 @@ export async function handleGetTerminalOutput(params: {
     is_running: state.is_running,
     exit_code: state.exit_code,
     output_captured: state.output_captured,
+    ...(params.kill && { killed: true }),
   };
 
   if (state.output_captured && state.output) {

@@ -243,8 +243,15 @@ export function applyBlocks(
       continue;
     }
 
-    // Exactly one match — apply replacement
-    result = result.replace(block.search, block.replace);
+    // Exactly one match — apply replacement using indexOf + slice.
+    // Do NOT use String.prototype.replace here — it interprets $& $` $'
+    // and $$ as special patterns in the replacement string, which silently
+    // corrupts source code that contains those character sequences.
+    const idx = result.indexOf(block.search);
+    result =
+      result.slice(0, idx) +
+      block.replace +
+      result.slice(idx + block.search.length);
   }
 
   return { result, failedBlocks };
@@ -502,8 +509,8 @@ export async function handleApplyDiff(
         approvalPanel.isRecentlyApproved("write", relPath);
 
     if (canAutoApprove) {
-      // Snapshot diagnostics before the write
-      const snap = snapshotDiagnostics();
+      // Snapshot diagnostics before the write (registers listener eagerly)
+      const snap = snapshotDiagnostics(filePath);
 
       await fs.writeFile(filePath, newContent, "utf-8");
 
@@ -515,10 +522,7 @@ export async function handleApplyDiff(
       });
 
       // Collect new diagnostics
-      const newDiagnostics = await snap.collectNewErrors(
-        filePath,
-        diagnosticDelay,
-      );
+      const newDiagnostics = await snap.collectNewErrors(diagnosticDelay);
 
       const response: Record<string, unknown> = {
         status: "accepted",

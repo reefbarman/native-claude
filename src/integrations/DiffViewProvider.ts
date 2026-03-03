@@ -604,12 +604,13 @@ export class DiffViewProvider {
 
   private async waitForDiagnostics(): Promise<string | undefined> {
     return new Promise<string | undefined>((resolve) => {
-      const uri = vscode.Uri.file(this.absolutePath!);
       let settled = false;
+      let debounce: ReturnType<typeof setTimeout> | undefined;
 
       const settle = () => {
         if (settled) return;
         settled = true;
+        if (debounce) clearTimeout(debounce);
         disposable.dispose();
         clearTimeout(timer);
 
@@ -629,7 +630,7 @@ export class DiffViewProvider {
         }
 
         const lines: string[] = [];
-        for (const [diagUri, diags] of errorDiags) {
+        for (const [, diags] of errorDiags) {
           for (const diag of diags) {
             if (diag.severity !== vscode.DiagnosticSeverity.Error) continue;
             const line = diag.range.start.line + 1;
@@ -639,14 +640,19 @@ export class DiffViewProvider {
         resolve(lines.join("\n"));
       };
 
-      // Listen for diagnostic changes on our file
+      // Listen for diagnostic changes on our file.
+      // Debounce: the first event is often the language server clearing stale
+      // diagnostics before reanalyzing. Wait for events to stabilize before
+      // collecting, so we don't miss errors that arrive in a subsequent event.
+      const DEBOUNCE_MS = 300;
       const disposable = vscode.languages.onDidChangeDiagnostics((e) => {
         if (e.uris.some((u) => u.fsPath === this.absolutePath)) {
-          settle();
+          if (debounce) clearTimeout(debounce);
+          debounce = setTimeout(settle, DEBOUNCE_MS);
         }
       });
 
-      // Timeout fallback
+      // Hard timeout fallback
       const timer = setTimeout(settle, this.diagnosticDelay);
     });
   }
@@ -756,33 +762,41 @@ function getNewDiagnostics(
 
 /**
  * Standalone diagnostic collection for auto-approved writes.
- * Snapshots diagnostics before a write, then waits for language services
- * to update and returns any new errors as a formatted string.
+ * Snapshots diagnostics before a write and eagerly registers the
+ * onDidChangeDiagnostics listener so no events are missed during
+ * the write/open/sync sequence. Call collectNewErrors() after the
+ * write to wait for results.
  *
  * Usage:
- *   const snap = snapshotDiagnostics();
- *   // ... perform the write ...
- *   const diagnostics = await snap.collectNewErrors(filePath, delay);
+ *   const snap = snapshotDiagnostics(filePath);
+ *   // ... perform the write, open document, etc. ...
+ *   const diagnostics = await snap.collectNewErrors(delay);
  */
-export function snapshotDiagnostics(): {
-  collectNewErrors: (
-    filePath: string,
-    delayMs: number,
-  ) => Promise<string | undefined>;
+export function snapshotDiagnostics(filePath: string): {
+  collectNewErrors: (delayMs: number) => Promise<string | undefined>;
 } {
   const preDiagnostics = vscode.languages.getDiagnostics();
 
+  // Track diagnostic events eagerly — before the write happens —
+  // so we never miss events that fire during write/open/sync.
+  let gotEvent = false;
+  const disposable = vscode.languages.onDidChangeDiagnostics((e) => {
+    if (e.uris.some((u) => u.fsPath === filePath)) {
+      gotEvent = true;
+    }
+  });
+
   return {
-    collectNewErrors(
-      filePath: string,
-      delayMs: number,
-    ): Promise<string | undefined> {
+    collectNewErrors(delayMs: number): Promise<string | undefined> {
       return new Promise<string | undefined>((resolve) => {
         let settled = false;
+        let debounce: ReturnType<typeof setTimeout> | undefined;
 
         const settle = () => {
           if (settled) return;
           settled = true;
+          if (debounce) clearTimeout(debounce);
+          lateDisposable.dispose();
           disposable.dispose();
           clearTimeout(timer);
 
@@ -812,14 +826,22 @@ export function snapshotDiagnostics(): {
           resolve(lines.join("\n"));
         };
 
-        // Listen for diagnostic changes on our file
-        const disposable = vscode.languages.onDidChangeDiagnostics((e) => {
+        // If we already received events before collectNewErrors was called,
+        // start the debounce immediately so we settle soon.
+        const DEBOUNCE_MS = 300;
+        if (gotEvent) {
+          debounce = setTimeout(settle, DEBOUNCE_MS);
+        }
+
+        // Continue listening for new events with debounce
+        const lateDisposable = vscode.languages.onDidChangeDiagnostics((e) => {
           if (e.uris.some((u) => u.fsPath === filePath)) {
-            settle();
+            if (debounce) clearTimeout(debounce);
+            debounce = setTimeout(settle, DEBOUNCE_MS);
           }
         });
 
-        // Timeout fallback
+        // Hard timeout fallback
         const timer = setTimeout(settle, delayMs);
       });
     },

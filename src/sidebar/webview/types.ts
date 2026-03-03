@@ -28,12 +28,34 @@ export interface ConnectedAgent {
   clientVersion?: string;
   agentId?: string;
   agentDisplayName?: string;
+  /** Epoch ms of last MCP activity for this session. */
+  lastActivity: number;
+  /** Whether this session has completed the workspace handshake. */
+  trustState: "trusted" | "untrusted";
 }
 
 export interface AgentInfo {
   id: string;
   name: string;
   selected: boolean;
+}
+
+export interface IndexStatusInfo {
+  state: "idle" | "discovering" | "indexing" | "error";
+  phase?: string;
+  current?: number;
+  total?: number;
+  detail?: string;
+  lastCompleted?: {
+    filesIndexed: number;
+    totalFilesInIndex: number;
+    chunksCreated: number;
+    totalChunksInIndex: number;
+    durationMs: number;
+    errorCount?: number;
+    cancelled?: boolean;
+  };
+  error?: string;
 }
 
 export interface SidebarState {
@@ -56,6 +78,7 @@ export interface SidebarState {
   settingsWriteRules?: string[];
   activeSessions?: SessionInfo[];
   connectedAgents?: ConnectedAgent[];
+  indexStatus?: IndexStatusInfo;
 }
 
 export interface TrackedCallInfo {
@@ -84,7 +107,8 @@ export interface FeedbackEntry {
 export type ExtensionMessage =
   | { type: "stateUpdate"; state: SidebarState }
   | { type: "updateToolCalls"; calls: TrackedCallInfo[] }
-  | { type: "updateFeedback"; entries: FeedbackEntry[] };
+  | { type: "updateFeedback"; entries: FeedbackEntry[] }
+  | { type: "updateIndexStatus"; status: IndexStatusInfo };
 
 // Webview → Extension messages
 export interface WebviewCommand {

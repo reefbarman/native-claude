@@ -3,11 +3,13 @@ import type {
   SidebarState,
   TrackedCallInfo,
   FeedbackEntry,
+  IndexStatusInfo,
   ExtensionMessage,
   PostCommand,
 } from "./types.js";
 import { ActiveToolCalls } from "./components/ActiveToolCalls.js";
 import { ServerStatus } from "./components/ServerStatus.js";
+import { IndexStatus } from "./components/IndexStatus.js";
 import { Configuration } from "./components/Configuration.js";
 import { WriteApproval } from "./components/WriteApproval.js";
 import { TrustedPaths } from "./components/TrustedPaths.js";
@@ -35,7 +37,8 @@ interface State {
 type Action =
   | { type: "stateUpdate"; state: SidebarState }
   | { type: "updateToolCalls"; calls: TrackedCallInfo[] }
-  | { type: "updateFeedback"; entries: FeedbackEntry[] };
+  | { type: "updateFeedback"; entries: FeedbackEntry[] }
+  | { type: "updateIndexStatus"; status: IndexStatusInfo };
 
 const initialState: State = {
   sidebar: {
@@ -58,6 +61,11 @@ function reducer(state: State, action: Action): State {
       return { ...state, toolCalls: action.calls };
     case "updateFeedback":
       return { ...state, feedbackEntries: action.entries };
+    case "updateIndexStatus":
+      return {
+        ...state,
+        sidebar: { ...state.sidebar, indexStatus: action.status },
+      };
     default:
       return state;
   }
@@ -76,7 +84,8 @@ export function App({ vscodeApi }: AppProps) {
       if (
         msg.type === "stateUpdate" ||
         msg.type === "updateToolCalls" ||
-        msg.type === "updateFeedback"
+        msg.type === "updateFeedback" ||
+        msg.type === "updateIndexStatus"
       ) {
         dispatch(msg);
       }
@@ -100,6 +109,7 @@ export function App({ vscodeApi }: AppProps) {
     <div>
       <ActiveToolCalls calls={state.toolCalls} postCommand={postCommand} />
       <ServerStatus state={state.sidebar} postCommand={postCommand} />
+      <IndexStatus state={state.sidebar} postCommand={postCommand} />
       <Configuration state={state.sidebar} postCommand={postCommand} />
       <WriteApproval state={state.sidebar} postCommand={postCommand} />
       <TrustedPaths state={state.sidebar} postCommand={postCommand} />

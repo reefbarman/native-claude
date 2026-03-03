@@ -34,11 +34,22 @@ import {
 import { handleGetCallHierarchy } from "../tools/getCallHierarchy.js";
 import { handleGetTypeHierarchy } from "../tools/getTypeHierarchy.js";
 import { handleGetInlayHints } from "../tools/getInlayHints.js";
+import { handleHandshake } from "../tools/handshake.js";
 import {
   TOOL_REGISTRY,
   TOOL_NAMES,
   DEV_TOOL_NAMES,
 } from "../shared/toolRegistry.js";
+
+type ToolResult = { content: Array<{ type: "text"; text: string }> };
+
+/** Closures for per-session trust state, provided by McpServerHost. */
+export interface TrustGate {
+  isSessionTrusted: () => boolean;
+  markSessionTrusted: () => void;
+  getTrustAttempts: () => number;
+  incrementTrustAttempts: () => void;
+}
 
 /** Look up a tool's description from the registry. Throws if not found. */
 function desc(name: string): string {
@@ -54,17 +65,98 @@ export function registerTools(
   getSessionId: () => string | undefined,
   tracker: ToolCallTracker,
   extensionUri: import("vscode").Uri,
+  trust: TrustGate,
 ): void {
   const sid = () => getSessionId() ?? "unknown";
   const touch = () => approvalManager.touchSession(sid());
+  const log = (msg: string) => console.log(`[AgentLink] ${msg}`);
 
-  // Track registered tool names for validation against the registry
+  /**
+   * Gate wrapper — rejects tool calls from untrusted sessions with an
+   * escalating error message. After 3+ failed attempts, tells the agent
+   * it's likely connected to the wrong MCP server instance.
+   */
+  function requireTrust<P extends Record<string, unknown>>(
+    handler: (params: P, ...rest: unknown[]) => Promise<ToolResult>,
+  ): (params: P, ...rest: unknown[]) => Promise<ToolResult> {
+    return async (params: P, ...rest: unknown[]) => {
+      if (!trust.isSessionTrusted()) {
+        trust.incrementTrustAttempts();
+        const attempts = trust.getTrustAttempts();
+        const shortId = sid().substring(0, 12);
+        log(
+          `Rejected tool call for untrusted session ${shortId} (attempt ${attempts})`,
+        );
+        const base =
+          "Session not trusted. Call the 'handshake' tool first with your working_directories parameter (an array of all your known working directories).";
+        const escalation =
+          attempts >= 3
+            ? "\n\nYou appear to be connected to the wrong MCP server instance. Ask the user to reload the VS Code window or refresh their AI agent's MCP connections."
+            : "";
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify({ error: base + escalation }) },
+          ],
+        };
+      }
+      return handler(params, ...rest);
+    };
+  }
+
+  // Track registered tool names for validation against the registry.
+  // Also wraps all tool handlers (except "handshake") with the requireTrust
+  // gate so untrusted sessions are rejected before any tool logic runs.
   const registeredTools = new Set<string>();
   const origRegisterTool = server.registerTool.bind(server);
   server.registerTool = ((...args: unknown[]) => {
-    if (typeof args[0] === "string") registeredTools.add(args[0]);
+    const toolName = typeof args[0] === "string" ? args[0] : undefined;
+    if (toolName) registeredTools.add(toolName);
+
+    // Wrap the handler (3rd arg) with requireTrust for all tools except handshake
+    if (toolName && toolName !== "handshake" && typeof args[2] === "function") {
+      const originalHandler = args[2] as (
+        params: Record<string, unknown>,
+        extra?: unknown,
+      ) => Promise<ToolResult>;
+      args[2] = requireTrust(originalHandler);
+    }
+
     return (origRegisterTool as Function)(...args);
   }) as typeof server.registerTool;
+
+  // --- Session lifecycle ---
+
+  server.registerTool(
+    "handshake",
+    {
+      description: desc("handshake"),
+      inputSchema: {
+        working_directories: z
+          .array(z.string())
+          .describe(
+            "All working directories known to the agent (primary + additional)",
+          ),
+      },
+    },
+    tracker.wrapHandler(
+      "handshake",
+      (params) => {
+        touch();
+        const shortId = sid().substring(0, 12);
+        return handleHandshake(
+          params,
+          trust.markSessionTrusted,
+          log,
+          shortId,
+        );
+      },
+      (p) =>
+        Array.isArray(p.working_directories)
+          ? `${(p.working_directories as string[]).length} dirs`
+          : "",
+      sid,
+    ),
+  );
 
   // --- Read-only tools ---
 
@@ -111,9 +203,7 @@ export function registerTools(
       inputSchema: {
         path: z
           .string()
-          .describe(
-            "Directory path (absolute or relative to workspace root)",
-          ),
+          .describe("Directory path (absolute or relative to workspace root)"),
         recursive: z
           .boolean()
           .optional()
@@ -169,7 +259,7 @@ export function registerTools(
           .boolean()
           .optional()
           .describe(
-            "Use semantic/vector search instead of regex. Requires codebase index (Roo Code) and OpenAI API key. Default: false",
+            "Use semantic/vector search instead of regex. Requires codebase index and OpenAI API key. Default: false",
           ),
         context: z.coerce
           .number()
@@ -224,12 +314,7 @@ export function registerTools(
       "search_files",
       (params) => {
         touch();
-        return handleSearchFiles(
-          params,
-          approvalManager,
-          approvalPanel,
-          sid(),
-        );
+        return handleSearchFiles(params, approvalManager, approvalPanel, sid());
       },
       (p) => String(p.regex ?? "").slice(0, 60),
       sid,
@@ -981,6 +1066,12 @@ export function registerTools(
           .describe(
             "Number of context lines around each grep match (like grep -C). Only used with output_grep.",
           ),
+        force: z
+          .boolean()
+          .optional()
+          .describe(
+            "Bypass command validation (the auto-rejection of grep, cat, head, tail, sed). Use when the rejection is a false positive — e.g. commands with shell expansion ($(), env vars) in arguments.",
+          ),
       },
       annotations: { readOnlyHint: false, openWorldHint: true },
     },
@@ -1000,6 +1091,94 @@ export function registerTools(
       sid,
     ),
   );
+
+  server.registerTool(
+    "close_terminals",
+    {
+      description: desc("close_terminals"),
+      inputSchema: {
+        names: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "Terminal names to close (e.g. ['Server', 'Tests']). Omit to close all managed terminals.",
+          ),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        openWorldHint: false,
+      },
+    },
+    tracker.wrapHandler(
+      "close_terminals",
+      (params) => {
+        touch();
+        return handleCloseTerminals(params);
+      },
+      (p) =>
+        Array.isArray(p.names) ? (p.names as string[]).join(", ") : "all",
+      sid,
+    ),
+  );
+
+  server.registerTool(
+    "get_terminal_output",
+    {
+      description: desc("get_terminal_output"),
+      inputSchema: {
+        terminal_id: z
+          .string()
+          .describe("Terminal ID returned by execute_command (e.g. 'term_3')"),
+        wait_seconds: z.coerce
+          .number()
+          .optional()
+          .describe(
+            "Wait up to N seconds for new output to appear before returning. Useful when a background command was just started and you want to avoid a double-call. Polls every 250ms and returns early when new output arrives or the command finishes.",
+          ),
+        kill: z
+          .boolean()
+          .optional()
+          .describe(
+            "Send Ctrl+C (SIGINT) to kill the running command. Returns captured output.",
+          ),
+        output_head: z.coerce
+          .number()
+          .optional()
+          .describe("Return only the first N lines of output."),
+        output_tail: z.coerce
+          .number()
+          .optional()
+          .describe("Return only the last N lines of output."),
+        output_offset: z.coerce
+          .number()
+          .optional()
+          .describe("Skip first N lines before applying head/tail."),
+        output_grep: z
+          .string()
+          .optional()
+          .describe(
+            "Filter output to lines matching this regex pattern (case-insensitive).",
+          ),
+        output_grep_context: z.coerce
+          .number()
+          .optional()
+          .describe("Number of context lines around each grep match."),
+      },
+      annotations: { readOnlyHint: false, openWorldHint: false },
+    },
+    tracker.wrapHandler(
+      "get_terminal_output",
+      (params) => {
+        touch();
+        return handleGetTerminalOutput(params);
+      },
+      (p) => String(p.terminal_id ?? ""),
+      sid,
+    ),
+  );
+
+  // --- Semantic search ---
 
   server.registerTool(
     "codebase_search",
@@ -1044,89 +1223,7 @@ export function registerTools(
     ),
   );
 
-  server.registerTool(
-    "close_terminals",
-    {
-      description: desc("close_terminals"),
-      inputSchema: {
-        names: z
-          .array(z.string())
-          .optional()
-          .describe(
-            "Terminal names to close (e.g. ['Server', 'Tests']). Omit to close all managed terminals.",
-          ),
-      },
-      annotations: {
-        readOnlyHint: false,
-        destructiveHint: true,
-        openWorldHint: false,
-      },
-    },
-    tracker.wrapHandler(
-      "close_terminals",
-      (params) => {
-        touch();
-        return handleCloseTerminals(params);
-      },
-      (p) =>
-        Array.isArray(p.names) ? (p.names as string[]).join(", ") : "all",
-      sid,
-    ),
-  );
-
-  server.registerTool(
-    "get_terminal_output",
-    {
-      description: desc("get_terminal_output"),
-      inputSchema: {
-        terminal_id: z
-          .string()
-          .describe(
-            "Terminal ID returned by execute_command (e.g. 'term_3')",
-          ),
-        wait_seconds: z.coerce
-          .number()
-          .optional()
-          .describe(
-            "Wait up to N seconds for new output to appear before returning. Useful when a background command was just started and you want to avoid a double-call. Polls every 250ms and returns early when new output arrives or the command finishes.",
-          ),
-        output_head: z.coerce
-          .number()
-          .optional()
-          .describe("Return only the first N lines of output."),
-        output_tail: z.coerce
-          .number()
-          .optional()
-          .describe("Return only the last N lines of output."),
-        output_offset: z.coerce
-          .number()
-          .optional()
-          .describe("Skip first N lines before applying head/tail."),
-        output_grep: z
-          .string()
-          .optional()
-          .describe(
-            "Filter output to lines matching this regex pattern (case-insensitive).",
-          ),
-        output_grep_context: z.coerce
-          .number()
-          .optional()
-          .describe("Number of context lines around each grep match."),
-      },
-      annotations: { readOnlyHint: true, openWorldHint: false },
-    },
-    tracker.wrapHandler(
-      "get_terminal_output",
-      (params) => {
-        touch();
-        return handleGetTerminalOutput(params);
-      },
-      (p) => String(p.terminal_id ?? ""),
-      sid,
-    ),
-  );
-
-  // --- Dev-only feedback tools ---
+  // --- Dev-only tools ---
 
   if (__DEV_BUILD__) {
     server.registerTool(

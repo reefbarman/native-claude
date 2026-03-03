@@ -21,6 +21,24 @@ if ($input.PSObject.Properties["hookEventName"]) {
     $hookEvent = $input.hookEventName
 }
 
+# Allow built-in file tools for markdown files in plans directories
+# Agents use built-in tools for plan files - these don't need agentlink's diff view
+$fileTools = @("Read", "Write", "Edit", "readFile", "editFiles", "createFile")
+if ($toolName -in $fileTools) {
+    $planPath = ""
+    if ($input.tool_input) {
+        foreach ($field in @("file_path", "filePath", "path")) {
+            if ($input.tool_input.PSObject.Properties[$field]) {
+                $planPath = $input.tool_input.$field
+                break
+            }
+        }
+    }
+    if ($planPath -and $planPath -match '[/\\]plans[/\\][^/\\]*\.md$') {
+        exit 0
+    }
+}
+
 # Allow Read for non-text file types that agentlink can't handle
 # (images, PDFs, notebooks - Claude's built-in Read handles these natively)
 if ($toolName -eq "Read") {

@@ -2,7 +2,7 @@
   "name": "agentlink",
   "displayName": "AgentLink",
   "description": "MCP server that provides AI agents with native VS Code tools — diff-based file editing, integrated terminal, diagnostics",
-  "version": "1.0.19",
+  "version": "1.1.0",
   "publisher": "agentlink",
   "repository": {
     "type": "git",
@@ -106,6 +106,14 @@
       {
         "command": "agentlink.configureAgents",
         "title": "AgentLink: Configure Agents"
+      },
+      {
+        "command": "agentlink.rebuildIndex",
+        "title": "AgentLink: Rebuild Codebase Index"
+      },
+      {
+        "command": "agentlink.cancelIndex",
+        "title": "AgentLink: Cancel Indexing"
       }
     ],
     "menus": {
@@ -186,12 +194,51 @@
         "agentlink.semanticSearchEnabled": {
           "type": "boolean",
           "default": false,
-          "description": "Enable semantic codebase search via Qdrant index (built by Roo Code)"
+          "description": "Enable semantic codebase search via Qdrant vector index. Requires Qdrant running and an OpenAI API key."
         },
         "agentlink.qdrantUrl": {
           "type": "string",
           "default": "http://localhost:6333",
           "description": "Qdrant vector database URL for semantic codebase search"
+        },
+        "agentlink.autoIndex": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically index the codebase on startup when semantic search is enabled."
+        },
+        "agentlink.chunkGranularity": {
+          "type": "string",
+          "enum": [
+            "standard",
+            "fine"
+          ],
+          "default": "fine",
+          "enumDescriptions": [
+            "Function/method-level chunks. Efficient with good recall.",
+            "Adds statement-level chunks for finer-grained search. ~50% more embeddings."
+          ],
+          "description": "Chunk granularity for codebase indexing."
+        },
+        "agentlink.indexExclusions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "**/node_modules/**",
+            "**/.git/**",
+            "**/dist/**",
+            "**/build/**",
+            "**/.next/**",
+            "**/coverage/**",
+            "**/__pycache__/**",
+            "**/target/**",
+            "**/.venv/**",
+            "**/vendor/**",
+            "**/*.min.js",
+            "**/*.map"
+          ],
+          "description": "Glob patterns for files to exclude from codebase indexing (in addition to .gitignore)."
         },
         "agentlink.approvalPosition": {
           "type": "string",
@@ -234,9 +281,11 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
     "@vscode/codicons": "^0.0.44",
+    "@vscode/tree-sitter-wasm": "^0.3.0",
     "diff": "^8.0.3",
     "picomatch": "^4.0.3",
     "preact": "^10.28.4",
+    "web-tree-sitter": "^0.26.6",
     "zod": "^4.3.6"
   },
   "devDependencies": {

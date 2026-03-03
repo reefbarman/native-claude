@@ -1,3 +1,16 @@
+## Workspace handshake — REQUIRED FIRST STEP
+
+Before using any other agentlink tool, you **MUST** call the `handshake` tool to establish a trusted connection. This verifies you are connected to the correct VS Code instance.
+
+**Call it immediately** at the start of every session:
+```
+handshake({ working_directories: ["<your primary working directory>", "<additional dir 1>", ...] })
+```
+
+Pass **all** your known working directories (primary + additional). The server checks that its workspace folders are present in your list. On success you get `{ status: "trusted" }` and all other tools become available.
+
+If the handshake keeps failing, you are likely connected to the wrong MCP server instance. Ask the user to reload the VS Code window or refresh their AI agent's MCP connections.
+
 ## Prefer AgentLink MCP tools
 
 When the `agentlink` MCP server is available, prefer its tools over built-in equivalents. AgentLink tools work through VS Code directly, providing diff views, integrated terminal, real diagnostics, and language server intelligence.
@@ -6,13 +19,13 @@ When the `agentlink` MCP server is available, prefer its tools over built-in equ
 
 If your agent has built-in filesystem tools, prefer the agentlink equivalents:
 
-| Built-in | AgentLink equivalent | Why |
-|---|---|---|
-| File read | `read_file` | Returns line numbers, file metadata, git status, and diagnostics summary |
-| File edit/write | `apply_diff` / `write_file` | Opens a diff view for user review. Format-on-save applies automatically. Returns user edits and diagnostics. |
-| Shell/terminal | `execute_command` | Runs in VS Code's integrated terminal (visible to user). Captures output via shell integration. Supports named terminals for parallel tasks. |
-| File search/glob | `list_files` | Lists files with optional recursive + depth control |
-| Content search/grep | `search_files` | Ripgrep-powered search with context lines. Also supports semantic/vector search. |
+| Built-in            | AgentLink equivalent        | Why                                                                                                                                          |
+| ------------------- | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| File read           | `read_file`                 | Returns line numbers, file metadata, git status, and diagnostics summary                                                                     |
+| File edit/write     | `apply_diff` / `write_file` | Opens a diff view for user review. Format-on-save applies automatically. Returns user edits and diagnostics.                                 |
+| Shell/terminal      | `execute_command`           | Runs in VS Code's integrated terminal (visible to user). Captures output via shell integration. Supports named terminals for parallel tasks. |
+| File search/glob    | `list_files`                | Lists files with optional recursive + depth control                                                                                          |
+| Content search/grep | `search_files`              | Ripgrep-powered search with context lines.                                                                                                   |
 
 ### Terminal behavior
 
@@ -36,6 +49,7 @@ If your agent has built-in filesystem tools, prefer the agentlink equivalents:
 
 AgentLink also provides language server tools with no built-in equivalent. Use these proactively — they give you real language server intelligence instead of guessing from source text.
 
+- **`handshake`** — Establish a trusted connection by verifying workspace identity. Must be called before any other tool.
 - **`go_to_definition`** — Jump to where a symbol is defined. Takes a file, line, and column.
 - **`go_to_implementation`** — Find concrete implementations of an interface, abstract class, or method.
 - **`go_to_type_definition`** — Navigate to the type definition of a symbol.
@@ -51,6 +65,5 @@ AgentLink also provides language server tools with no built-in equivalent. Use t
 - **`rename_symbol`** — Rename a symbol across the entire workspace using the language server.
 - **`open_file`** — Open a file in the VS Code editor, optionally scrolling to a specific line.
 - **`show_notification`** — Show a notification in VS Code. Use sparingly.
-- **`codebase_search`** — Semantic search over the codebase using vector similarity.
 - **`find_and_replace`** — Bulk find-and-replace across multiple files using a glob pattern.
 - **`get_terminal_output`** — Check on a background command started with `execute_command` + `background: true`.

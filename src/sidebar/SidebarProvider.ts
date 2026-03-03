@@ -17,6 +17,7 @@ import { matchClientName, getAgentById } from "../agents/registry.js";
 import type {
   AgentInfo,
   ConnectedAgent,
+  IndexStatusInfo,
   SidebarState,
 } from "./webview/types.js";
 
@@ -42,13 +43,21 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     id: string;
     clientName?: string;
     clientVersion?: string;
+    lastActivity: number;
+    trusted: boolean;
   }>;
+  private sidebarRefreshInterval?: ReturnType<typeof setInterval>;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
     log?: (msg: string) => void,
   ) {
     this.log = log ?? (() => {});
+    // Periodic refresh so "last seen" times and stale-session filtering stay current
+    this.sidebarRefreshInterval = setInterval(
+      () => this.refreshApprovalState(),
+      30_000,
+    );
   }
 
   setApprovalManager(manager: ApprovalManager): void {
@@ -61,6 +70,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       id: string;
       clientName?: string;
       clientVersion?: string;
+      lastActivity: number;
+      trusted: boolean;
     }>,
   ): void {
     this.mcpSessionProvider = provider;
@@ -99,6 +110,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     } catch {
       // feedbackStore may not exist yet
     }
+  }
+
+  updateIndexStatus(status: IndexStatusInfo): void {
+    this.state.indexStatus = status;
+    this.view?.webview.postMessage({
+      type: "updateIndexStatus",
+      status,
+    });
   }
 
   resolveWebviewView(
@@ -369,6 +388,16 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
             vscode.window.showTextDocument(vscode.Uri.file(feedbackPath));
           }
           break;
+        // Codebase index commands
+        case "rebuildIndex":
+          vscode.commands.executeCommand("agentlink.rebuildIndex");
+          break;
+        case "cancelIndex":
+          vscode.commands.executeCommand("agentlink.cancelIndex");
+          break;
+        case "resumeIndex":
+          vscode.commands.executeCommand("agentlink.resumeIndex");
+          break;
       }
     });
   }
@@ -601,21 +630,28 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         };
       });
 
-      // Build connected agents list from all MCP sessions (not just approval sessions)
-      this.state.connectedAgents = mcpSessions.map((s) => {
-        const agentId = s.clientName
-          ? matchClientName(s.clientName)
-          : undefined;
-        return {
-          sessionId: s.id,
-          clientName: s.clientName,
-          clientVersion: s.clientVersion,
-          agentId,
-          agentDisplayName: agentId
-            ? getAgentById(agentId)?.name
-            : undefined,
-        };
-      });
+      // Build connected agents list from all MCP sessions (not just approval sessions).
+      // Filter out sessions idle for more than 5 minutes.
+      const STALE_REMOVE_MS = 5 * 60_000;
+      const now = Date.now();
+      this.state.connectedAgents = mcpSessions
+        .filter((s) => now - s.lastActivity < STALE_REMOVE_MS)
+        .map((s) => {
+          const agentId = s.clientName
+            ? matchClientName(s.clientName)
+            : undefined;
+          return {
+            sessionId: s.id,
+            clientName: s.clientName,
+            clientVersion: s.clientVersion,
+            agentId,
+            agentDisplayName: agentId
+              ? getAgentById(agentId)?.name
+              : undefined,
+            lastActivity: s.lastActivity,
+            trustState: s.trusted ? ("trusted" as const) : ("untrusted" as const),
+          };
+        });
     }
     this.state.masterBypass = this.getMasterBypass();
     // Send state via postMessage instead of full HTML replacement

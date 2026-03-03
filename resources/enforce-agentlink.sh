@@ -19,6 +19,16 @@ tool_name=$(echo "$input" | jq -r '.tool_name')
 # Detect calling agent: Copilot includes hookEventName, Claude Code does not
 hook_event=$(echo "$input" | jq -r '.hookEventName // ""')
 
+# Allow built-in file tools for markdown files in plans directories
+# Agents use built-in tools for plan files — these don't need agentlink's diff view
+file_tools_re="^(Read|Write|Edit|readFile|editFiles|createFile)$"
+if [[ "$tool_name" =~ $file_tools_re ]]; then
+  file_path=$(echo "$input" | jq -r '.tool_input.file_path // .tool_input.filePath // .tool_input.path // ""')
+  if echo "$file_path" | grep -qiE '/plans/[^/]*\.md$'; then
+    exit 0
+  fi
+fi
+
 # Allow Read for non-text file types that agentlink can't handle
 # (images, PDFs, notebooks — Claude's built-in Read handles these natively)
 if [ "$tool_name" = "Read" ]; then

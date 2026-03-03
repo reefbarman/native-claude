@@ -76,6 +76,7 @@ export interface CommandResult {
   command_modified?: boolean;
   original_command?: string;
   follow_up?: string;
+  timed_out?: boolean;
 }
 
 export interface ExecuteOptions {
@@ -725,7 +726,9 @@ export class TerminalManager {
     };
 
     if (timedOut) {
-      result.output += `\n[Timed out after ${timeout! / 1000}s — command may still be running in terminal]`;
+      this.transitionToBackground(managed);
+      result.timed_out = true;
+      result.output += `\n[Timed out after ${timeout! / 1000}s — command may still be running. Use get_terminal_output with terminal_id "${managed.id}" to check on progress, or add kill: true to stop it.]`;
     }
 
     logDiag("RETURNING_RESULT");
@@ -748,6 +751,92 @@ export class TerminalManager {
       output_captured: false,
       terminal_id: managed.id,
     };
+  }
+
+  /**
+   * Transition a foreground command that timed out into background state,
+   * so get_terminal_output can retrieve its output and detect completion.
+   * The stream async generator from executeWithShellIntegration continues
+   * pumping data into managed.outputBuffer independently.
+   */
+  private transitionToBackground(managed: ManagedTerminal): void {
+    // Clean up any stale background state
+    for (const d of managed.backgroundDisposables) d.dispose();
+    managed.backgroundDisposables = [];
+
+    managed.backgroundRunning = true;
+    managed.backgroundOutputCaptured = true;
+    managed.backgroundExitCode = null;
+
+    const execTag = `timeout-bg:${managed.id}:${Date.now()}`;
+    const logBg = (event: string) => {
+      this.log?.(
+        `[${execTag}] ${event} | running=${managed.backgroundRunning} buf=${managed.outputBuffer.length}`,
+      );
+    };
+
+    logBg("TRANSITION_TO_BACKGROUND");
+
+    // Helper to finalize background state
+    const finalize = (source: string) => {
+      if (!managed.backgroundRunning) return;
+      managed.backgroundRunning = false;
+      managed.outputBuffer = cleanTerminalOutput(managed.outputBuffer);
+      clearInterval(markerPoll);
+      for (const d of managed.backgroundDisposables) d.dispose();
+      managed.backgroundDisposables = [];
+      logBg(`FINALIZED source=${source} exit_code=${managed.backgroundExitCode}`);
+    };
+
+    // Listen for shell execution end event
+    const exitDisposable = vscode.window.onDidEndTerminalShellExecution((e) => {
+      if (e.terminal === managed.terminal) {
+        logBg(`END_EVENT exitCode=${e.exitCode}`);
+        managed.backgroundExitCode = e.exitCode ?? null;
+        finalize("exitEvent");
+      }
+    });
+
+    // Listen for terminal close
+    const closeDisposable = vscode.window.onDidCloseTerminal((t) => {
+      if (t === managed.terminal) {
+        logBg("TERMINAL_CLOSED");
+        finalize("terminalClosed");
+      }
+    });
+
+    managed.backgroundDisposables.push(exitDisposable, closeDisposable);
+
+    // Marker polling — catches completion markers in the output buffer
+    let lastMarkerCheckPos = 0;
+    const checkForMarker = (): boolean => {
+      const result = findAndStripMarker(
+        managed.outputBuffer,
+        lastMarkerCheckPos,
+      );
+      if (result) {
+        logBg(`MARKER_FOUND exitCode=${result.exitCode ?? "none"}`);
+        managed.outputBuffer = result.stripped;
+        managed.backgroundExitCode = result.exitCode;
+        finalize("marker");
+        return true;
+      }
+      lastMarkerCheckPos = managed.outputBuffer.length;
+      return false;
+    };
+
+    const markerPoll = setInterval(() => {
+      if (!managed.backgroundRunning) {
+        clearInterval(markerPoll);
+        return;
+      }
+      if (managed.outputBuffer.length > lastMarkerCheckPos) {
+        checkForMarker();
+      }
+    }, 500);
+    managed.backgroundDisposables.push({
+      dispose: () => clearInterval(markerPoll),
+    });
   }
 
   private executeBackground(

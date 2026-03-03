@@ -14,15 +14,15 @@ export function setSecretStorage(storage: vscode.SecretStorage): void {
   secretStorage = storage;
 }
 
-// --- Configuration helpers ---
+// --- Configuration helpers (exported for IndexerManager) ---
 
-function getQdrantUrl(): string {
+export function getQdrantUrl(): string {
   return vscode.workspace
     .getConfiguration("agentlink")
     .get<string>("qdrantUrl", "http://localhost:6333");
 }
 
-async function getOpenAiApiKey(): Promise<string> {
+export async function getOpenAiApiKey(): Promise<string> {
   const fromSecrets = await secretStorage?.get(SECRET_KEY);
   if (fromSecrets) return fromSecrets;
   return process.env.OPENAI_API_KEY || "";
@@ -34,11 +34,12 @@ function isSemanticSearchEnabled(): boolean {
     .get<boolean>("semanticSearchEnabled", false);
 }
 
-// --- Collection name derivation (must match Roo Code) ---
+// --- Collection name derivation ---
 
-function getCollectionName(workspacePath: string): string {
+/** AgentLink collection name (al- prefix) */
+export function getAlCollectionName(workspacePath: string): string {
   const hash = createHash("sha256").update(workspacePath).digest("hex");
-  return `ws-${hash.substring(0, 16)}`;
+  return `al-${hash.substring(0, 16)}`;
 }
 
 // --- OpenAI Embeddings via fetch ---
@@ -86,14 +87,184 @@ interface QdrantSearchResult {
   payload?: QdrantPayload;
 }
 
-async function queryQdrant(
-  qdrantUrl: string,
-  collectionName: string,
-  queryVector: number[],
+// --- Query enhancement (Phase 3) ---
+
+const STOP_WORDS = new Set([
+  "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+  "have", "has", "had", "do", "does", "did", "will", "would", "could",
+  "should", "may", "might", "shall", "can", "need", "dare", "ought",
+  "and", "but", "or", "nor", "not", "so", "yet", "both", "either",
+  "neither", "each", "every", "all", "any", "few", "more", "most",
+  "some", "such", "no", "only", "own", "same", "than", "too", "very",
+  "just", "because", "as", "until", "while", "of", "at", "by", "for",
+  "with", "about", "against", "between", "through", "during", "before",
+  "after", "above", "below", "to", "from", "up", "down", "in", "out",
+  "on", "off", "over", "under", "again", "further", "then", "once",
+  "here", "there", "when", "where", "why", "how", "what", "which",
+  "who", "whom", "this", "that", "these", "those", "i", "me", "my",
+  "we", "our", "you", "your", "he", "him", "his", "she", "her", "it",
+  "its", "they", "them", "their",
+]);
+
+/** Code-specific words that are too generic for keyword matching */
+const CODE_NOISE_WORDS = new Set([
+  "function", "class", "const", "let", "var", "import", "export",
+  "return", "new", "type", "interface", "enum", "struct", "impl",
+  "def", "self", "true", "false", "null", "undefined", "void",
+  "string", "number", "boolean", "int", "public", "private",
+  "static", "async", "await", "try", "catch", "throw", "if",
+  "else", "for", "while", "switch", "case", "break", "continue",
+  "use", "using", "get", "set",
+]);
+
+/**
+ * Extract meaningful keywords from a search query.
+ * Splits CamelCase and snake_case, removes stop words and code noise.
+ */
+export function extractKeywords(query: string): string[] {
+  const tokens: string[] = [];
+
+  // Split the query into raw words
+  const rawWords = query.split(/[\s,;:.()\[\]{}<>'"]+/).filter(Boolean);
+
+  for (const word of rawWords) {
+    // Split CamelCase: "TerminalManager" → ["Terminal", "Manager"]
+    const camelParts = word.split(/(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])/).filter(Boolean);
+    if (camelParts.length > 1) {
+      tokens.push(word); // keep original CamelCase term
+      tokens.push(...camelParts);
+    }
+
+    // Split snake_case / kebab-case
+    const snakeParts = word.split(/[_-]/).filter(Boolean);
+    if (snakeParts.length > 1) {
+      tokens.push(word); // keep original
+      tokens.push(...snakeParts);
+    }
+
+    // Always add the original word
+    if (camelParts.length <= 1 && snakeParts.length <= 1) {
+      tokens.push(word);
+    }
+  }
+
+  // Deduplicate, filter short words, stop words, and code noise
+  const seen = new Set<string>();
+  return tokens.filter((t) => {
+    const lower = t.toLowerCase();
+    if (lower.length < 3) return false;
+    if (STOP_WORDS.has(lower)) return false;
+    if (CODE_NOISE_WORDS.has(lower)) return false;
+    if (seen.has(lower)) return false;
+    seen.add(lower);
+    return true;
+  });
+}
+
+/**
+ * Expand query text for better embedding recall.
+ * Adds split forms of CamelCase and snake_case terms.
+ */
+export function expandQuery(query: string): string {
+  let expanded = query;
+
+  // CamelCase splitting: "DiffViewProvider" → append "Diff View Provider"
+  const camelMatches = query.match(/[A-Z][a-z]+(?=[A-Z])|[A-Z][a-z]+/g);
+  if (camelMatches && camelMatches.length > 1) {
+    expanded += " " + camelMatches.join(" ");
+  }
+
+  // snake_case splitting: "shell_integration" → append "shell integration"
+  const words = query.split(/\s+/);
+  for (const word of words) {
+    if (word.includes("_")) {
+      expanded += " " + word.replace(/_/g, " ");
+    }
+  }
+
+  return expanded;
+}
+
+// --- Hybrid search helpers ---
+
+/**
+ * Reciprocal Rank Fusion: merge results from multiple retrieval strategies.
+ * Items appearing in multiple lists get boosted scores.
+ */
+export function rrfMerge(
+  vectorResults: QdrantSearchResult[],
+  keywordResults: QdrantSearchResult[],
+  limit: number,
+  k: number = 60,
+): QdrantSearchResult[] {
+  const scores = new Map<string, { score: number; result: QdrantSearchResult }>();
+
+  vectorResults.forEach((r, rank) => {
+    const id = String(r.id);
+    const rrfScore = 1 / (k + rank + 1);
+    scores.set(id, { score: rrfScore, result: r });
+  });
+
+  keywordResults.forEach((r, rank) => {
+    const id = String(r.id);
+    const rrfScore = 1 / (k + rank + 1);
+    const existing = scores.get(id);
+    if (existing) {
+      existing.score += rrfScore;
+    } else {
+      scores.set(id, { score: rrfScore, result: r });
+    }
+  });
+
+  return [...scores.values()]
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map(({ result }) => result);
+}
+
+/**
+ * Rescore results using multiple signals: vector similarity, keyword overlap, path relevance.
+ */
+export function rerankResults(
+  results: QdrantSearchResult[],
+  queryKeywords: string[],
+): QdrantSearchResult[] {
+  if (queryKeywords.length === 0) return results;
+
+  return results
+    .map((r) => {
+      const chunk = (r.payload?.codeChunk ?? "").toLowerCase();
+      const filePath = (r.payload?.filePath ?? "").toLowerCase();
+
+      // Signal 1: Vector similarity (already in r.score)
+      const vectorScore = r.score;
+
+      // Signal 2: Keyword overlap — fraction of query keywords appearing in chunk
+      const keywordHits = queryKeywords.filter((kw) =>
+        chunk.includes(kw.toLowerCase()),
+      ).length;
+      const keywordScore = keywordHits / queryKeywords.length;
+
+      // Signal 3: File path relevance — do query terms appear in file path
+      const pathHits = queryKeywords.filter((kw) =>
+        filePath.includes(kw.toLowerCase()),
+      ).length;
+      const pathScore = pathHits / queryKeywords.length;
+
+      // Weighted combination
+      const finalScore = vectorScore * 0.6 + keywordScore * 0.25 + pathScore * 0.15;
+
+      return { ...r, score: finalScore };
+    })
+    .sort((a, b) => b.score - a.score);
+}
+
+// --- Qdrant query functions ---
+
+/** Build the base filter object for Qdrant queries */
+function buildQdrantFilter(
   directoryPrefix?: string,
-  limit: number = 10,
-): Promise<QdrantSearchResult[]> {
-  // Build filter — always exclude metadata points
+): Record<string, unknown> {
   const mustNot = [{ key: "type", match: { value: "metadata" } }];
   const must: Array<{ key: string; match: { value: string } }> = [];
 
@@ -116,16 +287,26 @@ async function queryQdrant(
   if (must.length > 0) {
     filter.must = must;
   }
+  return filter;
+}
+
+/** Execute a vector-only search against Qdrant */
+async function queryQdrantVector(
+  qdrantUrl: string,
+  collectionName: string,
+  queryVector: number[],
+  directoryPrefix?: string,
+  limit: number = 10,
+  scoreThreshold: number = 0.35,
+): Promise<QdrantSearchResult[]> {
+  const filter = buildQdrantFilter(directoryPrefix);
 
   const body = {
     query: queryVector,
     filter,
-    score_threshold: 0.4,
+    score_threshold: scoreThreshold,
     limit,
-    params: {
-      hnsw_ef: 128,
-      exact: false,
-    },
+    params: { hnsw_ef: 256, exact: false },
     with_payload: {
       include: ["filePath", "codeChunk", "startLine", "endLine"],
     },
@@ -143,7 +324,7 @@ async function queryQdrant(
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     throw new Error(
-      `Qdrant is not reachable at ${qdrantUrl}. Ensure Qdrant is running and Roo Code codebase indexing is enabled. (${message})`,
+      `Qdrant is not reachable at ${qdrantUrl}. Ensure Qdrant is running. (${message})`,
     );
   }
 
@@ -151,7 +332,7 @@ async function queryQdrant(
     const error = await response.text();
     if (response.status === 404) {
       throw new Error(
-        `No codebase index found for this workspace (collection: ${collectionName}). Ensure Roo Code has indexed this workspace.`,
+        `No codebase index found (collection: ${collectionName}).`,
       );
     }
     throw new Error(`Qdrant API error (${response.status}): ${error}`);
@@ -161,6 +342,133 @@ async function queryQdrant(
     result?: { points?: QdrantSearchResult[] };
   };
   return data.result?.points ?? [];
+}
+
+/** Execute a vector search filtered by keyword text match */
+async function queryQdrantWithTextFilter(
+  qdrantUrl: string,
+  collectionName: string,
+  queryVector: number[],
+  keywords: string[],
+  directoryPrefix?: string,
+  limit: number = 20,
+): Promise<QdrantSearchResult[]> {
+  const baseFilter = buildQdrantFilter(directoryPrefix);
+
+  // Add text match filter — at least one keyword must appear (should = OR)
+  const textConditions = keywords.map((kw) => ({
+    key: "codeChunk",
+    match: { text: kw },
+  }));
+
+  // Wrap the base filter's must conditions + text filter together
+  const filter = {
+    ...baseFilter,
+    must: [
+      ...(Array.isArray(baseFilter.must) ? baseFilter.must : []),
+      { should: textConditions },
+    ],
+  };
+
+  const body = {
+    query: queryVector,
+    filter,
+    score_threshold: 0.2, // lower threshold since we have keyword signal
+    limit,
+    params: { hnsw_ef: 256, exact: false },
+    with_payload: {
+      include: ["filePath", "codeChunk", "startLine", "endLine"],
+    },
+  };
+
+  const url = `${qdrantUrl.replace(/\/+$/, "")}/collections/${collectionName}/points/query`;
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) return []; // silently fall back to vector-only
+    const data = (await response.json()) as {
+      result?: { points?: QdrantSearchResult[] };
+    };
+    return data.result?.points ?? [];
+  } catch {
+    return []; // silently fall back to vector-only
+  }
+}
+
+/**
+ * Hybrid search: combines vector similarity with keyword matching via RRF,
+ * then reranks with multi-signal scoring.
+ */
+async function queryQdrant(
+  qdrantUrl: string,
+  collectionName: string,
+  queryVector: number[],
+  queryText: string,
+  directoryPrefix?: string,
+  limit: number = 10,
+): Promise<QdrantSearchResult[]> {
+  const keywords = extractKeywords(queryText);
+  const fetchLimit = Math.max(limit * 3, 20);
+
+  // Run vector and keyword-filtered searches in parallel
+  const [vectorResults, keywordResults] = await Promise.all([
+    queryQdrantVector(qdrantUrl, collectionName, queryVector, directoryPrefix, fetchLimit),
+    keywords.length > 0
+      ? queryQdrantWithTextFilter(qdrantUrl, collectionName, queryVector, keywords, directoryPrefix, fetchLimit)
+      : Promise.resolve([]),
+  ]);
+
+  // Merge with RRF
+  const merged = keywordResults.length > 0
+    ? rrfMerge(vectorResults, keywordResults, fetchLimit)
+    : vectorResults;
+
+  // Rerank with multi-signal scoring
+  const reranked = rerankResults(merged, keywords);
+
+  return reranked.slice(0, limit);
+}
+
+// --- Result formatting ---
+
+interface FormattedResult {
+  file: string;
+  score: number;
+  startLine: number;
+  endLine: number;
+  codeChunk: string;
+}
+
+function formatResults(results: QdrantSearchResult[]): FormattedResult[] {
+  return results
+    .filter((r) => r.payload?.filePath)
+    .map((r) => ({
+      file: r.payload!.filePath,
+      score: r.score,
+      startLine: r.payload!.startLine,
+      endLine: r.payload!.endLine,
+      codeChunk: r.payload!.codeChunk?.trim() ?? "",
+    }));
+}
+
+function buildOutput(query: string, results: FormattedResult[]): ToolResult {
+  const sections = results.map((r) => {
+    return `## ${r.file} (score: ${r.score.toFixed(4)}, lines ${r.startLine}-${r.endLine})\n${r.codeChunk}`;
+  });
+
+  const output = {
+    query,
+    semantic: true,
+    total_results: results.length,
+    results: sections.join("\n\n"),
+  };
+
+  return { content: [{ type: "text", text: JSON.stringify(output, null, 2) }] };
 }
 
 // --- Main entry point ---
@@ -201,48 +509,31 @@ export async function semanticSearch(
 
   const qdrantUrl = getQdrantUrl();
   const workspacePath = getFirstWorkspaceRoot();
-  const collectionName = getCollectionName(workspacePath);
+  const collectionName = getAlCollectionName(workspacePath);
 
   // Compute directory prefix relative to workspace
   const relativeDir = path.relative(workspacePath, dirPath);
   const directoryPrefix = relativeDir === "" ? undefined : relativeDir;
 
-  // Generate embedding for the query
-  const queryVector = await generateEmbedding(query, apiKey);
-
-  // Query Qdrant
+  // Expand query for better embedding recall, then embed
+  const expandedQuery = expandQuery(query);
+  const queryVector = await generateEmbedding(expandedQuery, apiKey);
   const effectiveLimit = limit ?? 10;
-  const results = await queryQdrant(
-    qdrantUrl,
-    collectionName,
-    queryVector,
-    directoryPrefix,
-    effectiveLimit,
-  );
 
-  // Format results
-  const formattedResults = results
-    .filter((r) => r.payload?.filePath)
-    .map((r) => ({
-      file: r.payload!.filePath,
-      score: r.score,
-      startLine: r.payload!.startLine,
-      endLine: r.payload!.endLine,
-      codeChunk: r.payload!.codeChunk?.trim() ?? "",
-    }));
-
-  // Build output in a format Claude Code can read well
-  const sections = formattedResults.map(
-    (r) =>
-      `## ${r.file} (score: ${r.score.toFixed(4)}, lines ${r.startLine}-${r.endLine})\n${r.codeChunk}`,
-  );
-
-  const output = {
-    query,
-    semantic: true,
-    total_results: formattedResults.length,
-    results: sections.join("\n\n"),
-  };
-
-  return { content: [{ type: "text", text: JSON.stringify(output, null, 2) }] };
+  try {
+    const results = await queryQdrant(
+      qdrantUrl,
+      collectionName,
+      queryVector,
+      query,
+      directoryPrefix,
+      effectiveLimit,
+    );
+    return buildOutput(query, formatResults(results));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      content: [{ type: "text", text: JSON.stringify({ error: msg }) }],
+    };
+  }
 }

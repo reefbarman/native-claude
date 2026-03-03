@@ -1,6 +1,8 @@
 **/*
 !dist/extension.js
 !dist/extension.js.map
+!dist/indexer-worker.js
+!dist/wasm/**
 !dist/sidebar.js
 !dist/sidebar.css
 !dist/approval.js

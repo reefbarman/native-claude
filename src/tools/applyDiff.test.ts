@@ -271,6 +271,36 @@ describe("applyBlocks", () => {
     expect(failedBlocks).toEqual([]);
   });
 
+  it("does not interpret $ patterns in replacement content", () => {
+    // String.prototype.replace treats $& $' $` $$ as special in the
+    // replacement string — this must not corrupt source code containing them
+    const content =
+      "function foo() {\n  return 1;\n}\n\nfunction bar() {\n  return 2;\n}";
+    const { result, failedBlocks } = applyBlocks(content, [
+      {
+        search: "  return 1;",
+        replace: '  return `${"hello"} $& world`;',
+        index: 0,
+      },
+    ]);
+    expect(result).toBe(
+      'function foo() {\n  return `${"hello"} $& world`;\n}\n\nfunction bar() {\n  return 2;\n}',
+    );
+    expect(failedBlocks).toEqual([]);
+  });
+
+  it("does not interpret $' (after-match) in replacement content", () => {
+    // $' is the most dangerous — it inserts everything AFTER the match,
+    // causing massive content duplication
+    const content = "AAA\nBBB\nCCC\nDDD";
+    const { result, failedBlocks } = applyBlocks(content, [
+      { search: "BBB", replace: "X$'Y", index: 0 },
+    ]);
+    // Should be literal "X$'Y", NOT "X\nCCC\nDDDY" (which $' would produce)
+    expect(result).toBe("AAA\nX$'Y\nCCC\nDDD");
+    expect(failedBlocks).toEqual([]);
+  });
+
   it("handles replacement that introduces text matching a later search", () => {
     // Block 0 replaces "a" with "b", block 1 searches for "b" in original
     // After block 0: "b c b" → block 1 finds "b" twice → ambiguous → fails

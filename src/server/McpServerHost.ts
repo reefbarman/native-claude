@@ -17,6 +17,10 @@ interface Session {
   server: McpServer;
   lastActivity: number;
   clientInfo?: { name: string; version: string };
+  /** Whether this session has completed the workspace handshake. */
+  trusted: boolean;
+  /** Number of consecutive failed trust attempts (handshake failures + gated tool rejections). */
+  trustAttempts: number;
 }
 
 const SESSION_IDLE_TTL = 30 * 60_000; // 30 minutes
@@ -150,6 +154,25 @@ export class McpServerHost {
       version: "0.1.0",
     });
 
+    // Trust closures — passed to registerTools so the handshake tool and
+    // requireTrust gate can read/write per-session trust state.
+    const getSid = () => transport.sessionId ?? "";
+    const isSessionTrusted = (): boolean =>
+      this.sessions.get(getSid())?.trusted ?? false;
+    const markSessionTrusted = (): void => {
+      const s = this.sessions.get(getSid());
+      if (s) {
+        s.trusted = true;
+        s.trustAttempts = 0;
+      }
+    };
+    const getTrustAttempts = (): number =>
+      this.sessions.get(getSid())?.trustAttempts ?? 0;
+    const incrementTrustAttempts = (): void => {
+      const s = this.sessions.get(getSid());
+      if (s) s.trustAttempts++;
+    };
+
     registerTools(
       server,
       this.approvalManager,
@@ -157,6 +180,12 @@ export class McpServerHost {
       () => transport.sessionId,
       this.tracker,
       this.extensionUri,
+      {
+        isSessionTrusted,
+        markSessionTrusted,
+        getTrustAttempts,
+        incrementTrustAttempts,
+      },
     );
     await server.connect(transport);
 
@@ -184,6 +213,8 @@ export class McpServerHost {
         transport,
         server,
         lastActivity: Date.now(),
+        trusted: false,
+        trustAttempts: 0,
       });
       this.onSessionChanged?.();
     }
@@ -232,11 +263,15 @@ export class McpServerHost {
     id: string;
     clientName?: string;
     clientVersion?: string;
+    lastActivity: number;
+    trusted: boolean;
   }> {
     return Array.from(this.sessions.entries()).map(([id, s]) => ({
       id,
       clientName: s.clientInfo?.name,
       clientVersion: s.clientInfo?.version,
+      lastActivity: s.lastActivity,
+      trusted: s.trusted,
     }));
   }
 

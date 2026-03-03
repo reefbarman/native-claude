@@ -14,6 +14,10 @@ import type { SubCommandEntry } from "../approvals/webview/types.js";
 import { filterOutput, saveOutputTempFile } from "../util/outputFilter.js";
 import { validateCommand } from "../util/pipeValidator.js";
 import { validateInteractiveCommand } from "../util/interactiveValidator.js";
+import { Semaphore } from "../util/Semaphore.js";
+
+/** Serializes the approval-check phase so pending dialogs block other commands. */
+const approvalGate = new Semaphore(1);
 
 type ToolResult = { content: Array<{ type: "text"; text: string }> };
 
@@ -31,6 +35,7 @@ export async function handleExecuteCommand(
     output_offset?: number;
     output_grep?: string;
     output_grep_context?: number;
+    force?: boolean;
   },
   approvalManager: ApprovalManager,
   approvalPanel: ApprovalPanelProvider,
@@ -57,20 +62,23 @@ export async function handleExecuteCommand(
     let approvalFollowUp: string | undefined;
 
     // Reject disallowed command patterns (direct head/tail/cat/grep, piped filtering)
-    const commandViolation = validateCommand(params.command);
-    if (commandViolation) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              status: "rejected",
-              command: params.command,
-              reason: commandViolation.message,
-            }),
-          },
-        ],
-      };
+    // Skip when force=true — the agent believes the rejection is a false positive
+    if (!params.force) {
+      const commandViolation = validateCommand(params.command);
+      if (commandViolation) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                status: "rejected",
+                command: params.command,
+                reason: commandViolation.message,
+              }),
+            },
+          ],
+        };
+      }
     }
 
     // Reject known interactive commands (editors, REPLs, TUI apps, etc.)
@@ -91,36 +99,44 @@ export async function handleExecuteCommand(
     }
 
     if (!masterBypass) {
-      // Split compound command and approve each sub-command
-      const subCommands = splitCompoundCommand(params.command);
-      const approvalResult = await approveSubCommands(
-        subCommands,
-        params.command,
-        approvalManager,
-        approvalPanel,
-        sessionId,
-      );
+      // Gate: only one command goes through approval at a time, so pending
+      // dialogs aren't buried by terminals from auto-approved commands.
+      const releaseGate = await approvalGate.acquire();
+      try {
+        const subCommands = splitCompoundCommand(params.command);
+        const approvalResult = await approveSubCommands(
+          subCommands,
+          params.command,
+          approvalManager,
+          approvalPanel,
+          sessionId,
+        );
 
-      if (!approvalResult.approved) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({
-                status: "rejected",
-                command: params.command,
-                ...(approvalResult.reason && { reason: approvalResult.reason }),
-              }),
-            },
-          ],
-        };
+        if (!approvalResult.approved) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  status: "rejected",
+                  command: params.command,
+                  ...(approvalResult.reason && {
+                    reason: approvalResult.reason,
+                  }),
+                }),
+              },
+            ],
+          };
+        }
+
+        if (approvalResult.editedCommand) {
+          commandToRun = approvalResult.editedCommand;
+        }
+
+        approvalFollowUp = approvalResult.followUp;
+      } finally {
+        releaseGate();
       }
-
-      if (approvalResult.editedCommand) {
-        commandToRun = approvalResult.editedCommand;
-      }
-
-      approvalFollowUp = approvalResult.followUp;
     }
 
     const terminalManager = getTerminalManager();

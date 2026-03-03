@@ -23,6 +23,14 @@ export interface ToolMeta {
  * only here and nowhere else.
  */
 export const TOOL_REGISTRY: Record<string, ToolMeta> = {
+  // --- Session lifecycle ---
+
+  handshake: {
+    label: "Workspace handshake",
+    description:
+      "Establish a trusted connection by verifying workspace identity. Must be called before any other tool. Pass all your known working directories — the server validates that its workspace folders are present in your list. Returns { status: 'trusted' } on success or { status: 'rejected', missing_count: N } on failure.",
+  },
+
   // --- File operations ---
 
   read_file: {
@@ -134,12 +142,12 @@ export const TOOL_REGISTRY: Record<string, ToolMeta> = {
   execute_command: {
     label: "Integrated terminal",
     description:
-      "Run a command in VS Code's integrated terminal. The terminal is visible to the user. Output is captured when shell integration is available.\n\nTerminal reuse: By default, reuses an existing idle terminal \u2014 do NOT pass terminal_name or terminal_id for normal commands. Only use terminal_name when you need a genuinely separate terminal for parallel execution (e.g. a background dev server running alongside normal commands). Do not create named terminals for one-off commands.\n\nTerminal splitting: Use split_from with a terminal_id or terminal_name to create a new terminal split alongside an existing one, forming a visual group in VS Code's terminal panel. Only affects new terminal creation \u2014 if the target terminal_name already exists and is idle, it is reused without re-splitting.\n\nBackground commands: Use background=true for long-running processes (dev servers, watch modes). Returns immediately with terminal_id. Use get_terminal_output with the terminal_id to check on progress, read accumulated output, and see if the command has finished. Background terminals are never auto-reused \u2014 always use terminal_name or terminal_id to target them.\n\nOutput is capped to the last 200 lines by default. Full output is saved to a temp file (returned as output_file) for on-demand access via read_file. Use output_head, output_tail, or output_grep to customize filtering. IMPORTANT: Commands that pipe through head, tail, or grep (e.g. `cmd | head -5`) will be automatically REJECTED. Use the output_head, output_tail, and output_grep parameters instead \u2014 they filter the output returned to you while keeping the full output visible to the user in the terminal.\n\nInteractive commands: Commands that require interactive input (editors like vim/nano, REPLs without scripts, TUI apps like htop, bare database CLIs, interactive git flags like -i/-p, scaffolders without --yes) will be automatically REJECTED with a helpful suggestion. Always use non-interactive alternatives: pass -y/--yes flags, use -c/-e for inline execution, provide all arguments upfront, or use the appropriate agentlink tool (write_file, apply_diff) instead of editors.",
+      "Run a command in VS Code's integrated terminal. The terminal is visible to the user. Output is captured when shell integration is available.\n\nTerminal reuse: By default, reuses an existing idle terminal \u2014 do NOT pass terminal_name or terminal_id for normal commands. Only use terminal_name when you need a genuinely separate terminal for parallel execution (e.g. a background dev server running alongside normal commands). Do not create named terminals for one-off commands.\n\nTerminal splitting: Use split_from with a terminal_id or terminal_name to create a new terminal split alongside an existing one, forming a visual group in VS Code's terminal panel. Only affects new terminal creation \u2014 if the target terminal_name already exists and is idle, it is reused without re-splitting.\n\nBackground commands: Use background=true for long-running processes (dev servers, watch modes). Returns immediately with terminal_id. Use get_terminal_output with the terminal_id to check on progress, read accumulated output, and see if the command has finished. Background terminals are never auto-reused \u2014 always use terminal_name or terminal_id to target them.\n\nOutput is capped to the last 200 lines by default. Full output is saved to a temp file (returned as output_file) for on-demand access via read_file. Use output_head, output_tail, or output_grep to customize filtering. IMPORTANT: Commands that pipe through head, tail, or grep (e.g. `cmd | head -5`) will be automatically REJECTED. Use the output_head, output_tail, and output_grep parameters instead \u2014 they filter the output returned to you while keeping the full output visible to the user in the terminal. If a command is wrongly rejected, retry with force=true to bypass validation.\n\nInteractive commands: Commands that require interactive input (editors like vim/nano, REPLs without scripts, TUI apps like htop, bare database CLIs, interactive git flags like -i/-p, scaffolders without --yes) will be automatically REJECTED with a helpful suggestion. Always use non-interactive alternatives: pass -y/--yes flags, use -c/-e for inline execution, provide all arguments upfront, or use the appropriate agentlink tool (write_file, apply_diff) instead of editors.",
   },
   get_terminal_output: {
     label: "Read background terminal output",
     description:
-      "Get the output and status of a background command running in a terminal. Use after execute_command with background=true to check on progress, read accumulated output, and see if the command has finished. Supports the same output filtering parameters as execute_command.",
+      "Get the output and status of a background or timed-out command running in a terminal. Use after execute_command with background=true, or after a foreground command that timed out (returns timed_out: true with terminal_id). Check on progress, read accumulated output, and see if the command has finished. Supports the same output filtering parameters as execute_command.\n\nUse kill=true to send Ctrl+C (SIGINT) to the running command and return captured output.",
   },
   close_terminals: {
     label: "Clean up terminals",
@@ -159,7 +167,7 @@ export const TOOL_REGISTRY: Record<string, ToolMeta> = {
   codebase_search: {
     label: "Semantic code search",
     description:
-      'Search the codebase by meaning, not exact text. Uses the Qdrant vector index (built by Roo Code) to find code semantically similar to your natural language query. Best for exploratory questions like "how does authentication work" or "where are database connections configured". Falls back gracefully with a helpful error if the index is not available.',
+      'Search the codebase by meaning, not exact text. Uses a Qdrant vector index to find code semantically similar to your natural language query. Best for exploratory questions like "how does authentication work" or "where are database connections configured". Falls back gracefully with a helpful error if the index is not available.',
   },
 
   // --- Dev-only tools ---

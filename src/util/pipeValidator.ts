@@ -103,6 +103,12 @@ function checkDirectFileCommands(command: string): ValidationResult | null {
     const info = DIRECT_FILE_COMMANDS.get(cmd);
     if (!info) continue;
 
+    // Allow commands whose arguments contain shell expansion ($(), backticks,
+    // $VAR) — our tools can't resolve dynamic paths so the rejection would
+    // be a false positive.
+    const argsText = trimmed.slice(cmd.length);
+    if (hasShellExpansion(argsText)) continue;
+
     // Detect cat used in write context (heredoc or output redirection)
     if (cmd === "cat") {
       // cat in a pipeline (e.g. `cat file1 file2 | diff`) is legitimate — skip
@@ -549,6 +555,60 @@ function parseGrepArgs(args: string[]): Record<string, string | number> {
   }
 
   return suggestions;
+}
+
+/**
+ * Detect unquoted shell expansion in a string: $(...), backticks, or $VAR.
+ * Returns true if the string contains dynamic shell features that our tools
+ * cannot resolve, meaning the command should be allowed through.
+ */
+function hasShellExpansion(text: string): boolean {
+  let inSingle = false;
+  let inDouble = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+
+    // Backslash escape (skip next char)
+    if (ch === "\\" && i + 1 < text.length && !inSingle) {
+      i++;
+      continue;
+    }
+
+    // Quote tracking
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      continue;
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      continue;
+    }
+
+    // Inside single quotes, nothing is expanded
+    if (inSingle) continue;
+
+    // $( — command substitution
+    if (ch === "$" && i + 1 < text.length && text[i + 1] === "(") {
+      return true;
+    }
+
+    // $VAR or ${VAR} — environment variable ($ followed by letter or {)
+    if (
+      ch === "$" &&
+      i + 1 < text.length &&
+      (/[A-Za-z_]/.test(text[i + 1]) || text[i + 1] === "{")
+    ) {
+      return true;
+    }
+
+    // Backtick command substitution
+    if (ch === "`") {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 function stripQuotes(s: string): string {

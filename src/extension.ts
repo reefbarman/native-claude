@@ -29,6 +29,7 @@ import {
   installHooks,
 } from "./setup.js";
 import { setSecretStorage } from "./services/semanticSearch.js";
+import { IndexerManager } from "./indexer/IndexerManager.js";
 
 export const DIFF_VIEW_URI_SCHEME = "agentlink-diff";
 
@@ -42,6 +43,7 @@ let approvalPanel: ApprovalPanelProvider;
 let toolCallTracker: ToolCallTracker;
 let activePort: number | null = null;
 let activeAuthToken: string | undefined;
+let indexerManager: IndexerManager | null = null;
 
 function log(message: string): void {
   const timestamp = new Date().toISOString();
@@ -579,6 +581,49 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
   );
 
+  // --- Codebase indexer ---
+  const semanticEnabled = vscode.workspace
+    .getConfiguration("agentlink")
+    .get<boolean>("semanticSearchEnabled", false);
+
+  if (semanticEnabled) {
+    indexerManager = new IndexerManager(
+      context.extensionUri,
+      context.globalStorageUri,
+      log,
+    );
+    context.subscriptions.push(indexerManager);
+
+    // Forward index status to sidebar
+    indexerManager.onStatusChanged((status) => {
+      sidebarProvider.updateIndexStatus(status);
+    });
+
+    // Start file watching for incremental updates
+    indexerManager.startWatching();
+
+    // Register index commands
+    context.subscriptions.push(
+      vscode.commands.registerCommand("agentlink.rebuildIndex", () =>
+        indexerManager?.startIndexing(true),
+      ),
+      vscode.commands.registerCommand("agentlink.cancelIndex", () =>
+        indexerManager?.cancelIndexing(),
+      ),
+      vscode.commands.registerCommand("agentlink.resumeIndex", () =>
+        indexerManager?.startIndexing(false),
+      ),
+      // Internal command for IndexerManager to retrieve the OpenAI API key
+      vscode.commands.registerCommand(
+        "agentlink.getOpenAiApiKeyInternal",
+        async () => {
+          const key = await context.secrets.get("openaiApiKey");
+          return key || "";
+        },
+      ),
+    );
+  }
+
   // Cleanup on deactivation
   context.subscriptions.push({
     dispose: () => {
@@ -603,6 +648,15 @@ export function activate(context: vscode.ExtensionContext): void {
     const startWithRetry = async (attempt: number): Promise<void> => {
       try {
         await startServer(context);
+        // Trigger auto-index after server starts (first attempt only)
+        if (attempt === 0 && indexerManager) {
+          const autoIndex = vscode.workspace
+            .getConfiguration("agentlink")
+            .get<boolean>("autoIndex", true);
+          if (autoIndex) {
+            indexerManager.startIndexing();
+          }
+        }
       } catch (err) {
         if (attempt < MAX_RETRIES) {
           const delay = 1000 * 2 ** attempt; // 2s, 4s, 8s

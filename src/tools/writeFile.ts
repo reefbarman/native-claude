@@ -47,8 +47,8 @@ export async function handleWriteFile(
         approvalPanel.isRecentlyApproved("write", relPath);
 
     if (canAutoApprove) {
-      // Snapshot diagnostics before the write
-      const snap = snapshotDiagnostics();
+      // Snapshot diagnostics before the write (registers listener eagerly)
+      const snap = snapshotDiagnostics(filePath);
 
       await fs.mkdir(path.dirname(filePath), { recursive: true });
       await fs.writeFile(filePath, params.content, "utf-8");
@@ -60,11 +60,23 @@ export async function handleWriteFile(
         preserveFocus: true,
       });
 
+      // Force-sync document model with disk content (see applyDiff.ts)
+      if (doc.getText() !== params.content) {
+        const edit = new vscode.WorkspaceEdit();
+        edit.replace(
+          doc.uri,
+          new vscode.Range(
+            doc.positionAt(0),
+            doc.positionAt(doc.getText().length),
+          ),
+          params.content,
+        );
+        await vscode.workspace.applyEdit(edit);
+        await doc.save();
+      }
+
       // Collect new diagnostics
-      const newDiagnostics = await snap.collectNewErrors(
-        filePath,
-        diagnosticDelay,
-      );
+      const newDiagnostics = await snap.collectNewErrors(diagnosticDelay);
 
       const response: Record<string, unknown> = {
         status: "accepted",

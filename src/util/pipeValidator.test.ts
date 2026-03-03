@@ -94,6 +94,56 @@ describe("validateCommand", () => {
     });
   });
 
+  // ── Shell expansion bypass ─────────────────────────────────────────
+
+  describe("commands with shell expansion (should be allowed)", () => {
+    it("allows grep with $() command substitution in path", () => {
+      expect(
+        validateCommand(
+          'grep -r "pattern" $(go env GOMODCACHE)/github.com/pkg*',
+        ),
+      ).toBeNull();
+    });
+
+    it("allows grep with $VAR in path", () => {
+      expect(validateCommand("grep -r pattern $GOMODCACHE/pkg")).toBeNull();
+    });
+
+    it("allows grep with ${VAR} in path", () => {
+      expect(
+        validateCommand('grep -r "error" ${HOME}/logs/app.log'),
+      ).toBeNull();
+    });
+
+    it("allows cat with $() in path", () => {
+      expect(validateCommand("cat $(find /tmp -name '*.log')")).toBeNull();
+    });
+
+    it("allows head with backtick command substitution", () => {
+      expect(
+        validateCommand("head -20 `find /var -name error.log`"),
+      ).toBeNull();
+    });
+
+    it("still rejects grep on plain workspace files", () => {
+      const result = validateCommand("grep -i error server.log");
+      expect(result).not.toBeNull();
+      expect(result!.message).toContain("search_files");
+    });
+
+    it("does not treat $ inside single quotes as expansion", () => {
+      // grep '$HOME' file.txt — the $HOME is literal (single-quoted)
+      const result = validateCommand("grep '$HOME' file.txt");
+      expect(result).not.toBeNull();
+      expect(result!.message).toContain("search_files");
+    });
+
+    it("treats $ inside double quotes as expansion", () => {
+      // grep "pattern" "$LOGDIR/app.log" — $LOGDIR is expanded in double quotes
+      expect(validateCommand('grep "pattern" "$LOGDIR/app.log"')).toBeNull();
+    });
+  });
+
   // ── sed -i (in-place editing) ──────────────────────────────────────
 
   describe("sed -i (in-place editing)", () => {

@@ -14,7 +14,7 @@ Most AI coding agents operate at the filesystem level — they read and write fi
 | **Terminal commands**     | Runs in a hidden subprocess | Runs in VS Code's **integrated terminal** — visible, interactive, with shell integration for output capture. Supports named terminals, parallel tasks, and **split terminal groups**.                                                |
 | **Diagnostics**           | Not available               | Real **TypeScript errors, ESLint warnings**, etc. from VS Code's language services — returned after writes and available on-demand.                                                                                                  |
 | **File reading**          | Raw file content            | Content plus **file metadata** (size, modified date), **language detection**, **git status**, **diagnostics summary**, and **symbol outlines** (functions, classes, interfaces grouped by kind).                                     |
-| **Search**                | `grep`/`rg` via subprocess  | Same ripgrep engine, plus optional **semantic vector search** against an indexed codebase.                                                                                                                                           |
+| **Search**                | `grep`/`rg` via subprocess  | Same ripgrep engine with context lines, pagination, and multiple output modes.                                                                                                                                                       |
 | **File listing**          | `find`/`ls` via subprocess  | Native listing with ripgrep's `--files` mode for fast recursive listing with automatic `.gitignore` support.                                                                                                                         |
 | **Language intelligence** | Not available               | **Go to definition/implementation/type**, **find references**, **hover types**, **completions**, **symbols**, **rename**, **code actions**, **call/type hierarchy**, and **inlay hints** — all powered by VS Code's language server. |
 | **Approval system**       | All-or-nothing permissions  | **Granular approval** — per-file write rules, per-sub-command pattern matching, outside-workspace path trust with prefix/glob/exact patterns, all in a dedicated approval panel.                                                     |
@@ -217,14 +217,13 @@ Recursive listing uses ripgrep (`--files` mode) for speed and automatic `.gitign
 
 ### search_files
 
-Search file contents using regex or semantic vector search.
+Search file contents using regex.
 
 | Parameter          | Type     | Description                                                                                                                  |
 | ------------------ | -------- | ---------------------------------------------------------------------------------------------------------------------------- |
 | `path`             | string   | Directory to search in                                                                                                       |
-| `regex`            | string   | Regex pattern, or natural language query when `semantic=true`                                                                |
+| `regex`            | string   | Regex pattern to search for                                                                                                  |
 | `file_pattern`     | string?  | Glob to filter files (e.g. `*.ts`)                                                                                           |
-| `semantic`         | boolean? | Use vector similarity search instead of regex                                                                                |
 | `context`          | number?  | Number of context lines around each match (default: 1). Overridden by `context_before`/`context_after` if specified.         |
 | `context_before`   | number?  | Context lines BEFORE each match (like `grep -B`). Overrides `context` for before-match lines.                                |
 | `context_after`    | number?  | Context lines AFTER each match (like `grep -A`). Overrides `context` for after-match lines.                                  |
@@ -234,7 +233,7 @@ Search file contents using regex or semantic vector search.
 | `offset`           | number?  | Skip first N matches before returning results. Use with `max_results` for pagination.                                        |
 | `output_mode`      | string?  | `content` (default, matching lines with context), `files_with_matches` (file paths only), or `count` (match counts per file) |
 
-Regex search is powered by ripgrep with context lines and per-file match counts. Semantic search queries a Qdrant vector index (see [Semantic Search](#semantic-search)).
+Powered by ripgrep with context lines and per-file match counts.
 
 ### get_diagnostics
 
@@ -451,18 +450,6 @@ Bulk find-and-replace across **multiple files**. Opens a rich preview panel show
 
 For single-file edits, prefer `apply_diff` — it provides better diff review and format-on-save.
 
-### codebase_search
-
-Search the codebase by meaning using vector similarity. Pass a natural language query and get ranked code chunks.
-
-| Parameter | Type    | Description                                                        |
-| --------- | ------- | ------------------------------------------------------------------ |
-| `query`   | string  | Natural language query describing what you're looking for          |
-| `path`    | string? | Directory to scope the search to (omit to search entire workspace) |
-| `limit`   | number? | Maximum number of results to return (default: 10)                  |
-
-Requires a Qdrant vector index (built by Roo Code) and an OpenAI API key. See [Semantic Search](#semantic-search).
-
 ### execute_command
 
 Run a command in VS Code's integrated terminal. Output is captured when shell integration is available.
@@ -479,7 +466,7 @@ Output is capped to the **last 200 lines** by default. Full output is saved to a
 | `terminal_name`       | string?  | Run in a named terminal (e.g. `Server`, `Tests`)                                                                         |
 | `split_from`          | string?  | Split alongside an existing terminal, creating a visual group                                                            |
 | `background`          | boolean? | Run without waiting for completion. Returns immediately with `terminal_id`. Use `get_terminal_output` to check progress. |
-| `timeout`             | number?  | Timeout in seconds                                                                                                       |
+| `timeout`             | number?  | Timeout in seconds. Timed-out commands transition to background state — use `get_terminal_output` with the returned `terminal_id` to check on progress. |
 | `output_head`         | number?  | Return only the first N lines of output                                                                                  |
 | `output_tail`         | number?  | Return only the last N lines of output                                                                                   |
 | `output_offset`       | number?  | Skip first N lines before applying head/tail                                                                             |
@@ -496,17 +483,18 @@ Close managed terminals. With no arguments, closes all terminals created by Agen
 
 ### get_terminal_output
 
-Get the output and status of a background command. Use after `execute_command` with `background: true`.
+Get the output and status of a background or timed-out command. Use after `execute_command` with `background: true`, or after a foreground command that timed out (`timed_out: true` in the response).
 
-| Parameter             | Type    | Description                                          |
-| --------------------- | ------- | ---------------------------------------------------- |
-| `terminal_id`         | string  | Terminal ID returned by `execute_command`            |
-| `wait_seconds`        | number? | Wait up to N seconds for new output before returning |
-| `output_head`         | number? | Return only the first N lines of output              |
-| `output_tail`         | number? | Return only the last N lines of output               |
-| `output_offset`       | number? | Skip first N lines before applying head/tail         |
-| `output_grep`         | string? | Filter output to lines matching this regex           |
-| `output_grep_context` | number? | Context lines around each grep match                 |
+| Parameter             | Type     | Description                                                          |
+| --------------------- | -------- | -------------------------------------------------------------------- |
+| `terminal_id`         | string   | Terminal ID returned by `execute_command`                            |
+| `wait_seconds`        | number?  | Wait up to N seconds for new output before returning                 |
+| `kill`                | boolean? | Send Ctrl+C (SIGINT) to kill the running command. Returns `killed: true`. |
+| `output_head`         | number?  | Return only the first N lines of output                              |
+| `output_tail`         | number?  | Return only the last N lines of output                               |
+| `output_offset`       | number?  | Skip first N lines before applying head/tail                         |
+| `output_grep`         | string?  | Filter output to lines matching this regex                           |
+| `output_grep_context` | number?  | Context lines around each grep match                                 |
 
 ## Sidebar & Approval Panel
 
@@ -572,23 +560,6 @@ When you approve a command or file write, the approval is remembered for a short
 
 Configure with `agentlink.recentApprovalTtl` (seconds). Set to `0` to disable.
 
-## Semantic Search
-
-AgentLink can query a [Qdrant](https://qdrant.tech/) vector index for semantic code search. This is designed to share the index built by [Roo Code](https://github.com/RooVetGit/Roo-Code) — AgentLink doesn't build its own index, it queries the existing one.
-
-### Setup
-
-1. Have Roo Code index your codebase (Roo Code Settings > Codebase Indexing)
-2. Enable in settings:
-
-| Setting                           | Default                 | Description            |
-| --------------------------------- | ----------------------- | ---------------------- |
-| `agentlink.semanticSearchEnabled` | `false`                 | Enable semantic search |
-| `agentlink.qdrantUrl`             | `http://localhost:6333` | Qdrant server URL      |
-
-3. Set your OpenAI API key via **AgentLink: Set OpenAI API Key** in the command palette (stored securely in VS Code's SecretStorage). Falls back to `OPENAI_API_KEY` env var.
-4. Use `search_files` with `semantic: true` — the `regex` parameter is interpreted as a natural language query
-
 ## Multi-Window Support
 
 Each VS Code window runs its own independent MCP server on its own port. The extension writes config to each workspace folder root so that agent instances running in that directory connect to the correct window.
@@ -599,21 +570,19 @@ Each VS Code window runs its own independent MCP server on its own port. The ext
 
 ## Settings
 
-| Setting                            | Default                 | Description                                                                                                      |
-| ---------------------------------- | ----------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `agentlink.agents`                 | `["claude-code"]`       | Which agents to auto-configure (claude-code, copilot, roo-code, cline, kilo-code, codex)                         |
-| `agentlink.port`                   | `0`                     | HTTP port for the MCP server (`0` = OS-assigned, recommended for multi-window)                                   |
-| `agentlink.autoStart`              | `true`                  | Auto-start server on activation                                                                                  |
-| `agentlink.autoUpdateInstructions` | `false`                 | Auto-update agent instruction files on startup (enabled when you click Set Up Instructions during onboarding)    |
-| `agentlink.autoUpdateHooks`        | `false`                 | Auto-update enforcement hooks on startup (enabled when you click Install Hooks during onboarding)                |
-| `agentlink.requireAuth`            | `true`                  | Require Bearer token auth                                                                                        |
-| `agentlink.masterBypass`           | `false`                 | Skip all approval prompts                                                                                        |
-| `agentlink.approvalPosition`       | `panel`                 | Where to show approval dialogs: `beside` (split editor) or `panel` (bottom panel)                                |
-| `agentlink.diagnosticDelay`        | `1500`                  | Max ms to wait for diagnostics after save                                                                        |
-| `agentlink.recentApprovalTtl`      | `60`                    | Seconds to remember single-use approvals. Repeat identical operations auto-approve within this window. `0` = off |
-| `agentlink.writeRules`             | `[]`                    | Glob patterns for auto-approved file writes (settings-level)                                                     |
-| `agentlink.semanticSearchEnabled`  | `false`                 | Enable semantic codebase search via Qdrant index                                                                 |
-| `agentlink.qdrantUrl`              | `http://localhost:6333` | Qdrant vector database URL                                                                                       |
+| Setting                            | Default           | Description                                                                                                      |
+| ---------------------------------- | ----------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `agentlink.agents`                 | `["claude-code"]` | Which agents to auto-configure (claude-code, copilot, roo-code, cline, kilo-code, codex)                         |
+| `agentlink.port`                   | `0`               | HTTP port for the MCP server (`0` = OS-assigned, recommended for multi-window)                                   |
+| `agentlink.autoStart`              | `true`            | Auto-start server on activation                                                                                  |
+| `agentlink.autoUpdateInstructions` | `false`           | Auto-update agent instruction files on startup (enabled when you click Set Up Instructions during onboarding)    |
+| `agentlink.autoUpdateHooks`        | `false`           | Auto-update enforcement hooks on startup (enabled when you click Install Hooks during onboarding)                |
+| `agentlink.requireAuth`            | `true`            | Require Bearer token auth                                                                                        |
+| `agentlink.masterBypass`           | `false`           | Skip all approval prompts                                                                                        |
+| `agentlink.approvalPosition`       | `panel`           | Where to show approval dialogs: `beside` (split editor) or `panel` (bottom panel)                                |
+| `agentlink.diagnosticDelay`        | `1500`            | Max ms to wait for diagnostics after save                                                                        |
+| `agentlink.recentApprovalTtl`      | `60`              | Seconds to remember single-use approvals. Repeat identical operations auto-approve within this window. `0` = off |
+| `agentlink.writeRules`             | `[]`              | Glob patterns for auto-approved file writes (settings-level)                                                     |
 
 ## Platform Notes
 

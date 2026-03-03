@@ -20,96 +20,138 @@ export async function handleGetDiagnostics(params: {
       diagnostics = vscode.languages.getDiagnostics();
     }
 
-    // Build severity filter set
-    const allowedSeverities = parseSeverityFilter(params.severity);
+    // Apply severity filter
+    const severityFilter = params.severity
+      ? parseSeverityFilter(params.severity)
+      : undefined;
 
-    const roots = getWorkspaceRoots();
-    const lines: string[] = [];
+    // Apply source filter
+    const sourceFilter = params.source
+      ? params.source
+          .split(",")
+          .map((s) => s.trim().toLowerCase())
+          .filter(Boolean)
+      : undefined;
+
+    const results: Array<{
+      file: string;
+      diagnostics: Array<{
+        line: number;
+        column: number;
+        severity: string;
+        message: string;
+        source?: string;
+        code?: string | number;
+      }>;
+    }> = [];
 
     for (const [uri, diags] of diagnostics) {
-      if (diags.length === 0) continue;
+      const filteredDiags = diags.filter((d) => {
+        if (severityFilter && !severityFilter.has(d.severity)) return false;
+        if (
+          sourceFilter &&
+          !sourceFilter.some((s) => d.source?.toLowerCase().includes(s))
+        )
+          return false;
+        return true;
+      });
 
-      // Get relative path
-      let relPath = uri.fsPath;
-      for (const root of roots) {
-        if (relPath.startsWith(root + path.sep)) {
-          relPath = path.relative(root, relPath);
-          break;
-        }
-      }
+      if (filteredDiags.length === 0) continue;
 
-      // Build source filter set
-      const allowedSources = params.source
-        ? new Set(params.source.toLowerCase().split(",").map((s) => s.trim()).filter(Boolean))
-        : null;
+      const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      const filePath = workspaceRoot
+        ? path.relative(workspaceRoot, uri.fsPath)
+        : uri.fsPath;
 
-      for (const diag of diags) {
-        if (allowedSeverities && !allowedSeverities.has(diag.severity)) continue;
-        if (allowedSources && (!diag.source || !allowedSources.has(diag.source.toLowerCase()))) continue;
-
-        const severity = severityToString(diag.severity);
-        const line = diag.range.start.line + 1;
-        const col = diag.range.start.character + 1;
-        const source = diag.source ? ` (${diag.source})` : "";
-        lines.push(`[${severity}] ${relPath}:${line}:${col} — ${diag.message}${source}`);
-      }
+      results.push({
+        file: filePath,
+        diagnostics: filteredDiags.map((d) => ({
+          line: d.range.start.line + 1,
+          column: d.range.start.character + 1,
+          severity: severityToString(d.severity),
+          message: d.message,
+          ...(d.source && { source: d.source }),
+          ...(d.code !== undefined && {
+            code:
+              typeof d.code === "object" && d.code !== null
+                ? (d.code as { value: string | number }).value
+                : d.code,
+          }),
+        })),
+      });
     }
 
-    if (lines.length === 0) {
-      return { content: [{ type: "text", text: "No diagnostics found." }] };
+    if (results.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: params.path
+              ? `No diagnostics found for ${params.path}`
+              : "No diagnostics found in workspace",
+          },
+        ],
+      };
     }
 
-    const result = {
-      count: lines.length,
-      diagnostics: lines.join("\n"),
+    return {
+      content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
     };
-
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    return { content: [{ type: "text", text: JSON.stringify({ error: message }) }] };
+    return {
+      content: [{ type: "text", text: `Error: ${message}` }],
+    };
   }
 }
 
-const VALID_SEVERITIES = new Set(["error", "warning", "info", "information", "hint"]);
+const VALID_SEVERITIES = new Set([
+  "error",
+  "warning",
+  "info",
+  "information",
+  "hint",
+]);
 
-function parseSeverityFilter(filter?: string): Set<vscode.DiagnosticSeverity> | null {
-  if (!filter) return null; // no filter = show all
+function parseSeverityFilter(input: string): Set<vscode.DiagnosticSeverity> {
+  const parts = input
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
 
-  const allowed = new Set<vscode.DiagnosticSeverity>();
-  const parts = filter.toLowerCase().split(",").map((s) => s.trim()).filter(Boolean);
-  const unknown: string[] = [];
-
+  const result = new Set<vscode.DiagnosticSeverity>();
   for (const part of parts) {
+    if (!VALID_SEVERITIES.has(part)) continue;
     switch (part) {
-      case "error": allowed.add(vscode.DiagnosticSeverity.Error); break;
-      case "warning": allowed.add(vscode.DiagnosticSeverity.Warning); break;
-      case "info": case "information": allowed.add(vscode.DiagnosticSeverity.Information); break;
-      case "hint": allowed.add(vscode.DiagnosticSeverity.Hint); break;
-      default: unknown.push(part);
+      case "error":
+        result.add(vscode.DiagnosticSeverity.Error);
+        break;
+      case "warning":
+        result.add(vscode.DiagnosticSeverity.Warning);
+        break;
+      case "info":
+      case "information":
+        result.add(vscode.DiagnosticSeverity.Information);
+        break;
+      case "hint":
+        result.add(vscode.DiagnosticSeverity.Hint);
+        break;
     }
   }
-
-  if (allowed.size === 0 && unknown.length > 0) {
-    throw new Error(
-      `Unknown severity filter: ${unknown.join(", ")}. Valid values: error, warning, info, information, hint`,
-    );
-  }
-
-  return allowed.size > 0 ? allowed : null;
+  return result;
 }
 
 function severityToString(severity: vscode.DiagnosticSeverity): string {
   switch (severity) {
     case vscode.DiagnosticSeverity.Error:
-      return "Error";
+      return "error";
     case vscode.DiagnosticSeverity.Warning:
-      return "Warning";
+      return "warning";
     case vscode.DiagnosticSeverity.Information:
-      return "Info";
+      return "info";
     case vscode.DiagnosticSeverity.Hint:
-      return "Hint";
+      return "hint";
     default:
-      return "Unknown";
+      return "unknown";
   }
 }

@@ -103,7 +103,7 @@ export async function handleSearchFiles(
     // Semantic search is handled separately
     if (params.semantic) {
       const { semanticSearch } = await import("../services/semanticSearch.js");
-      return semanticSearch(dirPath, params.regex);
+      return semanticSearch(dirPath, params.regex, params.max_results);
     }
 
     const maxResults = params.max_results ?? DEFAULT_MAX_RESULTS;
