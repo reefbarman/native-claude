@@ -69,7 +69,9 @@ These are the most frequent violations. Check yourself before every tool call:
 - After a session, use `close_terminals` to clean up any stale terminals.
 - `execute_command` runs in a real PTY terminal. Known interactive commands (editors, TUI apps, bare REPLs, scaffolders without `--yes`, git `-i`/`-p` flags, etc.) are **automatically rejected** with a helpful suggestion. Still, always use non-interactive flags where available (e.g. `--yes`, `-y`, `--no-input`, `--non-interactive`, `CI=true`) for commands the validator may not catch.
 - **Always set a `timeout`** for commands you expect to complete quickly (e.g. git, ls, npm test — use 10-30s). This prevents the session from hanging if a command unexpectedly blocks. Only omit timeout for long-running processes (dev servers, watch modes) where you want to wait indefinitely.
-- **`force` parameter** — Commands using `grep`, `cat`, `head`, `tail`, or `sed` are auto-rejected with a suggestion to use the equivalent agentlink tool. If the rejection is a false positive (e.g. the command uses shell expansion like `$(...)` or env vars that agentlink tools can't handle), retry with `force: true` to bypass validation.
+- **`force` parameter** — Commands using `grep`, `cat`, `head`, `tail`, or `sed` are auto-rejected with a suggestion to use the equivalent agentlink tool. Two categories of rejections exist:
+  - **Direct file commands** (e.g. `grep pattern file.txt`, `cat file.txt`) — can be bypassed with `force: true` + `force_reason` when the rejection is a false positive (e.g. shell expansion like `$(...)` or env vars). You MUST provide `force_reason` explaining why.
+  - **Piped filtering** (e.g. `cmd | grep pattern`, `cmd | tail -5`) — **NEVER bypassable**, even with `force: true`. Use `output_grep`, `output_head`, `output_tail` parameters instead. Do NOT retry with force.
 
 ### File editing notes
 

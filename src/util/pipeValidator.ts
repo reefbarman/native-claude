@@ -18,6 +18,8 @@ interface PipeViolation {
 
 interface ValidationResult {
   message: string;
+  /** 'direct' = standalone head/tail/cat/grep/sed; 'pipe' = piped filtering */
+  type: "direct" | "pipe";
   /** For pipe violations: the command with piped filtering segments stripped */
   strippedCommand?: string;
 }
@@ -119,6 +121,7 @@ function checkDirectFileCommands(command: string): ValidationResult | null {
       const hasRedirect = tokens.some((t) => t === ">" || t === ">>");
       if (isHeredoc || hasRedirect) {
         return {
+          type: "direct",
           message: [
             `Command rejected: "cat" with redirection should not be run in the terminal — it bypasses user review.`,
             `\nUse the write_file or apply_diff tool instead — they open a diff view for the user to review and approve changes, and return diagnostics from the language server.`,
@@ -142,6 +145,7 @@ function checkDirectFileCommands(command: string): ValidationResult | null {
       );
       if (hasSedInPlace) {
         return {
+          type: "direct",
           message: [
             `Command rejected: "sed -i" edits files in-place, bypassing user review.`,
             ``,
@@ -165,6 +169,7 @@ function checkDirectFileCommands(command: string): ValidationResult | null {
       );
       if (hasQuietFlag) {
         return {
+          type: "direct",
           message: [
             `Command rejected: "sed -n" reads/filters file content in the terminal.`,
             ``,
@@ -179,6 +184,7 @@ function checkDirectFileCommands(command: string): ValidationResult | null {
       const sedFileArg = findSedFileArg(sedArgs);
       if (sedFileArg) {
         return {
+          type: "direct",
           message: [
             `Command rejected: "sed" with a file argument should not be run in the terminal.`,
             ``,
@@ -225,7 +231,7 @@ function checkDirectFileCommands(command: string): ValidationResult | null {
       );
     }
 
-    return { message: lines.join("\n") };
+    return { type: "direct", message: lines.join("\n") };
   }
 
   return null;
@@ -428,8 +434,13 @@ function detectPipedFiltering(command: string): ValidationResult | null {
   lines.push(`Use these tool parameters instead:\n${paramList}`);
   lines.push("");
   lines.push(`Run this command instead: ${strippedCommand}`);
+  lines.push("");
+  lines.push(
+    `Do NOT retry with force=true — pipe filtering is never a false positive. Use the suggested parameters instead.`,
+  );
 
   return {
+    type: "pipe",
     message: lines.join("\n"),
     strippedCommand,
   };
@@ -452,9 +463,17 @@ function checkSegment(segment: string): PipeViolation | null {
 
   switch (cmd) {
     case "head":
-      return { command: cmd, segment, suggestions: ensurePositive(parseHeadArgs(args)) };
+      return {
+        command: cmd,
+        segment,
+        suggestions: ensurePositive(parseHeadArgs(args)),
+      };
     case "tail":
-      return { command: cmd, segment, suggestions: ensurePositive(parseTailArgs(args)) };
+      return {
+        command: cmd,
+        segment,
+        suggestions: ensurePositive(parseTailArgs(args)),
+      };
     case "grep":
       return { command: cmd, segment, suggestions: parseGrepArgs(args) };
     default:

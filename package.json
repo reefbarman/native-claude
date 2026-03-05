@@ -2,7 +2,7 @@
   "name": "agentlink",
   "displayName": "AgentLink",
   "description": "MCP server that provides AI agents with native VS Code tools — diff-based file editing, integrated terminal, diagnostics",
-  "version": "1.2.0",
+  "version": "1.2.4",
   "publisher": "agentlink",
   "repository": {
     "type": "git",

@@ -18,7 +18,10 @@ describe("splitCompoundCommand", () => {
   });
 
   it("splits on ;", () => {
-    expect(splitCompoundCommand("echo a; echo b")).toEqual(["echo a", "echo b"]);
+    expect(splitCompoundCommand("echo a; echo b")).toEqual([
+      "echo a",
+      "echo b",
+    ]);
   });
 
   it("splits on | (pipe)", () => {
@@ -27,7 +30,11 @@ describe("splitCompoundCommand", () => {
 
   it("handles mixed operators", () => {
     expect(splitCompoundCommand("a && b | c; d || e")).toEqual([
-      "a", "b", "c", "d", "e",
+      "a",
+      "b",
+      "c",
+      "d",
+      "e",
     ]);
   });
 
@@ -59,6 +66,48 @@ describe("splitCompoundCommand", () => {
     // &&& → && + & (ampersand). First && splits, then & stays in next part
     const result = splitCompoundCommand("a &&& b");
     expect(result).toEqual(["a", "& b"]);
+  });
+
+  it("splits on newlines", () => {
+    expect(splitCompoundCommand("echo a\necho b")).toEqual([
+      "echo a",
+      "echo b",
+    ]);
+  });
+
+  it("strips # comments (whole line)", () => {
+    expect(splitCompoundCommand("# this is a comment\ngh api foo")).toEqual([
+      "gh api foo",
+    ]);
+  });
+
+  it("strips # comments (inline after command)", () => {
+    expect(splitCompoundCommand("echo hello # greeting\nls")).toEqual([
+      "echo hello",
+      "ls",
+    ]);
+  });
+
+  it("preserves # inside double quotes", () => {
+    expect(splitCompoundCommand('echo "# not a comment"')).toEqual([
+      'echo "# not a comment"',
+    ]);
+  });
+
+  it("preserves # inside single quotes", () => {
+    expect(splitCompoundCommand("echo '# not a comment'")).toEqual([
+      "echo '# not a comment'",
+    ]);
+  });
+
+  it("handles comment-only input", () => {
+    expect(splitCompoundCommand("# just a comment")).toEqual([]);
+  });
+
+  it("handles comment before compound command", () => {
+    expect(splitCompoundCommand("# Check logs\ngh api foo 2>&1")).toEqual([
+      "gh api foo 2>&1",
+    ]);
   });
 });
 

@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { sanitizeRegex, getEscapingHint } from "./searchFiles.js";
+import {
+  sanitizeRegex,
+  getEscapingHint,
+  needsMultiline,
+} from "./searchFiles.js";
 
 describe("sanitizeRegex", () => {
   it("collapses double-escaped character classes", () => {
@@ -103,5 +107,30 @@ describe("getEscapingHint", () => {
 
   it("detects double-escaped forward slash", () => {
     expect(getEscapingHint("\\\\/")).toBeDefined();
+  });
+});
+
+describe("needsMultiline", () => {
+  it("returns true for regex containing \\n", () => {
+    expect(needsMultiline("\\n")).toBe(true);
+    expect(needsMultiline("foo\\nbar")).toBe(true);
+    expect(needsMultiline("\\s*\\n\\s*")).toBe(true);
+  });
+
+  it("returns false for plain text without \\n", () => {
+    expect(needsMultiline("hello world")).toBe(false);
+    expect(needsMultiline("foo")).toBe(false);
+    expect(needsMultiline("")).toBe(false);
+  });
+
+  it("returns false for escaped backslash before n (\\\\n)", () => {
+    // String value: \\n — matches literal backslash + n text, not a newline
+    expect(needsMultiline("\\\\n")).toBe(false);
+  });
+
+  it("works with sanitized regex from common Claude patterns", () => {
+    // After sanitizeRegex, double-escaped \\n becomes \n
+    const sanitized = sanitizeRegex("servers:\\\\s*\\\\n\\\\s*-\\\\s*url:");
+    expect(needsMultiline(sanitized)).toBe(true);
   });
 });

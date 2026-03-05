@@ -39,6 +39,15 @@ export function sanitizeRegex(regex: string): string {
 /**
  * Check if a regex pattern appears to be double-escaped and return a hint.
  */
+/**
+ * Check if a sanitized regex requires multiline mode (contains \n).
+ */
+export function needsMultiline(sanitizedRegex: string): boolean {
+  // After sanitization, a literal \n in the regex means the agent wants to match newlines.
+  // We look for the two-character sequence backslash + 'n' not preceded by another backslash.
+  return /(?<!\\)\\n/.test(sanitizedRegex);
+}
+
 export function getEscapingHint(regex: string): string | undefined {
   // Look for patterns like \\s, \\d, \\(, \\{ that suggest double-escaping
   if (/\\\\[sSdDwWbBntrf(){}[\].|+*?^$/]/.test(regex)) {
@@ -127,7 +136,8 @@ export async function handleSearchFiles(
     const contextBefore = params.context_before ?? params.context ?? 1;
     const contextAfter = params.context_after ?? params.context ?? 1;
     const offset = params.offset ?? 0;
-    const args = ["--json", "-e", sanitizeRegex(params.regex), "--no-messages"];
+    const sanitized = sanitizeRegex(params.regex);
+    const args = ["--json", "-e", sanitized, "--no-messages"];
 
     // Use asymmetric -B/-A when they differ, symmetric -C when equal
     if (contextBefore === contextAfter) {
@@ -139,7 +149,7 @@ export async function handleSearchFiles(
     if (params.case_insensitive) {
       args.push("--ignore-case");
     }
-    if (params.multiline) {
+    if (params.multiline || needsMultiline(sanitized)) {
       args.push("--multiline", "--multiline-dotall");
     }
 
@@ -277,15 +287,12 @@ async function searchFilesOnly(
     offset?: number;
   },
 ): Promise<ToolResult> {
-  const args = [
-    "--files-with-matches",
-    "-e",
-    sanitizeRegex(params.regex),
-    "--no-messages",
-  ];
+  const sanitized = sanitizeRegex(params.regex);
+  const args = ["--files-with-matches", "-e", sanitized, "--no-messages"];
 
   if (params.case_insensitive) args.push("--ignore-case");
-  if (params.multiline) args.push("--multiline", "--multiline-dotall");
+  if (params.multiline || needsMultiline(sanitized))
+    args.push("--multiline", "--multiline-dotall");
   if (params.file_pattern) args.push("--glob", params.file_pattern);
   args.push(dirPath);
 
@@ -348,10 +355,12 @@ async function searchCount(
     offset?: number;
   },
 ): Promise<ToolResult> {
-  const args = ["--count", "-e", sanitizeRegex(params.regex), "--no-messages"];
+  const sanitized = sanitizeRegex(params.regex);
+  const args = ["--count", "-e", sanitized, "--no-messages"];
 
   if (params.case_insensitive) args.push("--ignore-case");
-  if (params.multiline) args.push("--multiline", "--multiline-dotall");
+  if (params.multiline || needsMultiline(sanitized))
+    args.push("--multiline", "--multiline-dotall");
   if (params.file_pattern) args.push("--glob", params.file_pattern);
   args.push(dirPath);
 

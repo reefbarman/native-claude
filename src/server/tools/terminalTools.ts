@@ -84,7 +84,13 @@ export function registerTerminalTools(ctx: ToolRegistrationContext): void {
           .boolean()
           .optional()
           .describe(
-            "Bypass command validation (the auto-rejection of grep, cat, head, tail, sed). Use when the rejection is a false positive — e.g. commands with shell expansion ($(), env vars) in arguments.",
+            "Bypass command validation for direct file-reading commands (grep, cat, head, tail, sed on files). Only use when the rejection is a false positive — e.g. commands with shell expansion ($(), env vars) in arguments. Does NOT bypass pipe filtering rejections (cmd | grep/head/tail) — use output_grep/output_head/output_tail params instead.",
+          ),
+        force_reason: z
+          .string()
+          .optional()
+          .describe(
+            "Required when force=true. Explain why the rejection is a false positive (e.g. 'grep target is a $VAR path that read_file cannot resolve'). Commands with force=true but no force_reason will be rejected.",
           ),
       },
       annotations: { readOnlyHint: false, openWorldHint: true },
@@ -191,5 +197,4 @@ export function registerTerminalTools(ctx: ToolRegistrationContext): void {
       sid,
     ),
   );
-
 }

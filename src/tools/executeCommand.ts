@@ -37,6 +37,7 @@ export async function handleExecuteCommand(
     output_grep?: string;
     output_grep_context?: number;
     force?: boolean;
+    force_reason?: string;
   },
   approvalManager: ApprovalManager,
   approvalPanel: ApprovalPanelProvider,
@@ -46,7 +47,12 @@ export async function handleExecuteCommand(
   try {
     if (!params.command || params.command.trim().length === 0) {
       return {
-        content: [{ type: "text", text: JSON.stringify({ error: "Command cannot be empty" }) }],
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ error: "Command cannot be empty" }),
+          },
+        ],
       };
     }
 
@@ -69,10 +75,25 @@ export async function handleExecuteCommand(
     let approvalFollowUp: string | undefined;
 
     // Reject disallowed command patterns (direct head/tail/cat/grep, piped filtering)
-    // Skip when force=true — the agent believes the rejection is a false positive
-    if (!params.force) {
-      const commandViolation = validateCommand(params.command);
-      if (commandViolation) {
+    const commandViolation = validateCommand(params.command);
+    if (commandViolation) {
+      // force=true can only bypass "direct" violations (shell expansion false positives),
+      // never "pipe" violations — those have dedicated output_* params with no false positives.
+      const canBypass =
+        params.force &&
+        commandViolation.type === "direct" &&
+        params.force_reason;
+
+      if (!canBypass) {
+        const reason =
+          params.force && commandViolation.type === "pipe"
+            ? commandViolation.message +
+              "\n\nforce=true cannot bypass pipe filtering rejections. Use the output_grep/output_head/output_tail parameters instead."
+            : params.force && !params.force_reason
+              ? commandViolation.message +
+                "\n\nforce=true requires a force_reason explaining why the rejection is a false positive."
+              : commandViolation.message;
+
         return {
           content: [
             {
@@ -80,7 +101,7 @@ export async function handleExecuteCommand(
               text: JSON.stringify({
                 status: "rejected",
                 command: params.command,
-                reason: commandViolation.message,
+                reason,
               }),
             },
           ],

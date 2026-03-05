@@ -304,6 +304,43 @@ describe("validateCommand", () => {
     });
   });
 
+  // ── Violation type field ──────────────────────────────────────────
+
+  describe("violation type", () => {
+    it("direct violations have type 'direct'", () => {
+      const result = validateCommand("cat somefile.txt");
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe("direct");
+    });
+
+    it("sed violations have type 'direct'", () => {
+      const result = validateCommand("sed -i 's/a/b/' file.txt");
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe("direct");
+    });
+
+    it("pipe violations have type 'pipe'", () => {
+      const result = validateCommand("ls -la | head -5");
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe("pipe");
+    });
+
+    it("pipe violations include force=true warning", () => {
+      const result = validateCommand("npm ls | grep express");
+      expect(result).not.toBeNull();
+      expect(result!.message).toContain("Do NOT retry with force=true");
+    });
+
+    it("chained pipe violations have type 'pipe'", () => {
+      const result = validateCommand(
+        "make build 2>&1 | grep -E 'error|warning' | tail -10",
+      );
+      expect(result).not.toBeNull();
+      expect(result!.type).toBe("pipe");
+      expect(result!.message).toContain("Do NOT retry with force=true");
+    });
+  });
+
   // ── Edge cases ────────────────────────────────────────────────────
 
   describe("edge cases", () => {

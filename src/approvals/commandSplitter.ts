@@ -1,6 +1,6 @@
 /**
- * Split a compound shell command on &&, ||, |, ; while respecting
- * single/double quotes and backslash escapes.
+ * Split a compound shell command on &&, ||, |, ;, and newlines while
+ * respecting single/double quotes, backslash escapes, and # comments.
  */
 export function splitCompoundCommand(command: string): string[] {
   const parts: string[] = [];
@@ -35,6 +35,31 @@ export function splitCompoundCommand(command: string): string[] {
 
     // Only split when outside quotes
     if (!inSingle && !inDouble) {
+      // # comment — skip to end of line (only at word boundary:
+      // start of command, or preceded by whitespace/separator)
+      if (ch === "#" && (current.trim() === "" || /\s$/.test(current))) {
+        // Flush anything before the comment
+        const trimmed = current.trim();
+        if (trimmed) parts.push(trimmed);
+        current = "";
+        // Skip to end of line or end of string
+        while (i < command.length && command[i] !== "\n") {
+          i++;
+        }
+        // Skip the newline itself
+        if (i < command.length) i++;
+        continue;
+      }
+
+      // Newline — treat like ;
+      if (ch === "\n") {
+        const trimmed = current.trim();
+        if (trimmed) parts.push(trimmed);
+        current = "";
+        i++;
+        continue;
+      }
+
       // && operator
       if (ch === "&" && i + 1 < command.length && command[i + 1] === "&") {
         const trimmed = current.trim();
@@ -90,21 +115,41 @@ const WRAPPERS = new Map<string, Set<string>>([
   [
     "sudo",
     new Set([
-      "-u", "--user", "-g", "--group", "-C", "-D", "-R", "-T",
-      "-r", "--role", "-t", "--type", "-p", "--prompt",
+      "-u",
+      "--user",
+      "-g",
+      "--group",
+      "-C",
+      "-D",
+      "-R",
+      "-T",
+      "-r",
+      "--role",
+      "-t",
+      "--type",
+      "-p",
+      "--prompt",
     ]),
   ],
   [
     "xargs",
     new Set([
-      "-I", "-L", "-n", "-P", "-d", "-s", "-E", "-a",
-      "--arg-file", "--delimiter", "--max-args", "--max-procs", "--replace",
+      "-I",
+      "-L",
+      "-n",
+      "-P",
+      "-d",
+      "-s",
+      "-E",
+      "-a",
+      "--arg-file",
+      "--delimiter",
+      "--max-args",
+      "--max-procs",
+      "--replace",
     ]),
   ],
-  [
-    "env",
-    new Set(["-u", "--unset", "-C", "--chdir", "-S", "--split-string"]),
-  ],
+  ["env", new Set(["-u", "--unset", "-C", "--chdir", "-S", "--split-string"])],
   ["nice", new Set(["-n", "--adjustment"])],
   ["timeout", new Set(["-s", "--signal", "-k", "--kill-after"])],
   ["watch", new Set(["-n", "--interval", "-d", "--differences"])],

@@ -585,7 +585,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     // Build connected agents list from all MCP sessions (not just approval sessions).
     // This is outside the approvalManager block so trust-state changes always
     // propagate to the sidebar even before any approval interaction.
-    const STALE_REMOVE_MS = 5 * 60_000;
+    const STALE_REMOVE_MS = 2 * 60_000;
     const now = Date.now();
     this.state.connectedAgents = mcpSessions
       .filter((s) => now - s.lastActivity < STALE_REMOVE_MS)
