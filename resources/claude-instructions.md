@@ -50,10 +50,10 @@ These are the most frequent violations. Check yourself before every tool call:
 
 | Instead of (built-in) | Use (agentlink MCP)         | Why                                                                                                                                          |
 | --------------------- | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Read`                | `read_file`                 | Returns line numbers, file metadata, git status, and diagnostics summary                                                                     |
+| `Read`                | `read_file`                 | Returns line numbers, file metadata, git status, and diagnostics summary. Supports `query` param for semantic offset.                        |
 | `Edit` / `Write`      | `apply_diff` / `write_file` | Opens a diff view for user review. Format-on-save applies automatically. Returns user edits and diagnostics.                                 |
 | `Bash`                | `execute_command`           | Runs in VS Code's integrated terminal (visible to user). Captures output via shell integration. Supports named terminals for parallel tasks. |
-| `Glob`                | `list_files`                | Lists files with optional recursive + depth control                                                                                          |
+| `Glob`                | `list_files`                | Lists files with optional recursive + depth control. Supports `query` param for semantic file discovery.                                     |
 | `Grep`                | `search_files`              | Ripgrep-powered search with context lines.                                                                                                   |
 
 ### Terminal behavior — IMPORTANT
@@ -79,7 +79,16 @@ These are the most frequent violations. Check yourself before every tool call:
 - If `user_edits` is present, the user modified your proposed changes — read the patch to understand what they changed.
 - Use `get_diagnostics` for real VS Code errors/warnings from language services.
 
-### Semantic search — use `codebase_search` FIRST
+### Semantic navigation — `query` param on `read_file` and `list_files`
+
+When the codebase index is available, `read_file` and `list_files` both accept an optional `query` parameter for semantic navigation:
+
+- **`read_file` with `query`** — Jumps to the most relevant section of a file. Instead of reading from line 1 or guessing an offset, pass a natural language query (e.g. `read_file("src/server.ts", query: "error handling middleware")`) and the tool auto-sets the offset to the best matching chunk. Ignored if `offset` is explicitly provided. The response includes a `semantic_match` field showing the matched line range.
+- **`list_files` with `query`** — Finds files by meaning, not name. Pass a natural language query (e.g. `list_files("src/", query: "authentication")`) and get files ranked by semantic relevance. Other params (`recursive`, `depth`, `pattern`) are ignored when `query` is provided.
+
+Use these to reduce context-gathering round-trips: `list_files` with `query` to find relevant files, then `read_file` with `query` to land on the right section.
+
+### Search strategy — use `codebase_search` FIRST
 
 When exploring code, understanding architecture, or investigating how something works, **always start with `codebase_search`** before falling back to `search_files` regex search. Semantic search finds conceptually related code even when you don't know the exact names, patterns, or file locations.
 
@@ -98,6 +107,20 @@ When exploring code, understanding architecture, or investigating how something 
 - You need to count occurrences or find-and-replace
 
 **Combine both:** Start with `codebase_search` to discover relevant files and concepts, then use `search_files` for precise lookups within those files.
+
+**Prefer `list_files` with `query` over `codebase_search` when:**
+
+- You need to know *which files* are relevant, not see code snippets — e.g. "which files handle auth?" → `list_files("src/", query: "authentication")`
+- You're planning edits and need a file list to work through
+- You already know the directory to scope to
+
+**Always use `read_file` with `query` when:**
+
+- You know the file but not the exact line — e.g. `read_file("src/server.ts", query: "error handling")` instead of reading from line 1 and scrolling
+- The file is large (>200 lines) and you need a specific section
+- You're following up on a `codebase_search` or `list_files` result — pass the same query to `read_file` to land on the right spot
+
+**Do NOT** read a file from line 1 and then search within it when a `query` param would find the section directly. The `query` param saves a round-trip.
 
 ### Additional tools (no built-in equivalent)
 

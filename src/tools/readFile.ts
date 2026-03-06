@@ -14,6 +14,7 @@ import { SYMBOL_KIND_NAMES } from "./languageFeatures.js";
 import { Semaphore } from "../util/Semaphore.js";
 
 import { type ToolResult } from "../shared/types.js";
+import { semanticFileQuery } from "../services/semanticSearch.js";
 
 // --- Image support ---
 
@@ -316,6 +317,7 @@ export async function handleReadFile(
     offset?: number;
     limit?: number;
     include_symbols?: boolean;
+    query?: string;
   },
   approvalManager: ApprovalManager,
   approvalPanel: ApprovalPanelProvider,
@@ -405,7 +407,20 @@ export async function handleReadFile(
     const allLines = raw.split("\n");
     const totalLines = allLines.length;
 
-    const offset = Math.max(1, params.offset ?? 1);
+    // Semantic offset: when query is provided and no explicit offset, use the
+    // index to jump to the most relevant section of the file.
+    let semanticHit: { startLine: number; endLine: number } | null = null;
+    if (params.query && params.offset == null) {
+      const wsRoot = tryGetFirstWorkspaceRoot();
+      if (wsRoot) {
+        const relPath = path.relative(wsRoot, filePath);
+        semanticHit = await semanticFileQuery(relPath, params.query);
+      }
+    }
+
+    const offset = semanticHit
+      ? Math.max(1, semanticHit.startLine - 5) // 5 lines of context before the match
+      : Math.max(1, params.offset ?? 1);
 
     if (offset > totalLines) {
       const emptyResult: Record<string, unknown> = {
@@ -460,6 +475,15 @@ export async function handleReadFile(
     const showingAll = offset === 1 && lines.length === totalLines;
     if (!showingAll) {
       result.truncated = true;
+    }
+
+    // Semantic match info
+    if (semanticHit) {
+      result.semantic_match = {
+        query: params.query,
+        startLine: semanticHit.startLine,
+        endLine: semanticHit.endLine,
+      };
     }
 
     // File metadata

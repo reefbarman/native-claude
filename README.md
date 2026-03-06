@@ -179,12 +179,13 @@ Each agent connects to the same MCP server, so they share the same approval rule
 
 Read file contents with line numbers. Returns rich metadata that built-in read tools cannot provide.
 
-| Parameter         | Type     | Description                                        |
-| ----------------- | -------- | -------------------------------------------------- |
-| `path`            | string   | File path (absolute or relative to workspace root) |
-| `offset`          | number?  | Starting line number (1-indexed, default: 1)       |
-| `limit`           | number?  | Maximum lines to read (default: 2000)              |
-| `include_symbols` | boolean? | Include top-level symbol outline (default: true)   |
+| Parameter         | Type     | Description                                                                                                                                        |
+| ----------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `path`            | string   | File path (absolute or relative to workspace root)                                                                                                 |
+| `offset`          | number?  | Starting line number (1-indexed, default: 1)                                                                                                       |
+| `limit`           | number?  | Maximum lines to read (default: 2000)                                                                                                              |
+| `include_symbols` | boolean? | Include top-level symbol outline (default: true)                                                                                                   |
+| `query`           | string?  | Semantic search query to jump to the most relevant section. Auto-sets offset using the codebase index. Ignored if `offset` is explicitly provided. |
 
 **Response includes:**
 
@@ -195,6 +196,7 @@ Read file contents with line numbers. Returns rich metadata that built-in read t
 - `diagnostics` — `{ errors: N, warnings: N }` summary from language services
 - `symbols` — top-level symbols grouped by kind (e.g. `{ "function": ["foo (line 1)"], "class": ["Bar (line 20)"] }`). Automatically skipped for JSON/JSONC files.
 - `content` — numbered lines in `line_number | content` format
+- `semantic_match` — when `query` is used: `{ query, startLine, endLine }` showing the matched chunk
 
 Fields like `git_status`, `diagnostics`, and `symbols` are omitted when not available rather than returned as null.
 
@@ -206,14 +208,17 @@ Fields like `git_status`, `diagnostics`, and `symbols` are omitted when not avai
 
 List files and directories. Directories have a trailing `/` suffix.
 
-| Parameter   | Type     | Description                                                                       |
-| ----------- | -------- | --------------------------------------------------------------------------------- |
-| `path`      | string   | Directory path                                                                    |
-| `recursive` | boolean? | List recursively (default: false)                                                 |
-| `depth`     | number?  | Max directory depth for recursive listing                                         |
-| `pattern`   | string?  | Glob pattern to filter files (e.g. `*.ts`, `*.test.*`). Implies recursive search. |
+| Parameter   | Type     | Description                                                                                                                                                                |
+| ----------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `path`      | string   | Directory path                                                                                                                                                             |
+| `recursive` | boolean? | List recursively (default: false)                                                                                                                                          |
+| `depth`     | number?  | Max directory depth for recursive listing                                                                                                                                  |
+| `pattern`   | string?  | Glob pattern to filter files (e.g. `*.ts`, `*.test.*`). Implies recursive search.                                                                                          |
+| `query`     | string?  | Semantic search query to find files by meaning (e.g. `"authentication logic"`). Returns files ranked by relevance. Other params ignored when set. Requires codebase index. |
 
 Recursive listing uses ripgrep (`--files` mode) for speed and automatic `.gitignore` support.
+
+**Semantic mode:** When `query` is provided, the response includes `semantic: true`, files ranked by score, and `count`. Other listing params are ignored.
 
 ### search_files
 
@@ -458,20 +463,20 @@ Run a command in VS Code's integrated terminal. Output is captured when shell in
 
 Output is capped to the **last 200 lines** by default. Full output is saved to a temp file (returned as `output_file`) for on-demand access via `read_file`. Use `output_head`, `output_tail`, or `output_grep` to customize filtering.
 
-| Parameter             | Type     | Description                                                                                                              |
-| --------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `command`             | string   | Shell command to execute                                                                                                 |
-| `cwd`                 | string?  | Working directory                                                                                                        |
-| `terminal_id`         | string?  | Reuse a specific terminal by ID                                                                                          |
-| `terminal_name`       | string?  | Run in a named terminal (e.g. `Server`, `Tests`)                                                                         |
-| `split_from`          | string?  | Split alongside an existing terminal, creating a visual group                                                            |
-| `background`          | boolean? | Run without waiting for completion. Returns immediately with `terminal_id`. Use `get_terminal_output` to check progress. |
+| Parameter             | Type     | Description                                                                                                                                             |
+| --------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `command`             | string   | Shell command to execute                                                                                                                                |
+| `cwd`                 | string?  | Working directory                                                                                                                                       |
+| `terminal_id`         | string?  | Reuse a specific terminal by ID                                                                                                                         |
+| `terminal_name`       | string?  | Run in a named terminal (e.g. `Server`, `Tests`)                                                                                                        |
+| `split_from`          | string?  | Split alongside an existing terminal, creating a visual group                                                                                           |
+| `background`          | boolean? | Run without waiting for completion. Returns immediately with `terminal_id`. Use `get_terminal_output` to check progress.                                |
 | `timeout`             | number?  | Timeout in seconds. Timed-out commands transition to background state — use `get_terminal_output` with the returned `terminal_id` to check on progress. |
-| `output_head`         | number?  | Return only the first N lines of output                                                                                  |
-| `output_tail`         | number?  | Return only the last N lines of output                                                                                   |
-| `output_offset`       | number?  | Skip first N lines before applying head/tail                                                                             |
-| `output_grep`         | string?  | Filter output to lines matching this regex (case-insensitive)                                                            |
-| `output_grep_context` | number?  | Context lines around each grep match                                                                                     |
+| `output_head`         | number?  | Return only the first N lines of output                                                                                                                 |
+| `output_tail`         | number?  | Return only the last N lines of output                                                                                                                  |
+| `output_offset`       | number?  | Skip first N lines before applying head/tail                                                                                                            |
+| `output_grep`         | string?  | Filter output to lines matching this regex (case-insensitive)                                                                                           |
+| `output_grep_context` | number?  | Context lines around each grep match                                                                                                                    |
 
 ### close_terminals
 
@@ -485,16 +490,16 @@ Close managed terminals. With no arguments, closes all terminals created by Agen
 
 Get the output and status of a background or timed-out command. Use after `execute_command` with `background: true`, or after a foreground command that timed out (`timed_out: true` in the response).
 
-| Parameter             | Type     | Description                                                          |
-| --------------------- | -------- | -------------------------------------------------------------------- |
-| `terminal_id`         | string   | Terminal ID returned by `execute_command`                            |
-| `wait_seconds`        | number?  | Wait up to N seconds for new output before returning                 |
+| Parameter             | Type     | Description                                                               |
+| --------------------- | -------- | ------------------------------------------------------------------------- |
+| `terminal_id`         | string   | Terminal ID returned by `execute_command`                                 |
+| `wait_seconds`        | number?  | Wait up to N seconds for new output before returning                      |
 | `kill`                | boolean? | Send Ctrl+C (SIGINT) to kill the running command. Returns `killed: true`. |
-| `output_head`         | number?  | Return only the first N lines of output                              |
-| `output_tail`         | number?  | Return only the last N lines of output                               |
-| `output_offset`       | number?  | Skip first N lines before applying head/tail                         |
-| `output_grep`         | string?  | Filter output to lines matching this regex                           |
-| `output_grep_context` | number?  | Context lines around each grep match                                 |
+| `output_head`         | number?  | Return only the first N lines of output                                   |
+| `output_tail`         | number?  | Return only the last N lines of output                                    |
+| `output_offset`       | number?  | Skip first N lines before applying head/tail                              |
+| `output_grep`         | string?  | Filter output to lines matching this regex                                |
+| `output_grep_context` | number?  | Context lines around each grep match                                      |
 
 ## Sidebar & Approval Panel
 

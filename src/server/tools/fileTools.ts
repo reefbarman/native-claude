@@ -6,15 +6,8 @@ import { handleGetDiagnostics } from "../../tools/getDiagnostics.js";
 import type { ToolRegistrationContext } from "./types.js";
 
 export function registerFileTools(ctx: ToolRegistrationContext): void {
-  const {
-    server,
-    tracker,
-    approvalManager,
-    approvalPanel,
-    sid,
-    touch,
-    desc,
-  } = ctx;
+  const { server, tracker, approvalManager, approvalPanel, sid, touch, desc } =
+    ctx;
 
   server.registerTool(
     "read_file",
@@ -37,6 +30,12 @@ export function registerFileTools(ctx: ToolRegistrationContext): void {
           .optional()
           .describe(
             "Include top-level symbol outline (functions, classes, interfaces). Default: true. Set to false to suppress.",
+          ),
+        query: z
+          .string()
+          .optional()
+          .describe(
+            "Semantic search query to jump to the most relevant section of the file. Uses the codebase index to find the best matching code chunk and auto-sets the offset. Ignored if offset is explicitly provided. Requires codebase index.",
           ),
       },
       annotations: { readOnlyHint: true, openWorldHint: false },
@@ -75,6 +74,12 @@ export function registerFileTools(ctx: ToolRegistrationContext): void {
           .optional()
           .describe(
             "Glob pattern to filter files (e.g. '*.ts', '*.test.*'). Implies recursive search. Uses ripgrep glob syntax.",
+          ),
+        query: z
+          .string()
+          .optional()
+          .describe(
+            "Semantic search query to find files by meaning (e.g. 'authentication logic', 'database migrations'). Returns files ranked by relevance using the codebase index. Other params (recursive, depth, pattern) are ignored when query is provided. Requires codebase index.",
           ),
       },
       annotations: { readOnlyHint: true, openWorldHint: false },
