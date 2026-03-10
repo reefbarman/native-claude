@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import Anthropic from "@anthropic-ai/sdk";
+import type { ContentBlock } from "./providers/types.js";
 import { AgentSession } from "./AgentSession.js";
 import type { AgentConfig } from "./types.js";
 import { buildSystemPrompt } from "./systemPrompt.js";
@@ -83,6 +83,25 @@ describe("AgentSession", () => {
       expect(session.title).toBe("New Chat");
     });
 
+    it("stores providerId when specified", async () => {
+      const session = await makeSession({ providerId: "codex" });
+      expect(session.providerId).toBe("codex");
+    });
+
+    it("providerId is undefined when not specified", async () => {
+      const session = await makeSession();
+      expect(session.providerId).toBeUndefined();
+    });
+
+    it("passes providerId to buildSystemPrompt on create", async () => {
+      await makeSession({ providerId: "codex" });
+      expect(mockedBuildSystemPrompt).toHaveBeenCalledWith(
+        "code",
+        "/test",
+        expect.objectContaining({ providerId: "codex" }),
+      );
+    });
+
     it("defaults autoCondenseThreshold to 0.9 when not provided", async () => {
       const configWithoutThreshold: AgentConfig = {
         ...testConfig,
@@ -108,9 +127,7 @@ describe("AgentSession", () => {
 
     it("appendAssistantTurn appends an assistant message", async () => {
       const session = await makeSession();
-      const blocks: Anthropic.ContentBlock[] = [
-        { type: "text", text: "response", citations: [] },
-      ];
+      const blocks: ContentBlock[] = [{ type: "text", text: "response" }];
       session.appendAssistantTurn(blocks);
       const messages = session.getMessages();
       expect(messages).toHaveLength(1);
@@ -137,18 +154,14 @@ describe("AgentSession", () => {
       expect(session.messageCount).toBe(0);
       session.addUserMessage("one");
       expect(session.messageCount).toBe(1);
-      session.appendAssistantTurn([
-        { type: "text", text: "two", citations: [] },
-      ]);
+      session.appendAssistantTurn([{ type: "text", text: "two" }]);
       expect(session.messageCount).toBe(2);
     });
 
     it("getMessages returns all messages in order", async () => {
       const session = await makeSession();
       session.addUserMessage("user msg");
-      session.appendAssistantTurn([
-        { type: "text", text: "assistant msg", citations: [] },
-      ]);
+      session.appendAssistantTurn([{ type: "text", text: "assistant msg" }]);
       const msgs = session.getMessages();
       expect(msgs[0].role).toBe("user");
       expect(msgs[1].role).toBe("assistant");
@@ -179,9 +192,7 @@ describe("AgentSession", () => {
 
     it("does nothing when first message has non-string content", async () => {
       const session = await makeSession();
-      session.appendAssistantTurn([
-        { type: "text", text: "hello", citations: [] },
-      ]);
+      session.appendAssistantTurn([{ type: "text", text: "hello" }]);
       session.autoTitle();
       expect(session.title).toBe("New Chat");
     });
@@ -274,6 +285,33 @@ describe("AgentSession", () => {
         role: "user",
         content: "keep this context",
       });
+    });
+
+    it("setMode passes stored providerId to buildSystemPrompt", async () => {
+      const session = await makeSession({ providerId: "codex" });
+      mockedBuildSystemPrompt.mockClear();
+      mockedBuildSystemPrompt.mockResolvedValueOnce("mock ask prompt");
+      await session.setMode("ask");
+      expect(mockedBuildSystemPrompt).toHaveBeenCalledWith(
+        "ask",
+        "/test",
+        expect.objectContaining({ providerId: "codex" }),
+      );
+    });
+  });
+
+  describe("rebuildSystemPrompt", () => {
+    it("passes stored providerId to buildSystemPrompt", async () => {
+      const session = await makeSession({ providerId: "codex" });
+      mockedBuildSystemPrompt.mockClear();
+      mockedBuildSystemPrompt.mockResolvedValueOnce("rebuilt prompt");
+      await session.rebuildSystemPrompt();
+      expect(mockedBuildSystemPrompt).toHaveBeenCalledWith(
+        "code",
+        "/test",
+        expect.objectContaining({ providerId: "codex" }),
+      );
+      expect(session.systemPrompt).toBe("rebuilt prompt");
     });
   });
 

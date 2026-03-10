@@ -348,6 +348,45 @@ export class CheckpointManager {
   }
 
   // ---------------------------------------------------------------------------
+  // Diff
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Get a unified diff of all workspace changes since a given commit hash.
+   * Useful for providing review agents with the exact file changes.
+   * Returns empty string if checkpoints are not initialized or the diff fails.
+   */
+  async getDiffSince(commitHash: string): Promise<string> {
+    if (!this.initialized || !this.git) return "";
+    const env = this.getEnv();
+    try {
+      return await this.git
+        .env({ ...env, GIT_WORK_TREE: this.workspaceDir })
+        .diff([commitHash, "--unified=3"]);
+    } catch (err) {
+      this.log(`[checkpoint] getDiffSince failed: ${err}`);
+      return "";
+    }
+  }
+
+  /**
+   * Get the commit hash of the most recent checkpoint commit (HEAD of shadow repo).
+   * Returns null if not initialized.
+   */
+  async getHeadCommit(): Promise<string | null> {
+    if (!this.initialized || !this.git) return null;
+    const env = this.getEnv();
+    try {
+      const head = await this.git
+        .env({ ...env, GIT_WORK_TREE: this.workspaceDir })
+        .revparse(["HEAD"]);
+      return head.trim() || null;
+    } catch {
+      return null;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Helpers
   // ---------------------------------------------------------------------------
 

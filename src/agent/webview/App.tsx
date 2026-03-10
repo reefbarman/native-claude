@@ -36,13 +36,10 @@ import { QuestionCard } from "./components/QuestionCard";
 import { SessionHistory } from "./components/SessionHistory";
 import { BackgroundSessionStrip } from "./components/BackgroundSessionStrip";
 import type { BgSessionInfoProps } from "./components/BackgroundSessionStrip";
+import { getStreamingActivity } from "./components/MessageBubble";
+import { TranscriptView } from "./components/TranscriptView";
+import type { WebviewModelInfo } from "./types";
 
-// Model context window sizes
-const MODEL_MAX_TOKENS: Record<string, number> = {
-  "claude-opus-4-6": 200_000,
-  "claude-sonnet-4-6": 200_000,
-  "claude-haiku-4-5-20251001": 200_000,
-};
 const DEFAULT_MAX_TOKENS = 200_000;
 
 interface VsCodeApi {
@@ -64,8 +61,9 @@ interface AppState {
   loadedInstructions: Array<{ source: string; chars: number }> | null;
   todos: TodoItem[];
   modes: ModeInfo[];
+  availableModels: WebviewModelInfo[];
   slashCommands: SlashCommandInfo[];
-  messageQueue: Array<{ id: string; text: string }>;
+  messageQueue: Array<{ id: string; text: string; fullText?: string }>;
   questionRequest: { id: string; questions: Question[] } | null;
 }
 
@@ -77,7 +75,7 @@ type AppAction =
       systemPrompt?: string;
       loadedInstructions?: Array<{ source: string; chars: number }>;
     }
-  | { type: "ADD_USER_MESSAGE"; text: string }
+  | { type: "ADD_USER_MESSAGE"; text: string; isSlashCommand?: boolean }
   | { type: "THINKING_START"; thinkingId: string }
   | { type: "THINKING_DELTA"; thinkingId: string; text: string }
   | { type: "THINKING_END"; thinkingId: string }
@@ -108,8 +106,9 @@ type AppAction =
   | { type: "NEW_SESSION" }
   | { type: "TOGGLE_THINKING" }
   | { type: "SET_MODES"; modes: ModeInfo[] }
+  | { type: "SET_MODELS"; models: WebviewModelInfo[] }
   | { type: "SET_SLASH_COMMANDS"; commands: SlashCommandInfo[] }
-  | { type: "ENQUEUE_MESSAGE"; id: string; text: string }
+  | { type: "ENQUEUE_MESSAGE"; id: string; text: string; fullText?: string }
   | { type: "EDIT_QUEUE_MESSAGE"; id: string; text: string }
   | { type: "REMOVE_FROM_QUEUE"; id: string }
   | { type: "CLEAR_QUEUE" }
@@ -121,6 +120,7 @@ type AppAction =
       prevInputTokens: number;
       newInputTokens: number;
       durationMs: number;
+      validationWarnings?: string[];
     }
   | { type: "ADD_CONDENSE_ERROR"; errorMessage: string }
   | { type: "ADD_WARNING"; message: string }
@@ -136,7 +136,20 @@ type AppAction =
     }
   | { type: "SET_CHECKPOINT"; checkpointId: string; turnIndex: number }
   | { type: "CONDENSE_START" }
-  | { type: "CLEAR_ERROR" };
+  | { type: "CLEAR_ERROR" }
+  | {
+      type: "BG_AGENT_DONE";
+      sessionId: string;
+      task: string;
+      status: "completed" | "error" | "cancelled";
+      resultText?: string;
+    }
+  | {
+      type: "ADD_BG_QUESTION";
+      bgTask: string;
+      questions: string[];
+      answer: string;
+    };
 
 /**
  * Convert persisted AgentMessage[] (Anthropic API format) to ChatMessage[] (webview display format).
@@ -332,6 +345,7 @@ function reducer(state: AppState, action: AppAction): AppState {
             content: action.text,
             timestamp: Date.now(),
             blocks: [],
+            isSlashCommand: action.isSlashCommand,
           },
           {
             id: crypto.randomUUID(),
@@ -356,8 +370,40 @@ function reducer(state: AppState, action: AppAction): AppState {
             timestamp: Date.now(),
             blocks: [],
           },
+          {
+            id: crypto.randomUUID(),
+            role: "assistant",
+            content: "",
+            timestamp: Date.now(),
+            blocks: [],
+          },
         ],
       };
+
+    case "ADD_BG_QUESTION": {
+      const bgMsgs = [...state.messages];
+      const bgLast =
+        bgMsgs.length > 0 ? { ...bgMsgs[bgMsgs.length - 1] } : null;
+      const bgBlock = {
+        type: "bg_question" as const,
+        bgTask: action.bgTask,
+        questions: action.questions,
+        answer: action.answer,
+      };
+      if (bgLast && bgLast.role === "assistant") {
+        bgLast.blocks = [...(bgLast.blocks ?? []), bgBlock];
+        bgMsgs[bgMsgs.length - 1] = bgLast;
+        return { ...state, messages: bgMsgs };
+      }
+      bgMsgs.push({
+        id: crypto.randomUUID(),
+        role: "assistant",
+        content: "",
+        timestamp: Date.now(),
+        blocks: [bgBlock],
+      });
+      return { ...state, messages: bgMsgs };
+    }
 
     case "THINKING_START": {
       const all = ensureAssistant(state.messages);
@@ -406,18 +452,52 @@ function reducer(state: AppState, action: AppAction): AppState {
     }
 
     case "TOOL_INPUT_DELTA": {
-      const { msgs, last } = cloneLast(state.messages);
-      last.blocks = last.blocks.map((b) =>
+      // Search backwards for the message containing this tool_call (same
+      // rationale as TOOL_COMPLETE — events can push new messages).
+      let tiIdx = state.messages.length - 1;
+      for (; tiIdx >= 0; tiIdx--) {
+        if (
+          state.messages[tiIdx].blocks.some(
+            (b) => b.type === "tool_call" && b.id === action.toolCallId,
+          )
+        ) {
+          break;
+        }
+      }
+      if (tiIdx < 0) return state;
+      const tiMsgs = [...state.messages];
+      const tiTarget = { ...tiMsgs[tiIdx] };
+      tiTarget.blocks = tiTarget.blocks.map((b) =>
         b.type === "tool_call" && b.id === action.toolCallId
           ? { ...b, inputJson: b.inputJson + action.partialJson }
           : b,
       );
-      return { ...state, messages: msgs };
+      tiMsgs[tiIdx] = tiTarget;
+      return { ...state, messages: tiMsgs };
     }
 
     case "TOOL_COMPLETE": {
-      const { msgs, last } = cloneLast(state.messages);
-      last.blocks = last.blocks.map((b) =>
+      // Search ALL messages for the matching tool_call — not just the last one.
+      // Events like ADD_ANNOTATION, ADD_INTERJECTION, BG_AGENT_DONE, or ADD_CONDENSE
+      // can push new messages between TOOL_START and TOOL_COMPLETE, leaving the
+      // tool_call block in an earlier message. This is especially common with
+      // long-running tools like get_background_result.
+      let targetIdx = -1;
+      for (let i = state.messages.length - 1; i >= 0; i--) {
+        if (
+          state.messages[i].blocks.some(
+            (b) => b.type === "tool_call" && b.id === action.toolCallId,
+          )
+        ) {
+          targetIdx = i;
+          break;
+        }
+      }
+      if (targetIdx === -1) return state; // tool_call not found — no-op
+
+      const msgs = [...state.messages];
+      const target = { ...msgs[targetIdx] };
+      target.blocks = target.blocks.map((b) =>
         b.type === "tool_call" && b.id === action.toolCallId
           ? {
               ...b,
@@ -427,13 +507,58 @@ function reducer(state: AppState, action: AppAction): AppState {
             }
           : b,
       );
+      msgs[targetIdx] = target;
+
+      // When spawn_background_agent completes, add a bg_agent block to track progress
+      if (action.toolName === "spawn_background_agent") {
+        try {
+          const parsed = JSON.parse(action.result);
+          if (parsed.sessionId) {
+            // Extract task and message from the tool_call input
+            const toolBlock = target.blocks.find(
+              (b) => b.type === "tool_call" && b.id === action.toolCallId,
+            );
+            let task = "Background Agent";
+            let message: string | undefined;
+            if (toolBlock && toolBlock.type === "tool_call") {
+              try {
+                const input = JSON.parse(toolBlock.inputJson);
+                if (input.task) task = input.task;
+                if (input.message) message = input.message;
+              } catch {
+                // ignore parse error
+              }
+            }
+            target.blocks = [
+              ...target.blocks,
+              {
+                type: "bg_agent",
+                sessionId: parsed.sessionId,
+                task,
+                message,
+                resolvedModel: parsed.resolvedModel,
+                resolvedProvider: parsed.resolvedProvider,
+                resolvedMode: parsed.resolvedMode,
+                taskClass: parsed.taskClass,
+                routingReason: parsed.routingReason,
+              },
+            ];
+            msgs[targetIdx] = target;
+          }
+        } catch {
+          // ignore parse error
+        }
+      }
       return { ...state, messages: msgs };
     }
 
     case "TEXT_DELTA": {
       const all = ensureAssistant(state.messages);
       const { msgs, last } = cloneLast(all);
-      // Append to existing text block or start a new one
+      // Append to existing text block or start a new one.
+      // Each Claude API turn naturally produces interleaved text+tool blocks:
+      //   [text: "Let me do X:"] → [tool_call] → [text: "Follow-up:"] → ...
+      // The colon at the end of pre-tool text is Claude's natural lead-in style.
       const tail = lastBlock(last.blocks, "text");
       if (tail && tail.type === "text") {
         last.blocks[last.blocks.length - 1] = {
@@ -489,8 +614,49 @@ function reducer(state: AppState, action: AppAction): AppState {
       return { ...state, messages: all2, streaming: true };
     }
 
-    case "DONE":
-      return { ...state, streaming: false };
+    case "DONE": {
+      // Mark any incomplete tool calls / thinking blocks as complete so
+      // their spinners stop when the user clicks Stop.
+      const doneMessages = state.messages.map((m) => {
+        const hasIncomplete = m.blocks.some(
+          (b) =>
+            (b.type === "tool_call" && !b.complete) ||
+            (b.type === "thinking" && !b.complete),
+        );
+        if (!hasIncomplete) return m;
+        return {
+          ...m,
+          blocks: m.blocks.map((b) => {
+            if (b.type === "tool_call" && !b.complete) {
+              return {
+                ...b,
+                complete: true,
+                result: b.result || '{"status":"stopped"}',
+              };
+            }
+            if (b.type === "thinking" && !b.complete) {
+              return { ...b, complete: true };
+            }
+            return b;
+          }),
+        };
+      });
+
+      // Mark any in_progress todos as pending so their spinners stop
+      const stopTodos = (items: TodoItem[]): TodoItem[] =>
+        items.map((t) => ({
+          ...t,
+          status: t.status === "in_progress" ? "pending" : t.status,
+          children: t.children ? stopTodos(t.children) : t.children,
+        }));
+
+      return {
+        ...state,
+        streaming: false,
+        messages: doneMessages,
+        todos: stopTodos(state.todos),
+      };
+    }
 
     case "NEW_SESSION":
       return {
@@ -502,6 +668,7 @@ function reducer(state: AppState, action: AppAction): AppState {
         lastCacheReadTokens: 0,
         todos: [],
         messageQueue: [],
+        questionRequest: null,
       };
 
     case "TOGGLE_THINKING":
@@ -511,6 +678,14 @@ function reducer(state: AppState, action: AppAction): AppState {
       return {
         ...state,
         modes: Array.isArray(action.modes) ? action.modes : state.modes,
+      };
+
+    case "SET_MODELS":
+      return {
+        ...state,
+        availableModels: Array.isArray(action.models)
+          ? action.models
+          : state.availableModels,
       };
 
     case "SET_SLASH_COMMANDS":
@@ -526,7 +701,11 @@ function reducer(state: AppState, action: AppAction): AppState {
         ...state,
         messageQueue: [
           ...state.messageQueue,
-          { id: action.id, text: action.text },
+          {
+            id: action.id,
+            text: action.text,
+            ...(action.fullText ? { fullText: action.fullText } : {}),
+          },
         ],
       };
 
@@ -557,6 +736,13 @@ function reducer(state: AppState, action: AppAction): AppState {
             id: crypto.randomUUID(),
             role: "user" as const,
             content: action.text,
+            timestamp: Date.now(),
+            blocks: [],
+          },
+          {
+            id: crypto.randomUUID(),
+            role: "assistant" as const,
+            content: "",
             timestamp: Date.now(),
             blocks: [],
           },
@@ -622,10 +808,13 @@ function reducer(state: AppState, action: AppAction): AppState {
               prevInputTokens: action.prevInputTokens,
               newInputTokens: action.newInputTokens,
               durationMs: action.durationMs,
+              validationWarnings: action.validationWarnings,
             },
           },
         ],
         lastInputTokens: action.newInputTokens,
+        lastOutputTokens: 0,
+        lastCacheReadTokens: 0,
       };
     }
 
@@ -706,6 +895,38 @@ function reducer(state: AppState, action: AppAction): AppState {
       };
     }
 
+    case "BG_AGENT_DONE": {
+      // Insert a bg_agent_result notification at the current position in chat.
+      // If the last message is an assistant message, append the block to it.
+      // Otherwise, create a new assistant message for the notification.
+      const resultBlock: ContentBlock = {
+        type: "bg_agent_result",
+        sessionId: action.sessionId,
+        task: action.task,
+        status: action.status,
+        resultText: action.resultText,
+      };
+      const lastMsg = state.messages[state.messages.length - 1];
+      if (lastMsg?.role === "assistant") {
+        const { msgs, last } = cloneLast(state.messages);
+        last.blocks = [...last.blocks, resultBlock];
+        return { ...state, messages: msgs };
+      }
+      return {
+        ...state,
+        messages: [
+          ...state.messages,
+          {
+            id: crypto.randomUUID(),
+            role: "assistant" as const,
+            content: "",
+            timestamp: Date.now(),
+            blocks: [resultBlock],
+          },
+        ],
+      };
+    }
+
     case "SET_CHECKPOINT": {
       // Attach checkpointId to the most recent user message (turnIndex = its position)
       const msgs = [...state.messages];
@@ -750,7 +971,9 @@ const initialState: AppState = {
     { slug: "architect", name: "Architect", icon: "organization" },
     { slug: "ask", name: "Ask", icon: "question" },
     { slug: "debug", name: "Debug", icon: "debug" },
+    { slug: "review", name: "Review", icon: "checklist" },
   ],
+  availableModels: [],
   slashCommands: [],
   messageQueue: [],
   questionRequest: null,
@@ -776,6 +999,11 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
   // Guards against stale delta events arriving after agentDone (stop race condition).
   // Set true when a turn starts, false when agentDone fires.
   const streamingRef = useRef(false);
+  // Buffers for coalescing streaming deltas — flushed once per animation frame.
+  const textDeltaBuf = useRef("");
+  const thinkingDeltaBuf = useRef(new Map<string, string>());
+  const toolInputDeltaBuf = useRef(new Map<string, string>());
+  const deltaRafRef = useRef<number | null>(null);
   const [injection, setInjection] = useState<Injection | null>(null);
   const [shiftDragOver, setShiftDragOver] = useState(false);
   const dragCounterRef = useRef(0);
@@ -816,33 +1044,128 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
   const [expandedQueueIds, setExpandedQueueIds] = useState<Set<string>>(
     new Set(),
   );
+  const [transcriptView, setTranscriptView] = useState<{
+    task: string;
+    messages: ChatMessage[];
+  } | null>(null);
 
   useEffect(() => {
+    // Drain all delta buffers, dispatching one action per buffer.
+    // React 18 batches these synchronous dispatches into a single render.
+    const drainDeltaBuffers = () => {
+      if (textDeltaBuf.current) {
+        dispatch({ type: "TEXT_DELTA", text: textDeltaBuf.current });
+        textDeltaBuf.current = "";
+      }
+      for (const [thinkingId, text] of thinkingDeltaBuf.current) {
+        dispatch({ type: "THINKING_DELTA", thinkingId, text });
+      }
+      thinkingDeltaBuf.current.clear();
+      for (const [toolCallId, partialJson] of toolInputDeltaBuf.current) {
+        dispatch({ type: "TOOL_INPUT_DELTA", toolCallId, partialJson });
+      }
+      toolInputDeltaBuf.current.clear();
+    };
+    const scheduleDeltaFlush = () => {
+      if (deltaRafRef.current !== null) return;
+      deltaRafRef.current = requestAnimationFrame(() => {
+        deltaRafRef.current = null;
+        drainDeltaBuffers();
+      });
+    };
+    const flushDeltasNow = () => {
+      if (deltaRafRef.current !== null) {
+        cancelAnimationFrame(deltaRafRef.current);
+        deltaRafRef.current = null;
+      }
+      drainDeltaBuffers();
+    };
+
     const handler = (e: MessageEvent) => {
       const msg = e.data as ExtensionMessage;
 
+      const currentSessionId = stateRef.current.sessionId;
+      const eventSessionId =
+        "sessionId" in msg
+          ? (msg as { sessionId: string }).sessionId
+          : undefined;
+      const isBackgroundEvent =
+        msg.type === "agentBgThinkingStart" ||
+        msg.type === "agentBgThinkingDelta" ||
+        msg.type === "agentBgThinkingEnd" ||
+        msg.type === "agentBgTextDelta" ||
+        msg.type === "agentBgToolStart" ||
+        msg.type === "agentBgToolComplete" ||
+        msg.type === "agentBgApiRequest" ||
+        msg.type === "agentBgError" ||
+        msg.type === "agentBgDone";
+
+      const reportDrop = (
+        reason: "session_mismatch" | "streaming_false",
+      ): void => {
+        vscodeApi.postMessage({
+          command: "agentStreamDrop",
+          reason,
+          eventType: msg.type,
+          eventSessionId: eventSessionId ?? null,
+          currentSessionId: stateRef.current.sessionId,
+          streaming: streamingRef.current,
+        });
+      };
+
+      // Filter session-scoped foreground events from non-foreground sessions.
+      // agentSessionLoaded is excluded — it intentionally switches the active session.
+      if (
+        eventSessionId &&
+        msg.type !== "agentSessionLoaded" &&
+        !isBackgroundEvent &&
+        eventSessionId !== currentSessionId
+      ) {
+        console.debug(
+          `[agentlink-webview] dropping ${msg.type}: session mismatch (event=${eventSessionId}, current=${currentSessionId ?? "null"})`,
+        );
+        reportDrop("session_mismatch");
+        return;
+      }
+
+      const dropIfNotStreaming = () => {
+        if (streamingRef.current) return false;
+        console.debug(
+          `[agentlink-webview] dropping ${msg.type}: streamingRef=false (eventSession=${eventSessionId ?? "none"}, current=${stateRef.current.sessionId ?? "null"})`,
+        );
+        reportDrop("streaming_false");
+        return true;
+      };
+
       switch (msg.type) {
         case "stateUpdate":
+          streamingRef.current = Boolean(msg.state.streaming);
           dispatch({ type: "SET_STATE", state: msg.state });
           break;
         case "agentThinkingStart":
-          if (!streamingRef.current) break;
+          if (dropIfNotStreaming()) break;
           dispatch({ type: "THINKING_START", thinkingId: msg.thinkingId });
           break;
         case "agentThinkingDelta":
-          if (!streamingRef.current) break;
-          dispatch({
-            type: "THINKING_DELTA",
-            thinkingId: msg.thinkingId,
-            text: msg.text,
-          });
+          if (dropIfNotStreaming()) break;
+          thinkingDeltaBuf.current.set(
+            msg.thinkingId,
+            (thinkingDeltaBuf.current.get(msg.thinkingId) ?? "") + msg.text,
+          );
+          scheduleDeltaFlush();
           break;
         case "agentThinkingEnd":
-          if (!streamingRef.current) break;
+          if (dropIfNotStreaming()) break;
+          // Flush buffered thinking deltas so content arrives before the block
+          // is marked complete (same pattern as agentToolComplete).
+          flushDeltasNow();
           dispatch({ type: "THINKING_END", thinkingId: msg.thinkingId });
           break;
         case "agentToolStart":
-          if (!streamingRef.current) break;
+          if (dropIfNotStreaming()) break;
+          // Flush any buffered text deltas first so pre-tool text lands in its
+          // own block before the tool_call block is inserted.
+          flushDeltasNow();
           dispatch({
             type: "TOOL_START",
             toolCallId: msg.toolCallId,
@@ -850,15 +1173,20 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
           });
           break;
         case "agentToolInputDelta":
-          if (!streamingRef.current) break;
-          dispatch({
-            type: "TOOL_INPUT_DELTA",
-            toolCallId: msg.toolCallId,
-            partialJson: msg.partialJson,
-          });
+          if (dropIfNotStreaming()) break;
+          toolInputDeltaBuf.current.set(
+            msg.toolCallId,
+            (toolInputDeltaBuf.current.get(msg.toolCallId) ?? "") +
+              msg.partialJson,
+          );
+          scheduleDeltaFlush();
           break;
         case "agentToolComplete":
-          if (!streamingRef.current) break;
+          if (dropIfNotStreaming()) break;
+          // Flush any buffered input deltas before marking complete,
+          // otherwise the input JSON may be empty/partial when the
+          // tool block switches to its "complete" state.
+          flushDeltasNow();
           dispatch({
             type: "TOOL_COMPLETE",
             toolCallId: msg.toolCallId,
@@ -868,7 +1196,7 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
           });
           break;
         case "agentUserAnnotation":
-          if (!streamingRef.current) break;
+          if (dropIfNotStreaming()) break;
           dispatch({
             type: "ADD_ANNOTATION",
             text: msg.text,
@@ -876,11 +1204,12 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
           });
           break;
         case "agentTextDelta":
-          if (!streamingRef.current) break;
-          dispatch({ type: "TEXT_DELTA", text: msg.text });
+          if (dropIfNotStreaming()) break;
+          textDeltaBuf.current += msg.text;
+          scheduleDeltaFlush();
           break;
         case "agentApiRequest":
-          if (!streamingRef.current) break;
+          if (dropIfNotStreaming()) break;
           dispatch({
             type: "API_REQUEST",
             requestId: msg.requestId,
@@ -893,6 +1222,7 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
           });
           break;
         case "agentError":
+          flushDeltasNow();
           streamingRef.current = false;
           dispatch({
             type: "ERROR",
@@ -904,20 +1234,30 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
           dispatch({ type: "TODO_UPDATE", todos: msg.todos });
           break;
         case "agentDone": {
+          flushDeltasNow();
           streamingRef.current = false;
           dispatch({ type: "DONE" });
           dispatch({ type: "CLEAR_QUESTION" });
           const queue = messageQueueRef.current;
           if (queue.length > 0) {
-            const combined = queue.map((q) => q.text).join("\n\n");
+            // Display text for the chat UI (shows slash command names)
+            const displayCombined = queue.map((q) => q.text).join("\n\n");
+            // Full text for the agent (expanded slash command bodies)
+            const sendCombined = queue
+              .map((q) => q.fullText ?? q.text)
+              .join("\n\n");
             messageQueueRef.current = [];
             dispatch({ type: "CLEAR_QUEUE" });
             setTimeout(() => {
               streamingRef.current = true;
-              dispatch({ type: "ADD_USER_MESSAGE", text: combined });
+              dispatch({
+                type: "ADD_USER_MESSAGE",
+                text: displayCombined,
+                isSlashCommand: queue.some((q) => q.fullText),
+              });
               vscodeApi.postMessage({
                 command: "agentSend",
-                text: combined,
+                text: sendCombined,
                 attachments: [],
                 sessionId: stateRef.current.sessionId,
                 mode: stateRef.current.mode,
@@ -951,6 +1291,9 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
           break;
         case "agentModesUpdate":
           dispatch({ type: "SET_MODES", modes: msg.modes });
+          break;
+        case "agentModelsUpdate":
+          dispatch({ type: "SET_MODELS", models: msg.models });
           break;
         case "agentSlashCommandsUpdate":
           dispatch({ type: "SET_SLASH_COMMANDS", commands: msg.commands });
@@ -992,6 +1335,7 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
             prevInputTokens: msg.prevInputTokens,
             newInputTokens: msg.newInputTokens,
             durationMs: msg.durationMs,
+            validationWarnings: msg.validationWarnings,
           });
           break;
 
@@ -1059,6 +1403,68 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
         case "agentBgSessionsUpdate":
           setBgSessions(msg.sessions as BgSessionInfoProps[]);
           break;
+
+        // Background-only stream events are intentionally not rendered into the
+        // foreground transcript. They only trigger bg session UI refresh.
+        case "agentBgThinkingStart":
+        case "agentBgThinkingDelta":
+        case "agentBgThinkingEnd":
+        case "agentBgTextDelta":
+        case "agentBgToolStart":
+        case "agentBgToolComplete":
+        case "agentBgApiRequest":
+        case "agentBgError":
+          // Bg status updates are sent separately (and throttled) by the extension.
+          break;
+        case "agentBgDone": {
+          // Insert a completion notification at the current chat position
+          const bgSessionId = msg.sessionId;
+          // Find the task name from existing bg_agent blocks in messages
+          let bgTask = "Background Agent";
+          for (const m of state.messages) {
+            for (const b of m.blocks) {
+              if (b.type === "bg_agent" && b.sessionId === bgSessionId) {
+                bgTask = b.task;
+                break;
+              }
+            }
+          }
+          // Determine status from bgSessions state
+          const bgInfo = bgSessions.find((s) => s.id === bgSessionId);
+          const bgStatus: "completed" | "error" | "cancelled" =
+            bgInfo?.status === "error"
+              ? "error"
+              : bgInfo?.status === "cancelled"
+                ? "cancelled"
+                : "completed";
+          dispatch({
+            type: "BG_AGENT_DONE",
+            sessionId: bgSessionId,
+            task: bgTask,
+            status: bgStatus,
+            resultText:
+              (msg.resultText as string | undefined) ?? bgInfo?.resultText,
+          });
+          break;
+        }
+
+        case "agentBgQuestion": {
+          dispatch({
+            type: "ADD_BG_QUESTION",
+            bgTask: msg.bgTask,
+            questions: msg.questions,
+            answer: msg.answer,
+          });
+          break;
+        }
+
+        case "showBgTranscript": {
+          const converted = agentMessagesToChatMessages(
+            (msg.messages as unknown[]) ?? [],
+          );
+          setTranscriptView({ task: msg.task as string, messages: converted });
+          break;
+        }
       }
     };
 
@@ -1067,12 +1473,27 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
     // Tell extension we're ready
     vscodeApi.postMessage({ command: "webviewReady" });
 
-    return () => window.removeEventListener("message", handler);
+    return () => {
+      window.removeEventListener("message", handler);
+      if (deltaRafRef.current !== null)
+        cancelAnimationFrame(deltaRafRef.current);
+    };
   }, [vscodeApi]);
 
   const handleSend = useCallback(
-    (text: string, attachments: string[] = [], displayText?: string) => {
+    (
+      text: string,
+      attachments: string[] = [],
+      displayText?: string,
+      media?: Array<{
+        name: string;
+        mimeType: string;
+        base64: string;
+        kind: "image" | "document";
+      }>,
+    ) => {
       // While streaming, enqueue the message instead of sending immediately
+      // (media is not supported for queued messages — only text)
       if (state.streaming) {
         const display = displayText ?? text;
         const queueId = crypto.randomUUID();
@@ -1080,12 +1501,17 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
           type: "ENQUEUE_MESSAGE",
           id: queueId,
           text: display,
+          // When displayText differs from text (e.g. slash commands), preserve
+          // the full expanded text so the queue drain sends the right content.
+          fullText: displayText && displayText !== text ? text : undefined,
         });
         // Notify extension about this queued item so it can inject it ASAP
         // between tool batches. Only the first pending item will be used.
+        const fullTextForQueue =
+          displayText && displayText !== text ? text : undefined;
         vscodeApi.postMessage({
           command: "agentQueueMessage",
-          text: display,
+          text: fullTextForQueue ?? display,
           queueId,
           sessionId: stateRef.current.sessionId,
         });
@@ -1098,13 +1524,54 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
         const fileRefs = attachments.map((p) => `[Attached: ${p}]`).join("\n");
         fullText = fileRefs + "\n\n" + text;
       }
+
+      // Split media into images and documents for the extension
+      const images = media?.filter((m) => m.kind === "image") ?? [];
+      const documents = media?.filter((m) => m.kind === "document") ?? [];
+
+      // Build display text with media indicators
+      let displayWithMedia = displayText ?? fullText;
+      if (images.length > 0 || documents.length > 0) {
+        const indicators: string[] = [];
+        if (images.length > 0)
+          indicators.push(
+            `${images.length} image${images.length > 1 ? "s" : ""}`,
+          );
+        if (documents.length > 0)
+          indicators.push(
+            `${documents.length} PDF${documents.length > 1 ? "s" : ""}`,
+          );
+        displayWithMedia =
+          `[${indicators.join(", ")} attached]\n` + displayWithMedia;
+      }
+
       // displayText is shown in the chat UI; fullText is sent to the agent
       streamingRef.current = true;
-      dispatch({ type: "ADD_USER_MESSAGE", text: displayText ?? fullText });
+      dispatch({
+        type: "ADD_USER_MESSAGE",
+        text: displayWithMedia,
+        isSlashCommand: displayText !== undefined,
+      });
       vscodeApi.postMessage({
         command: "agentSend",
         text: fullText,
         attachments,
+        images:
+          images.length > 0
+            ? images.map((m) => ({
+                name: m.name,
+                mimeType: m.mimeType,
+                base64: m.base64,
+              }))
+            : undefined,
+        documents:
+          documents.length > 0
+            ? documents.map((m) => ({
+                name: m.name,
+                mimeType: m.mimeType,
+                base64: m.base64,
+              }))
+            : undefined,
         sessionId: stateRef.current.sessionId,
         mode: stateRef.current.mode,
         thinkingEnabled: thinkingEnabledRef.current,
@@ -1129,8 +1596,16 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
     [vscodeApi],
   );
 
+  const handleOpenBgTranscript = useCallback(
+    (sessionId: string) => {
+      vscodeApi.postMessage({ command: "openBgTranscript", sessionId });
+    },
+    [vscodeApi],
+  );
+
   const handleNewSession = useCallback(() => {
     dispatch({ type: "NEW_SESSION" });
+    setBgSessions([]);
     vscodeApi.postMessage({
       command: "agentNewSession",
       mode: stateRef.current.mode,
@@ -1140,7 +1615,30 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
   const handleSwitchMode = useCallback(
     (slug: string) => {
       dispatch({ type: "NEW_SESSION" });
+      setBgSessions([]);
       vscodeApi.postMessage({ command: "agentNewSession", mode: slug });
+    },
+    [vscodeApi],
+  );
+
+  const handleSelectModel = useCallback(
+    (modelId: string) => {
+      vscodeApi.postMessage({
+        command: "agentSetModel",
+        model: modelId,
+      });
+    },
+    [vscodeApi],
+  );
+
+  const handleSignIn = useCallback(
+    (provider: string) => {
+      if (
+        provider.toLowerCase() === "codex" ||
+        provider.toLowerCase() === "openai"
+      ) {
+        vscodeApi.postMessage({ command: "agentCodexSignIn" });
+      }
     },
     [vscodeApi],
   );
@@ -1160,6 +1658,7 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
       switch (name) {
         case "new":
           dispatch({ type: "NEW_SESSION" });
+          setBgSessions([]);
           vscodeApi.postMessage({
             command: "agentNewSession",
             mode: stateRef.current.mode,
@@ -1196,7 +1695,6 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
         case "mcp-status":
           vscodeApi.postMessage({ command: "agentSlashCommand", name, args });
           break;
-        // Phase 4 stubs
         case "condense":
         case "checkpoint":
         case "revert":
@@ -1288,6 +1786,15 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
       });
     }
   }, [vscodeApi]);
+
+  const handleErrorSignIn = useCallback(() => {
+    const model = state.availableModels.find(
+      (m) => m.id === stateRef.current.model,
+    );
+    if (model) {
+      handleSignIn(model.provider);
+    }
+  }, [state.availableModels, handleSignIn]);
 
   const handleShowHistory = useCallback(() => {
     vscodeApi.postMessage({ command: "agentListSessions" });
@@ -1421,6 +1928,13 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
         onDragLeave={handleContainerDragLeave}
         onDrop={handleContainerDrop}
       >
+        {transcriptView && (
+          <TranscriptView
+            task={transcriptView.task}
+            messages={transcriptView.messages}
+            onClose={() => setTranscriptView(null)}
+          />
+        )}
         {shiftDragOver && (
           <div class="drop-overlay">
             <div class="drop-overlay-content">
@@ -1471,6 +1985,10 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
           onOpenMermaidPanel={handleOpenMermaidPanel}
           onRevertCheckpoint={handleRevertCheckpoint}
           onRetry={handleRetry}
+          onSignIn={handleErrorSignIn}
+          bgSessions={bgSessions}
+          onStopBackground={handleStopBackground}
+          onOpenTranscript={handleOpenBgTranscript}
         />
         {state.messageQueue.length > 0 && (
           <div class="queue-panel">
@@ -1556,7 +2074,8 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
             outputTokens={state.lastOutputTokens}
             cacheReadTokens={state.lastCacheReadTokens}
             maxContextWindow={
-              MODEL_MAX_TOKENS[state.chatState.model] ?? DEFAULT_MAX_TOKENS
+              state.availableModels.find((m) => m.id === state.chatState.model)
+                ?.contextWindow ?? DEFAULT_MAX_TOKENS
             }
             condenseThreshold={state.chatState.condenseThreshold}
           />
@@ -1722,12 +2241,21 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
         {state.streaming && (
           <div class="streaming-status-bar">
             <i class="codicon codicon-loading codicon-modifier-spin" />
-            <span>Working…</span>
+            <span>
+              {(() => {
+                const lastMsg = state.messages[state.messages.length - 1];
+                if (lastMsg?.role === "assistant") {
+                  return getStreamingActivity(lastMsg.blocks);
+                }
+                return "Waiting for response…";
+              })()}
+            </span>
           </div>
         )}
         <BackgroundSessionStrip
           sessions={bgSessions}
           onStop={handleStopBackground}
+          onOpenTranscript={handleOpenBgTranscript}
         />
         <InputArea
           onSend={handleSend}
@@ -1745,6 +2273,9 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
           modes={state.modes}
           currentMode={state.chatState.mode}
           currentModel={state.chatState.model}
+          availableModels={state.availableModels}
+          onSelectModel={handleSelectModel}
+          onSignIn={handleSignIn}
           onSwitchMode={handleSwitchMode}
           agentWriteApproval={state.chatState.agentWriteApproval ?? "prompt"}
           onSetAgentWriteApproval={handleSetAgentWriteApproval}

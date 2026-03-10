@@ -5,6 +5,15 @@ export interface ModeInfo {
   icon: string;
 }
 
+/** Model info sent from the extension via agentModelsUpdate. */
+export interface WebviewModelInfo {
+  id: string;
+  displayName: string;
+  provider: string;
+  contextWindow: number;
+  authenticated: boolean;
+}
+
 /** A slash command available for autocomplete */
 export interface SlashCommandInfo {
   name: string;
@@ -34,6 +43,8 @@ export interface Question {
     | "confirmation";
   question: string;
   options?: string[];
+  /** The option value the agent recommends (must match one of the options strings) */
+  recommended?: string;
   scale_min?: number;
   scale_max?: number;
   scale_min_label?: string;
@@ -119,6 +130,7 @@ export type ExtensionMessage =
       /** First ~200 chars of the summary for display */
       summary: string;
       durationMs: number;
+      validationWarnings?: string[];
     }
   | {
       type: "agentCondenseError";
@@ -156,6 +168,7 @@ export type ExtensionMessage =
   | { type: "agentInjectAttachment"; path: string }
   | { type: "agentInjectContext"; context: string }
   | { type: "agentModesUpdate"; modes: ModeInfo[] }
+  | { type: "agentModelsUpdate"; models: WebviewModelInfo[] }
   | { type: "agentSlashCommandsUpdate"; commands: SlashCommandInfo[] }
   | { type: "agentModeSwitchRequest"; mode: string; reason?: string }
   | {
@@ -229,10 +242,92 @@ export type ExtensionMessage =
           | "tool_executing"
           | "awaiting_approval"
           | "idle"
-          | "error";
+          | "error"
+          | "cancelled";
         currentTool?: string;
+        resolvedMode?: string;
+        resolvedModel?: string;
+        resolvedProvider?: string;
+        taskClass?: string;
+        routingReason?: string;
+        fallbackUsed?: boolean;
+        streamingText?: string;
+        resultText?: string;
+        errorMessage?: string;
+        completedAt?: number;
+        fullTranscript?: string;
       }>;
-    };
+    }
+  | { type: "agentBgThinkingStart"; sessionId: string; thinkingId: string }
+  | {
+      type: "agentBgThinkingDelta";
+      sessionId: string;
+      thinkingId: string;
+      text: string;
+    }
+  | { type: "agentBgThinkingEnd"; sessionId: string; thinkingId: string }
+  | { type: "agentBgTextDelta"; sessionId: string; text: string }
+  | {
+      type: "agentBgToolStart";
+      sessionId: string;
+      toolCallId: string;
+      toolName: string;
+    }
+  | {
+      type: "agentBgToolComplete";
+      sessionId: string;
+      toolCallId: string;
+      toolName: string;
+      result: string;
+      durationMs: number;
+    }
+  | {
+      type: "agentBgApiRequest";
+      sessionId: string;
+      requestId: string;
+      model: string;
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadTokens: number;
+      cacheCreationTokens: number;
+      durationMs: number;
+      timeToFirstToken: number;
+    }
+  | {
+      type: "agentBgError";
+      sessionId: string;
+      error: string;
+      retryable: boolean;
+    }
+  | {
+      type: "agentBgDone";
+      sessionId: string;
+      totalInputTokens: number;
+      totalOutputTokens: number;
+      totalCacheReadTokens: number;
+      totalCacheCreationTokens: number;
+      resultText?: string;
+    }
+  | {
+      type: "agentBgQuestion";
+      /** Foreground session that answered the question */
+      sessionId: string;
+      /** The background agent's task label */
+      bgTask: string;
+      /** Questions asked by the background agent */
+      questions: string[];
+      /** The foreground agent's answer */
+      answer: string;
+    }
+  | ShowBgTranscriptMessage;
+
+export type ShowBgTranscriptMessage = {
+  type: "showBgTranscript";
+  sessionId: string;
+  task: string;
+  /** Raw AgentMessage[] from the backend session */
+  messages: unknown[];
+};
 
 export interface ChatState {
   sessionId: string | null;
@@ -283,6 +378,45 @@ export type ContentBlock =
       result: string;
       complete: boolean;
       durationMs?: number;
+    }
+  | {
+      type: "bg_agent";
+      /** The background session ID */
+      sessionId: string;
+      /** Short task label */
+      task: string;
+      /** The full message/prompt sent to the background agent */
+      message?: string;
+      /** Resolved model used by the background agent */
+      resolvedModel?: string;
+      /** Resolved provider */
+      resolvedProvider?: string;
+      /** Resolved mode */
+      resolvedMode?: string;
+      /** Task class used for routing */
+      taskClass?: string;
+      /** Routing decision reason */
+      routingReason?: string;
+    }
+  | {
+      type: "bg_agent_result";
+      /** The background session ID */
+      sessionId: string;
+      /** Short task label */
+      task: string;
+      /** Completion status */
+      status: "completed" | "error" | "cancelled";
+      /** The final result text from the background agent */
+      resultText?: string;
+    }
+  | {
+      type: "bg_question";
+      /** The background agent's task label */
+      bgTask: string;
+      /** Questions asked by the background agent */
+      questions: string[];
+      /** The foreground agent's answer */
+      answer: string;
     };
 
 /** A chat message in the webview state */
@@ -296,6 +430,8 @@ export interface ChatMessage {
   blocks: ContentBlock[];
   /** Badge shown on approval follow-up and rejection annotation messages */
   badge?: "follow-up" | "rejection";
+  /** True when this message is a slash command invocation (renders as a compact pill) */
+  isSlashCommand?: boolean;
   /** Checkpoint ID associated with this user message (set when checkpoint was created before send) */
   checkpointId?: string;
   error?: { message: string; retryable: boolean };
@@ -314,6 +450,7 @@ export interface ChatMessage {
     durationMs?: number;
     errorMessage?: string;
     condensing?: boolean;
+    validationWarnings?: string[];
   };
   /** Set when role === "warning" */
   warningMessage?: string;

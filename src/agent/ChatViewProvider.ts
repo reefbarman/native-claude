@@ -3,8 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { randomUUID } from "crypto";
-import Anthropic from "@anthropic-ai/sdk";
-import { createAnthropicClient } from "./clientFactory.js";
+import { providerRegistry } from "./providers/index.js";
 import type { AgentSessionManager } from "./AgentSessionManager.js";
 import type { AgentEvent } from "./types.js";
 import type { TodoItem } from "./todoTool.js";
@@ -124,6 +123,16 @@ export type ExtensionToWebview =
         body?: string;
       }>;
     }
+  | {
+      type: "agentModelsUpdate";
+      models: Array<{
+        id: string;
+        displayName: string;
+        provider: string;
+        contextWindow: number;
+        authenticated: boolean;
+      }>;
+    }
   | { type: "agentModeSwitchRequest"; mode: string; reason?: string }
   | {
       type: "agentElicitationRequest";
@@ -172,6 +181,7 @@ export type ExtensionToWebview =
       newInputTokens: number;
       summary: string;
       durationMs: number;
+      validationWarnings?: string[];
     }
   | {
       type: "agentCondenseError";
@@ -213,6 +223,56 @@ export type ExtensionToWebview =
       type: "agentBgSessionsUpdate";
       sessions: import("../shared/types.js").BgSessionInfo[];
     }
+  | { type: "agentBgThinkingStart"; sessionId: string; thinkingId: string }
+  | {
+      type: "agentBgThinkingDelta";
+      sessionId: string;
+      thinkingId: string;
+      text: string;
+    }
+  | { type: "agentBgThinkingEnd"; sessionId: string; thinkingId: string }
+  | { type: "agentBgTextDelta"; sessionId: string; text: string }
+  | {
+      type: "agentBgToolStart";
+      sessionId: string;
+      toolCallId: string;
+      toolName: string;
+    }
+  | {
+      type: "agentBgToolComplete";
+      sessionId: string;
+      toolCallId: string;
+      toolName: string;
+      result: string;
+      durationMs: number;
+    }
+  | {
+      type: "agentBgApiRequest";
+      sessionId: string;
+      requestId: string;
+      model: string;
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadTokens: number;
+      cacheCreationTokens: number;
+      durationMs: number;
+      timeToFirstToken: number;
+    }
+  | {
+      type: "agentBgError";
+      sessionId: string;
+      error: string;
+      retryable: boolean;
+    }
+  | {
+      type: "agentBgDone";
+      sessionId: string;
+      totalInputTokens: number;
+      totalOutputTokens: number;
+      totalCacheReadTokens: number;
+      totalCacheCreationTokens: number;
+      resultText?: string;
+    }
   | {
       type: "agentInterjection";
       sessionId: string;
@@ -224,6 +284,19 @@ export type ExtensionToWebview =
       info: Record<string, string | number>;
       systemPrompt?: string;
       loadedInstructions?: Array<{ source: string; chars: number }>;
+    }
+  | {
+      type: "agentBgQuestion";
+      sessionId: string;
+      bgTask: string;
+      questions: string[];
+      answer: string;
+    }
+  | {
+      type: "showBgTranscript";
+      sessionId: string;
+      task: string;
+      messages: unknown[];
     };
 
 export interface ChatState {
@@ -282,7 +355,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** Tracks which pending-approval IDs belong to each session, for scoped cancellation on stop */
   private approvalSessionIndex = new Map<string, Set<string>>();
 
-  private condenseStartTime: number | null = null;
+  private condenseStartTimes = new Map<string, number>();
+  private bgUpdateTimer: ReturnType<typeof setTimeout> | null = null;
+  // Buffers for coalescing high-frequency streaming deltas before postMessage IPC.
+  private textDeltaBuffer = new Map<string, string>();
+  private thinkingDeltaBuffer = new Map<string, Map<string, string>>();
+  private toolInputDeltaBuffer = new Map<string, Map<string, string>>();
+  private deltaFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private streamDropCounts = {
+    sessionMismatch: 0,
+    streamingFalse: 0,
+  };
+  private streamDropLogTimer: ReturnType<typeof setTimeout> | null = null;
   private approvalManager: ApprovalManager | undefined;
   private approvalManagerListener: vscode.Disposable | undefined;
   private mermaidPanel: vscode.WebviewPanel | undefined;
@@ -299,26 +383,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       maxTokens,
       model,
     }) => {
-      let client: Anthropic;
+      const targetModel = model ?? "claude-sonnet-4-6";
+      const provider = providerRegistry.tryResolveProvider(targetModel);
+      if (!provider) {
+        return {
+          role: "assistant",
+          content: "Sampling unavailable: no provider for model.",
+        };
+      }
       try {
-        ({ client } = createAnthropicClient());
+        const result = await provider.complete({
+          model: targetModel,
+          systemPrompt: systemPrompt ?? "",
+          messages: messages.map((m) => ({
+            role: m.role,
+            content: m.content,
+          })),
+          maxTokens,
+        });
+        return { role: "assistant", content: result.text };
       } catch {
         return {
           role: "assistant",
-          content: "Sampling unavailable: no API key.",
+          content: "Sampling failed.",
         };
       }
-      const response = await client.messages.create({
-        model: model ?? "claude-sonnet-4-6",
-        max_tokens: maxTokens,
-        system: systemPrompt,
-        messages: messages.map((m) => ({ role: m.role, content: m.content })),
-      });
-      const text = response.content
-        .filter((b): b is Anthropic.TextBlock => b.type === "text")
-        .map((b) => b.text)
-        .join("");
-      return { role: "assistant", content: text };
     };
 
     this.mcpHub.onElicitation = (request, resolve, cancel) => {
@@ -506,6 +595,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               });
               return;
             }
+            // Reset session-level write approval when switching modes — "session"
+            // approval was granted for the previous mode, not the new one.
+            this.approvalManager?.resetSessionAgentWriteApproval(session.id);
             this.sendInitialState();
             const suffix = followUp?.trim() ? ` | ${followUp.trim()}` : "";
             this.log(
@@ -722,6 +814,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.postMessage({ type: "agentModesUpdate", modes } as ExtensionToWebview);
   }
 
+  private async sendModelsUpdate(): Promise<void> {
+    const allModels = providerRegistry.listAllModels();
+    const authStatus = await providerRegistry.getAuthStatus();
+    const models = allModels.map((m) => ({
+      id: m.id,
+      displayName: m.displayName,
+      provider: m.provider,
+      contextWindow: m.capabilities.contextWindow,
+      authenticated: authStatus[m.provider] ?? false,
+    }));
+    this.postMessage({
+      type: "agentModelsUpdate",
+      models,
+    } as ExtensionToWebview);
+  }
+
   private sendSlashCommands(): void {
     if (!this.slashRegistry) return;
     this.postMessage({
@@ -747,6 +855,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.handleAgentEvent(sessionId, event);
     };
 
+    manager.onBgQuestionAnswered = (fgSessionId, bgTask, questions, answer) => {
+      this.postMessage({
+        type: "agentBgQuestion",
+        sessionId: fgSessionId,
+        bgTask,
+        questions: questions.map((q) => q.question),
+        answer,
+      } as ExtensionToWebview);
+    };
+
     manager.onSessionsChanged = () => {
       this.postMessage({
         type: "agentSessionUpdate",
@@ -762,6 +880,66 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       type: "agentBgSessionsUpdate",
       sessions: this.sessionManager.getBgSessionInfos(),
     });
+  }
+
+  /**
+   * Throttled version of sendBgSessionsUpdate for high-frequency events
+   * (text_delta). Coalesces updates to fire at most once per 150ms.
+   */
+  private sendBgSessionsUpdateThrottled(): void {
+    if (this.bgUpdateTimer) return; // already scheduled
+    this.bgUpdateTimer = setTimeout(() => {
+      this.bgUpdateTimer = null;
+      this.sendBgSessionsUpdate();
+    }, 150);
+  }
+
+  /**
+   * Flush all buffered streaming deltas to the webview immediately.
+   * Called on a timer (scheduleDeltaFlush) and synchronously before done/error.
+   */
+  private flushDeltaBuffers(): void {
+    this.deltaFlushTimer = null;
+    for (const [sessionId, text] of this.textDeltaBuffer) {
+      this.postMessage({ type: "agentTextDelta", sessionId, text });
+    }
+    this.textDeltaBuffer.clear();
+    for (const [sessionId, byId] of this.thinkingDeltaBuffer) {
+      for (const [thinkingId, text] of byId) {
+        this.postMessage({
+          type: "agentThinkingDelta",
+          sessionId,
+          thinkingId,
+          text,
+        });
+      }
+    }
+    this.thinkingDeltaBuffer.clear();
+    for (const [sessionId, byId] of this.toolInputDeltaBuffer) {
+      for (const [toolCallId, partialJson] of byId) {
+        this.postMessage({
+          type: "agentToolInputDelta",
+          sessionId,
+          toolCallId,
+          partialJson,
+        });
+      }
+    }
+    this.toolInputDeltaBuffer.clear();
+  }
+
+  /** Schedule a delta flush ~16ms from now (idempotent). */
+  private scheduleDeltaFlush(): void {
+    if (this.deltaFlushTimer !== null) return;
+    this.deltaFlushTimer = setTimeout(() => this.flushDeltaBuffers(), 16);
+  }
+
+  /** Cancel any pending flush timer and drain buffers immediately. */
+  private flushDeltaBuffersNow(): void {
+    if (this.deltaFlushTimer !== null) {
+      clearTimeout(this.deltaFlushTimer);
+    }
+    this.flushDeltaBuffers();
   }
 
   resolveWebviewView(webviewView: vscode.WebviewView): void {
@@ -797,9 +975,44 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (!this.sessionManager) return;
 
     switch (msg.command) {
+      case "agentStreamDrop": {
+        if (!__DEV_BUILD__) break;
+        const reason = String(msg.reason ?? "");
+        const eventType = String(msg.eventType ?? "unknown");
+        const eventSessionId =
+          msg.eventSessionId === null || msg.eventSessionId === undefined
+            ? "none"
+            : String(msg.eventSessionId);
+        const currentSessionId =
+          msg.currentSessionId === null || msg.currentSessionId === undefined
+            ? "none"
+            : String(msg.currentSessionId);
+        const streaming = Boolean(msg.streaming);
+
+        if (reason === "session_mismatch") {
+          this.streamDropCounts.sessionMismatch += 1;
+        } else if (reason === "streaming_false") {
+          this.streamDropCounts.streamingFalse += 1;
+        }
+
+        if (!this.streamDropLogTimer) {
+          this.streamDropLogTimer = setTimeout(() => {
+            this.streamDropLogTimer = null;
+            this.log(
+              `[webview-drop] summary: session_mismatch=${this.streamDropCounts.sessionMismatch} streaming_false=${this.streamDropCounts.streamingFalse}`,
+            );
+          }, 2000);
+        }
+
+        this.log(
+          `[webview-drop] reason=${reason} event=${eventType} eventSession=${eventSessionId} currentSession=${currentSessionId} streaming=${streaming}`,
+        );
+        break;
+      }
       case "webviewReady":
         this.webviewReady = true;
         void this.sendModesUpdate();
+        void this.sendModelsUpdate();
         this.sendSlashCommands();
         this.sendSessionList();
         // Flush any messages queued before the webview was ready
@@ -846,8 +1059,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const sessionId = msg.sessionId as string | undefined;
         const thinkingEnabled = msg.thinkingEnabled !== false;
         const attachments = (msg.attachments as string[]) ?? [];
+        const images =
+          (msg.images as
+            | Array<{ name: string; mimeType: string; base64: string }>
+            | undefined) ?? [];
+        const documents =
+          (msg.documents as
+            | Array<{ name: string; mimeType: string; base64: string }>
+            | undefined) ?? [];
 
-        if (!text?.trim() && attachments.length === 0) return;
+        if (
+          !text?.trim() &&
+          attachments.length === 0 &&
+          images.length === 0 &&
+          documents.length === 0
+        )
+          return;
 
         // Resolve attachments: read file contents and build context
         const resolvedText = await this.resolveAttachments(text, attachments);
@@ -856,13 +1083,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           `[send] session=${sessionId ?? "new"} mode=${mode} thinking=${thinkingEnabled} attachments=${attachments.length} text="${resolvedText.slice(0, 80)}${resolvedText.length > 80 ? "..." : ""}"`,
         );
 
-        // If no sessionId, a new session will be created — update the webview
-        // with the new session ID so follow-up messages reuse it
         const mgr = this.sessionManager;
+        const config = mgr.getConfig();
+
+        // For new sessions, create the session first so we can send stateUpdate
+        // with the correct sessionId BEFORE streaming events start arriving.
+        // If we fire sendMessage() unawaited with no sessionId, createSession()
+        // runs async inside it — getForegroundSession() below returns null and
+        // the stateUpdate is never sent, causing all events to be dropped as
+        // session_mismatch in the webview.
+        let effectiveSessionId = sessionId;
+        if (!effectiveSessionId || !mgr.getSession(effectiveSessionId)) {
+          const newSession = await mgr.createSession(mode, {
+            activeFilePath: vscode.window.activeTextEditor?.document.uri.fsPath,
+          });
+          effectiveSessionId = newSession.id;
+        }
+
         mgr
-          .sendMessage(sessionId, resolvedText, mode, {
+          .sendMessage(effectiveSessionId, resolvedText, mode, {
             thinkingEnabled,
             activeFilePath: vscode.window.activeTextEditor?.document.uri.fsPath,
+            images: images.length > 0 ? images : undefined,
+            documents: documents.length > 0 ? documents : undefined,
           })
           .catch((err) => {
             this.log(`[error] send failed: ${err}`);
@@ -870,7 +1113,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         // Send updated state immediately so webview knows the session ID
         const fg = mgr.getForegroundSession();
-        const config = mgr.getConfig();
         if (fg) {
           this.postMessage({
             type: "stateUpdate",
@@ -915,6 +1157,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             totalCacheReadTokens: session?.totalCacheReadTokens ?? 0,
             totalCacheCreationTokens: session?.totalCacheCreationTokens ?? 0,
           });
+          // If this was a bg session, push updated status so the strip/block
+          // shows the cancelled state immediately.
+          if (session?.background) {
+            this.sendBgSessionsUpdate();
+          }
         }
         break;
       }
@@ -970,11 +1217,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "agentSetModel": {
         const model = msg.model as string;
         if (!model) break;
-        // Persist in config so future sessions and sendInitialState fallback use it
-        this.sessionManager.updateConfig({ model });
-        // Also update the active session if one exists
-        const fg = this.sessionManager.getForegroundSession();
-        if (fg) fg.model = model;
+        // Update config, session model, and rebuild system prompt if provider changed
+        await this.sessionManager.setModel(model);
         // Persist to VS Code global settings so it survives restarts
         vscode.workspace
           .getConfiguration("agentlink")
@@ -1115,6 +1359,43 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               totalCacheCreationTokens: fg.totalCacheCreationTokens,
             });
           }
+        } else if (name === "checkpoint") {
+          const checkpoint =
+            await this.sessionManager?.createManualCheckpoint();
+          if (!checkpoint) {
+            vscode.window.showInformationMessage(
+              "No active session state is available to checkpoint yet.",
+            );
+            break;
+          }
+          vscode.window.showInformationMessage(
+            `Checkpoint created: ${checkpoint.id.slice(0, 8)}`,
+          );
+        } else if (name === "revert") {
+          const fg = this.sessionManager?.getForegroundSession();
+          if (!fg || !this.sessionManager) break;
+          const checkpoints = this.sessionManager.getCheckpoints(fg.id);
+          if (checkpoints.length === 0) {
+            vscode.window.showInformationMessage("No checkpoints available.");
+            break;
+          }
+
+          const query = String(msg.args ?? "").trim();
+          const checkpoint = query
+            ? checkpoints.find(
+                (candidate) =>
+                  candidate.id === query || candidate.id.startsWith(query),
+              )
+            : checkpoints[checkpoints.length - 1];
+
+          if (!checkpoint) {
+            vscode.window.showWarningMessage(
+              `No checkpoint matched "${query}".`,
+            );
+            break;
+          }
+
+          await this.revertCheckpointWithConfirmation(fg.id, checkpoint.id);
         } else if (name === "mcp") {
           const scope =
             (msg.args as string) === "global" ? "global" : "project";
@@ -1132,7 +1413,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         } else {
           this.log(`[slash] /${name} not yet implemented`);
           vscode.window.showInformationMessage(
-            `/${name} will be available in a future update.`,
+            `Unknown slash command: /${name}`,
           );
         }
         break;
@@ -1157,6 +1438,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         vscode.window.showTextDocument(uri, options).then(undefined, (err) => {
           this.log(`[error] Failed to open file: ${err}`);
         });
+        break;
+      }
+
+      case "openBgTranscript": {
+        const sessionId = msg.sessionId as string;
+        if (sessionId) {
+          const session = this.sessionManager?.getSession(sessionId);
+          if (session) {
+            this.postMessage({
+              type: "showBgTranscript",
+              sessionId,
+              task: session.title ?? "Background Agent",
+              messages: session.getAllMessages(),
+            });
+          } else {
+            vscode.window.showWarningMessage(
+              "Background agent session not found — it may have been cleaned up.",
+            );
+          }
+        }
         break;
       }
 
@@ -1284,61 +1585,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const sessionId = msg.sessionId as string;
         const checkpointId = msg.checkpointId as string;
         if (!sessionId || !checkpointId || !this.sessionManager) break;
-
-        const preview = await this.sessionManager.previewRevert(
-          sessionId,
-          checkpointId,
-        );
-
-        // Build confirmation message listing affected files
-        const affected: string[] = [
-          ...(preview?.modified.map((f) => `  ~ ${f}`) ?? []),
-          ...(preview?.deleted.map((f) => `  - ${f}`) ?? []),
-          ...(preview?.restored.map((f) => `  + ${f}`) ?? []),
-        ];
-        const detail =
-          affected.length > 0
-            ? `\n\nAffected files:\n${affected.slice(0, 20).join("\n")}${affected.length > 20 ? `\n  ...and ${affected.length - 20} more` : ""}`
-            : "\n\nNo file changes detected.";
-
-        const confirmed = await vscode.window.showWarningMessage(
-          `Revert workspace to this checkpoint?${detail}`,
-          { modal: true },
-          "Revert",
-        );
-
-        if (confirmed !== "Revert") break;
-
-        const ok = await this.sessionManager.revertToCheckpoint(
-          sessionId,
-          checkpointId,
-        );
-
-        if (ok) {
-          this.log(
-            `[agent] Reverted session ${sessionId} to checkpoint ${checkpointId}`,
-          );
-          // Reload the session state in the webview
-          const session = this.sessionManager.getSession(sessionId);
-          if (session) {
-            this.postMessage({
-              type: "agentSessionLoaded",
-              sessionId: session.id,
-              title: session.title,
-              mode: session.mode,
-              messages: session.getAllMessages(),
-              lastInputTokens: session.lastInputTokens,
-              lastOutputTokens: 0, // per-last-request value not persisted; 0 avoids stale cumulative display
-              checkpoints: this.getSessionCheckpoints(session.id),
-            });
-          }
-          this.sendInitialState();
-          vscode.window.showInformationMessage("Reverted to checkpoint.");
-        } else {
-          vscode.window.showErrorMessage(
-            "Failed to revert checkpoint. Check the AgentLink Agent output channel for details.",
-          );
-        }
+        await this.revertCheckpointWithConfirmation(sessionId, checkpointId);
         break;
       }
 
@@ -1350,6 +1597,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           const session = this.sessionManager.getSession(sessionId);
           session?.setPendingInterjection(text, queueId);
         }
+        break;
+      }
+
+      case "agentCodexSignIn": {
+        // Trigger Codex sign-in from the webview (e.g. model picker "Sign in" row)
+        vscode.commands.executeCommand("agentlink.codexSignIn");
+        break;
+      }
+
+      case "agentCodexSignOut": {
+        vscode.commands.executeCommand("agentlink.codexSignOut");
         break;
       }
 
@@ -1370,12 +1628,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private handleAgentEvent(sessionId: string, event: AgentEvent): void {
+    // Route foreground and background streams separately so foreground transcript
+    // rendering does not depend on session-ID filtering in the webview.
+    const isBackground = Boolean(
+      this.sessionManager?.getSession(sessionId)?.background,
+    );
+
     // Log all events to the output channel
     switch (event.type) {
       case "thinking_start":
         this.log(`[agent] thinking_start id=${event.thinkingId}`);
         this.postMessage({
-          type: "agentThinkingStart",
+          type: isBackground ? "agentBgThinkingStart" : "agentThinkingStart",
           sessionId,
           thinkingId: event.thinkingId,
         });
@@ -1383,18 +1647,33 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
       case "thinking_delta":
         // Don't log every delta — too noisy
-        this.postMessage({
-          type: "agentThinkingDelta",
-          sessionId,
-          thinkingId: event.thinkingId,
-          text: event.text,
-        });
+        if (isBackground) {
+          this.postMessage({
+            type: "agentBgThinkingDelta",
+            sessionId,
+            thinkingId: event.thinkingId,
+            text: event.text,
+          });
+        } else {
+          const tMap =
+            this.thinkingDeltaBuffer.get(sessionId) ??
+            new Map<string, string>();
+          tMap.set(
+            event.thinkingId,
+            (tMap.get(event.thinkingId) ?? "") + event.text,
+          );
+          this.thinkingDeltaBuffer.set(sessionId, tMap);
+          this.scheduleDeltaFlush();
+        }
         break;
 
       case "thinking_end":
         this.log(`[agent] thinking_end id=${event.thinkingId}`);
+        // Flush buffered thinking deltas before marking complete so content
+        // arrives at the webview before the block is sealed.
+        this.flushDeltaBuffersNow();
         this.postMessage({
-          type: "agentThinkingEnd",
+          type: isBackground ? "agentBgThinkingEnd" : "agentThinkingEnd",
           sessionId,
           thinkingId: event.thinkingId,
         });
@@ -1402,36 +1681,53 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
       case "text_delta":
         // Don't log every delta — too noisy
-        this.postMessage({
-          type: "agentTextDelta",
-          sessionId,
-          text: event.text,
-        });
+        if (isBackground) {
+          this.postMessage({
+            type: "agentBgTextDelta",
+            sessionId,
+            text: event.text,
+          });
+        } else {
+          this.textDeltaBuffer.set(
+            sessionId,
+            (this.textDeltaBuffer.get(sessionId) ?? "") + event.text,
+          );
+          this.scheduleDeltaFlush();
+        }
+        // Keep bg strip in sync with streaming text (throttled to avoid flooding)
+        if (isBackground) {
+          this.sendBgSessionsUpdateThrottled();
+        }
         break;
 
       case "tool_start":
         this.log(
           `[agent] tool_start tool=${event.toolName} id=${event.toolCallId}`,
         );
+        // Flush buffered text deltas before the tool card so pre-tool text
+        // arrives at the webview before agentToolStart, preserving natural order.
+        this.flushDeltaBuffersNow();
         this.postMessage({
-          type: "agentToolStart",
+          type: isBackground ? "agentBgToolStart" : "agentToolStart",
           sessionId,
           toolCallId: event.toolCallId,
           toolName: event.toolName,
         });
         // Keep bg strip in sync when a bg session starts a new tool
-        if (this.sessionManager?.getSession(sessionId)?.background) {
+        if (isBackground) {
           this.sendBgSessionsUpdate();
         }
         break;
 
       case "tool_input_delta":
-        this.postMessage({
-          type: "agentToolInputDelta",
-          sessionId,
-          toolCallId: event.toolCallId,
-          partialJson: event.partialJson,
-        });
+        const iMap =
+          this.toolInputDeltaBuffer.get(sessionId) ?? new Map<string, string>();
+        iMap.set(
+          event.toolCallId,
+          (iMap.get(event.toolCallId) ?? "") + event.partialJson,
+        );
+        this.toolInputDeltaBuffer.set(sessionId, iMap);
+        this.scheduleDeltaFlush();
         break;
 
       case "checkpoint_created":
@@ -1456,6 +1752,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
       case "tool_result": {
         // Convert tool result content to a string for the webview
+        // Flush buffered tool input deltas before marking the tool complete
+        // so the webview sees the full input JSON before the result arrives.
+        this.flushDeltaBuffersNow();
         const resultText = event.result
           .map((c) => (c.type === "text" ? c.text : `[${c.type}]`))
           .join("\n");
@@ -1463,7 +1762,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           `[agent] tool_result tool=${event.toolName} id=${event.toolCallId} duration=${event.durationMs}ms`,
         );
         this.postMessage({
-          type: "agentToolComplete",
+          type: isBackground ? "agentBgToolComplete" : "agentToolComplete",
           sessionId,
           toolCallId: event.toolCallId,
           toolName: event.toolName,
@@ -1501,7 +1800,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             `duration=${event.durationMs}ms ttft=${event.timeToFirstToken}ms`,
         );
         this.postMessage({
-          type: "agentApiRequest",
+          type: isBackground ? "agentBgApiRequest" : "agentApiRequest",
           sessionId,
           requestId: event.requestId,
           model: event.model,
@@ -1515,19 +1814,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
 
       case "error":
+        this.flushDeltaBuffersNow();
         this.log(
           `[agent] error: ${event.error} (retryable=${event.retryable})`,
         );
         this.postMessage({
-          type: "agentError",
+          type: isBackground ? "agentBgError" : "agentError",
           sessionId,
           error: event.error,
           retryable: event.retryable,
         });
+        // Keep bg strip in sync on error (flush any pending throttled update)
+        if (isBackground) {
+          if (this.bgUpdateTimer) {
+            clearTimeout(this.bgUpdateTimer);
+            this.bgUpdateTimer = null;
+          }
+          this.sendBgSessionsUpdate();
+        }
         break;
 
       case "condense_start":
-        this.condenseStartTime = Date.now();
+        this.condenseStartTimes.set(sessionId, Date.now());
         this.postMessage({
           type: "agentCondenseStart",
           sessionId,
@@ -1539,10 +1847,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.log(
           `[agent] condensed: prev=${event.prevInputTokens} new=${event.newInputTokens}`,
         );
-        const condenseDurationMs = this.condenseStartTime
-          ? Date.now() - this.condenseStartTime
+        const condenseDurationMs = this.condenseStartTimes.has(sessionId)
+          ? Date.now() - this.condenseStartTimes.get(sessionId)!
           : 0;
-        this.condenseStartTime = null;
+        this.condenseStartTimes.delete(sessionId);
         this.postMessage({
           type: "agentCondense",
           sessionId,
@@ -1550,6 +1858,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           newInputTokens: event.newInputTokens,
           summary: event.summary,
           durationMs: condenseDurationMs,
+          validationWarnings: event.validationWarnings,
         });
         if (__DEV_BUILD__ && this.cwd) {
           this.writeCondenseDebug(sessionId, event).catch((err) => {
@@ -1578,36 +1887,68 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
       case "user_interjection":
         this.log(`[agent] user_interjection queueId=${event.queueId}`);
-        this.postMessage({
-          type: "agentInterjection",
-          sessionId,
-          text: event.text,
-          queueId: event.queueId,
-        });
+        // Suppress interjection UI for bg question injections — these are
+        // rendered as collapsible Q&A blocks via onBgQuestionAnswered instead.
+        if (!event.queueId.startsWith("bg-q-")) {
+          this.postMessage({
+            type: "agentInterjection",
+            sessionId,
+            text: event.text,
+            queueId: event.queueId,
+          });
+        }
         break;
 
       case "done":
+        this.flushDeltaBuffersNow();
         this.log(
           `[agent] done totalIn=${event.totalInputTokens} totalOut=${event.totalOutputTokens} ` +
             `cacheRead=${event.totalCacheReadTokens} cacheCreate=${event.totalCacheCreationTokens}`,
         );
         this.postMessage({
-          type: "agentDone",
+          type: isBackground ? "agentBgDone" : "agentDone",
           sessionId,
           totalInputTokens: event.totalInputTokens,
           totalOutputTokens: event.totalOutputTokens,
           totalCacheReadTokens: event.totalCacheReadTokens,
           totalCacheCreationTokens: event.totalCacheCreationTokens,
+          ...(isBackground && {
+            resultText:
+              this.sessionManager
+                ?.getSession(sessionId)
+                ?.getLastAssistantText() ?? undefined,
+          }),
         });
         // Refresh session list after save (SessionStore.save is called in SessionManager)
         this.sendSessionList();
+        // Keep bg strip in sync on done (flush any pending throttled update)
+        if (isBackground) {
+          if (this.bgUpdateTimer) {
+            clearTimeout(this.bgUpdateTimer);
+            this.bgUpdateTimer = null;
+          }
+          this.sendBgSessionsUpdate();
+        }
         break;
     }
   }
 
   private async writeCondenseDebug(
     sessionId: string,
-    event: { prevInputTokens: number; newInputTokens: number; summary: string },
+    event: {
+      prevInputTokens: number;
+      newInputTokens: number;
+      summary: string;
+      validationWarnings?: string[];
+      metadata?: {
+        inputMessageCount: number;
+        sourceUserMessageCount: number;
+        hadPriorSummaryInInput: boolean;
+        retryUsed: boolean;
+        validatorErrors: string[];
+        sourceHash: string;
+      };
+    },
   ): Promise<void> {
     const { randomUUID: uuid } = require("crypto") as typeof import("crypto");
     const id = uuid().slice(0, 8);
@@ -1630,6 +1971,35 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       ``,
       event.summary,
     ];
+    if (event.validationWarnings && event.validationWarnings.length > 0) {
+      summaryLines.push(``);
+      summaryLines.push(`## Validation Warnings`);
+      summaryLines.push(``);
+      for (const warning of event.validationWarnings) {
+        summaryLines.push(`- ${warning}`);
+      }
+    }
+    if (event.metadata) {
+      summaryLines.push(``);
+      summaryLines.push(`## Metadata`);
+      summaryLines.push(``);
+      summaryLines.push(
+        `- inputMessageCount: ${event.metadata.inputMessageCount}`,
+      );
+      summaryLines.push(
+        `- sourceUserMessageCount: ${event.metadata.sourceUserMessageCount}`,
+      );
+      summaryLines.push(
+        `- hadPriorSummaryInInput: ${event.metadata.hadPriorSummaryInInput}`,
+      );
+      summaryLines.push(`- retryUsed: ${event.metadata.retryUsed}`);
+      summaryLines.push(`- sourceHash: ${event.metadata.sourceHash}`);
+      if (event.metadata.validatorErrors.length > 0) {
+        summaryLines.push(
+          `- validatorErrors: ${event.metadata.validatorErrors.join(" | ")}`,
+        );
+      }
+    }
     fs.writeFileSync(
       path.join(dir, "condense-result.md"),
       summaryLines.join("\n"),
@@ -1649,7 +2019,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         ``,
       ];
       for (const msg of session.getAllMessages()) {
-        const role = msg.role === "user" ? "User" : "Assistant";
+        const role = msg.isSummary
+          ? "Condense Summary"
+          : msg.role === "user"
+            ? "User"
+            : "Assistant";
         transcriptLines.push(`## ${role}`);
         transcriptLines.push(``);
         if (typeof msg.content === "string") {
@@ -1798,6 +2172,66 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.log(`Transcript exported to ${filePath}`);
   }
 
+  private async revertCheckpointWithConfirmation(
+    sessionId: string,
+    checkpointId: string,
+  ): Promise<void> {
+    if (!this.sessionManager) return;
+
+    const preview = await this.sessionManager.previewRevert(
+      sessionId,
+      checkpointId,
+    );
+
+    const affected: string[] = [
+      ...(preview?.modified.map((f) => `  ~ ${f}`) ?? []),
+      ...(preview?.deleted.map((f) => `  - ${f}`) ?? []),
+      ...(preview?.restored.map((f) => `  + ${f}`) ?? []),
+    ];
+    const detail =
+      affected.length > 0
+        ? `\n\nAffected files:\n${affected.slice(0, 20).join("\n")}${affected.length > 20 ? `\n  ...and ${affected.length - 20} more` : ""}`
+        : "\n\nNo file changes detected.";
+
+    const confirmed = await vscode.window.showWarningMessage(
+      `Revert workspace to this checkpoint?${detail}`,
+      { modal: true },
+      "Revert",
+    );
+
+    if (confirmed !== "Revert") return;
+
+    const ok = await this.sessionManager.revertToCheckpoint(
+      sessionId,
+      checkpointId,
+    );
+
+    if (ok) {
+      this.log(
+        `[agent] Reverted session ${sessionId} to checkpoint ${checkpointId}`,
+      );
+      const session = this.sessionManager.getSession(sessionId);
+      if (session) {
+        this.postMessage({
+          type: "agentSessionLoaded",
+          sessionId: session.id,
+          title: session.title,
+          mode: session.mode,
+          messages: session.getAllMessages(),
+          lastInputTokens: session.lastInputTokens,
+          lastOutputTokens: 0,
+          checkpoints: this.getSessionCheckpoints(session.id),
+        });
+      }
+      this.sendInitialState();
+      vscode.window.showInformationMessage("Reverted to checkpoint.");
+    } else {
+      vscode.window.showErrorMessage(
+        "Failed to revert checkpoint. Check the AgentLink Agent output channel for details.",
+      );
+    }
+  }
+
   private async sendDebugInfo(): Promise<void> {
     const os = require("os");
 
@@ -1847,7 +2281,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (!systemPrompt && this.cwd) {
       try {
         const mode = fg?.mode ?? "code";
-        systemPrompt = await buildSystemPrompt(mode, this.cwd);
+        const model = fg?.model ?? this.sessionManager?.getConfig().model;
+        const providerId = model
+          ? providerRegistry.tryResolveProvider(model)?.id
+          : undefined;
+        systemPrompt = await buildSystemPrompt(mode, this.cwd, { providerId });
       } catch (err) {
         this.log(`[warn] Failed to build debug system prompt: ${err}`);
       }
@@ -1871,6 +2309,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       } catch (err) {
         this.log(`[warn] Failed to load instruction blocks for debug: ${err}`);
       }
+    }
+
+    const bgRouting = this.sessionManager?.getRecentBgRoutingSummaries(5) ?? [];
+    if (bgRouting.length > 0) {
+      bgRouting.forEach((line, idx) => {
+        info[`bg.route.${idx + 1}`] = line;
+      });
     }
 
     this.postMessage({
@@ -1999,6 +2444,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       type: "agentSessionUpdate",
       sessions: this.sessionManager.getSessionInfos(),
     });
+  }
+
+  /**
+   * Re-send model list to the webview. Called externally when provider auth
+   * state changes (e.g. Codex sign-in/sign-out).
+   */
+  public refreshModels(): void {
+    void this.sendModelsUpdate();
   }
 
   /**
@@ -2155,7 +2608,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy"
-    content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}'; img-src ${webview.cspSource} data:;">
+    content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}' ${webview.cspSource} blob:; worker-src blob:; img-src ${webview.cspSource} data: blob:;">
   <title>Mermaid Diagram</title>
   <style>
     :root { color-scheme: dark light; }

@@ -1,5 +1,6 @@
 import { useRef, useEffect, useCallback } from "preact/hooks";
 import type { ChatMessage } from "../types";
+import type { BgSessionInfoProps } from "./BackgroundSessionStrip";
 import { MessageBubble } from "./MessageBubble";
 import { CondenseRow } from "./CondenseRow";
 import { WarningRow } from "./WarningRow";
@@ -13,6 +14,10 @@ interface ChatViewProps {
   onOpenMermaidPanel?: (source: string) => void;
   onRevertCheckpoint?: (sessionId: string, checkpointId: string) => void;
   onRetry?: () => void;
+  onSignIn?: () => void;
+  bgSessions?: BgSessionInfoProps[];
+  onStopBackground?: (sessionId: string) => void;
+  onOpenTranscript?: (sessionId: string) => void;
 }
 
 export function ChatView({
@@ -23,6 +28,10 @@ export function ChatView({
   onOpenMermaidPanel,
   onRevertCheckpoint,
   onRetry,
+  onSignIn,
+  bgSessions,
+  onStopBackground,
+  onOpenTranscript,
 }: ChatViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const shouldAutoScroll = useRef(true);
@@ -57,7 +66,7 @@ export function ChatView({
     if (shouldAutoScroll.current) {
       scrollToBottom();
     }
-  }, [scrollKey]);
+  }, [scrollKey, streaming]);
 
   // Track scrollHeight changes (e.g. mermaid diagrams rendering async)
   // and auto-scroll when content grows
@@ -92,6 +101,21 @@ export function ChatView({
     shouldAutoScroll.current = distFromBottom < 150;
   }, []);
 
+  const firstUserMsg = messages.find((m) => m.role === "user");
+  const firstPromptText = firstUserMsg?.content.trim() ?? "";
+  const PREVIEW_MAX = 80;
+  const previewLabel =
+    firstPromptText.length > PREVIEW_MAX
+      ? firstPromptText.slice(0, PREVIEW_MAX) + "…"
+      : firstPromptText;
+
+  const scrollToTop = useCallback(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    programmaticScroll.current = true;
+    el.scrollTop = 0;
+  }, []);
+
   if (messages.length === 0) {
     return (
       <div class="chat-messages empty">
@@ -104,41 +128,63 @@ export function ChatView({
   }
 
   return (
-    <div class="chat-messages" ref={containerRef} onScroll={handleScroll}>
-      {messages.map((msg) =>
-        msg.role === "condense" ? (
-          <CondenseRow key={msg.id} message={msg} />
-        ) : msg.role === "warning" ? (
-          <WarningRow key={msg.id} message={msg} />
-        ) : (
-          <>
-            <MessageBubble
-              key={msg.id}
-              message={msg}
-              streaming={
-                streaming &&
-                msg === messages[messages.length - 1] &&
-                msg.role === "assistant"
-              }
-              onOpenFile={onOpenFile}
-              onOpenMermaidPanel={onOpenMermaidPanel}
-              onRetry={
-                msg === messages[messages.length - 1] && msg.error?.retryable
-                  ? onRetry
-                  : undefined
-              }
-            />
-            {msg.role === "user" && msg.checkpointId && onRevertCheckpoint && (
-              <CheckpointRow
-                key={`cp-${msg.id}`}
-                checkpointId={msg.checkpointId}
-                sessionId={sessionId}
-                onRevert={onRevertCheckpoint}
-              />
-            )}
-          </>
-        ),
+    <>
+      {previewLabel && (
+        <button
+          class="prompt-preview"
+          onClick={scrollToTop}
+          title={firstPromptText}
+        >
+          <i class="codicon codicon-comment" />
+          <span class="prompt-preview-text">{previewLabel}</span>
+        </button>
       )}
-    </div>
+      <div class="chat-messages" ref={containerRef} onScroll={handleScroll}>
+        {messages.map((msg) =>
+          msg.role === "condense" ? (
+            <CondenseRow key={msg.id} message={msg} />
+          ) : msg.role === "warning" ? (
+            <WarningRow key={msg.id} message={msg} />
+          ) : (
+            <>
+              {msg.role === "user" &&
+                msg.checkpointId &&
+                onRevertCheckpoint && (
+                  <CheckpointRow
+                    key={`cp-${msg.id}`}
+                    checkpointId={msg.checkpointId}
+                    sessionId={sessionId}
+                    onRevert={onRevertCheckpoint}
+                  />
+                )}
+              <MessageBubble
+                key={msg.id}
+                message={msg}
+                streaming={
+                  streaming &&
+                  msg === messages[messages.length - 1] &&
+                  msg.role === "assistant"
+                }
+                onOpenFile={onOpenFile}
+                onOpenMermaidPanel={onOpenMermaidPanel}
+                onRetry={
+                  msg === messages[messages.length - 1] && msg.error?.retryable
+                    ? onRetry
+                    : undefined
+                }
+                onSignIn={
+                  msg === messages[messages.length - 1] && msg.error
+                    ? onSignIn
+                    : undefined
+                }
+                bgSessions={bgSessions}
+                onStopBackground={onStopBackground}
+                onOpenTranscript={onOpenTranscript}
+              />
+            </>
+          ),
+        )}
+      </div>
+    </>
   );
 }

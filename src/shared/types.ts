@@ -91,7 +91,30 @@ export interface BgSessionInfo {
     | "tool_executing"
     | "awaiting_approval"
     | "idle"
-    | "error";
+    | "error"
+    | "cancelled";
   /** Most recently started tool name (while streaming). */
   currentTool?: string;
+  /** Resolved execution mode after route selection. */
+  resolvedMode?: string;
+  /** Resolved model id after route selection. */
+  resolvedModel?: string;
+  /** Resolved provider id after route selection. */
+  resolvedProvider?: string;
+  /** Background task class used for routing profile selection. */
+  taskClass?: string;
+  /** Human-readable reason for the selected route. */
+  routingReason?: string;
+  /** True when route fallback behavior was used. */
+  fallbackUsed?: boolean;
+  /** Accumulated streaming text from the bg agent (last ~500 chars for preview). */
+  streamingText?: string;
+  /** Final result text when agent is done. */
+  resultText?: string;
+  /** Error message if the agent errored. */
+  errorMessage?: string;
+  /** Timestamp when the agent finished (for auto-dismiss timing). */
+  completedAt?: number;
+  /** Full transcript of the bg agent conversation (all assistant text blocks). */
+  fullTranscript?: string;
 }

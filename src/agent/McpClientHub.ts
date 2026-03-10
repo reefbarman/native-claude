@@ -8,7 +8,7 @@ import {
   ElicitRequestSchema,
   CreateMessageRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import type Anthropic from "@anthropic-ai/sdk";
+import type { ToolDefinition, JsonSchema } from "./providers/types.js";
 import type { McpServerConfig } from "./mcpConfig.js";
 import type { ToolResult } from "../shared/types.js";
 import { McpOAuthProvider } from "./McpOAuthProvider.js";
@@ -65,7 +65,7 @@ interface ConnectedServer {
   name: string;
   config: McpServerConfig;
   client: Client;
-  tools: Anthropic.Tool[];
+  tools: ToolDefinition[];
   resources: McpResource[];
   prompts: McpPrompt[];
   status: McpServerStatus;
@@ -287,7 +287,7 @@ export class McpClientHub {
         input_schema: (t.inputSchema ?? {
           type: "object",
           properties: {},
-        }) as Anthropic.Tool["input_schema"],
+        }) as JsonSchema,
       }));
 
       entry.resources = resourcesResult.resources.map((r) => ({
@@ -469,8 +469,8 @@ export class McpClientHub {
   }
 
   /** All tool definitions from connected servers (prefixed). */
-  getToolDefs(): Anthropic.Tool[] {
-    const tools: Anthropic.Tool[] = [];
+  getToolDefs(): ToolDefinition[] {
+    const tools: ToolDefinition[] = [];
     for (const server of this.servers.values()) {
       if (server.status === "connected") tools.push(...server.tools);
     }

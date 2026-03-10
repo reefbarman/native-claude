@@ -76,13 +76,31 @@ export function CommandCard({
     );
   });
 
+  // Auto-size on command change
   useEffect(() => {
     const el = textareaRef.current;
-    if (el) {
+    if (el && el.clientWidth > 0) {
       el.style.height = "auto";
       el.style.height = el.scrollHeight + "px";
     }
   }, [command]);
+
+  // Re-run sizing when the panel becomes visible (clientWidth goes from 0 to real value)
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    let lastWidth = el.clientWidth;
+    const observer = new ResizeObserver(() => {
+      const w = el.clientWidth;
+      if (w !== lastWidth && w > 0) {
+        lastWidth = w;
+        el.style.height = "auto";
+        el.style.height = el.scrollHeight + "px";
+      }
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
 
   const handleRun = useCallback(() => {
     submit({

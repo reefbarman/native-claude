@@ -5,12 +5,16 @@
  * tool calls to the existing handler functions in src/tools/*.ts.
  */
 
-import type Anthropic from "@anthropic-ai/sdk";
+import type { ToolDefinition, JsonSchema } from "./providers/types.js";
 import { z } from "zod";
 import * as vscode from "vscode";
 import type { ApprovalManager } from "../approvals/ApprovalManager.js";
 import type { ApprovalPanelProvider } from "../approvals/ApprovalPanelProvider.js";
 import type { ToolResult } from "../shared/types.js";
+import type {
+  SpawnBackgroundRequest,
+  SpawnBackgroundResult,
+} from "./backgroundTypes.js";
 import { TOOL_REGISTRY } from "../shared/toolRegistry.js";
 import * as schemas from "../shared/toolSchemas.js";
 import type { AgentMode } from "./modes.js";
@@ -50,6 +54,9 @@ import { handleGetCallHierarchy } from "../tools/getCallHierarchy.js";
 import { handleGetTypeHierarchy } from "../tools/getTypeHierarchy.js";
 import { handleGetInlayHints } from "../tools/getInlayHints.js";
 import { handleRenameSymbol } from "../tools/renameSymbol.js";
+import { handleSendFeedback } from "../tools/sendFeedback.js";
+import { handleGetFeedback } from "../tools/getFeedback.js";
+import { handleDeleteFeedback } from "../tools/deleteFeedback.js";
 
 // --- Read-only tools (safe to execute in parallel) ---
 
@@ -82,8 +89,8 @@ export const READ_ONLY_TOOLS = new Set([
 
 // --- Tools excluded from the agent (MCP-only or not applicable) ---
 
-const EXCLUDED_TOOLS = new Set([
-  "handshake",
+const EXCLUDED_TOOLS = new Set(["handshake"]);
+const DEV_FEEDBACK_TOOLS = new Set([
   "send_feedback",
   "get_feedback",
   "delete_feedback",
@@ -93,12 +100,12 @@ const EXCLUDED_TOOLS = new Set([
 
 function zodSchemaToJsonSchema(
   schema: Record<string, z.ZodTypeAny>,
-): Anthropic.Tool["input_schema"] {
+): JsonSchema {
   const obj = z.object(schema);
   // Zod v4 has built-in JSON Schema support (zod-to-json-schema doesn't support v4)
   const jsonSchema = z.toJSONSchema(obj) as Record<string, unknown>;
   const { $schema: _, ...rest } = jsonSchema;
-  return rest as Anthropic.Tool["input_schema"];
+  return rest as JsonSchema;
 }
 
 // --- Tool name → zod schema mapping ---
@@ -130,16 +137,55 @@ const TOOL_SCHEMAS: Record<string, Record<string, z.ZodTypeAny>> = {
   get_type_hierarchy: schemas.getTypeHierarchySchema,
   get_inlay_hints: schemas.getInlayHintsSchema,
   codebase_search: schemas.codebaseSearchSchema,
+  ...(__DEV_BUILD__
+    ? {
+        send_feedback: {
+          tool_name: z
+            .string()
+            .describe("Name of the tool this feedback is about"),
+          feedback: z
+            .string()
+            .describe(
+              "Description of the issue, suggestion, or missing feature",
+            ),
+          tool_params: z
+            .string()
+            .optional()
+            .describe(
+              "Optional serialized params passed to the tool (helps reproduce)",
+            ),
+          tool_result_summary: z
+            .string()
+            .optional()
+            .describe("Optional summary of what happened / unexpected result"),
+        },
+        get_feedback: {
+          tool_name: z
+            .string()
+            .optional()
+            .describe(
+              "Filter to feedback about a specific tool (omit for all feedback)",
+            ),
+        },
+        delete_feedback: {
+          indices: z
+            .array(z.coerce.number())
+            .describe(
+              "0-based feedback entry indices to delete (from get_feedback output)",
+            ),
+        },
+      }
+    : {}),
 };
 
-const MCP_META_TOOLS: Anthropic.Tool[] = [
+const MCP_META_TOOLS: ToolDefinition[] = [
   {
     name: "list_mcp_resources",
     description: "List all resources available from connected MCP servers.",
     input_schema: {
       type: "object",
       properties: {},
-    } as Anthropic.Tool["input_schema"],
+    },
   },
   {
     name: "read_mcp_resource",
@@ -151,7 +197,7 @@ const MCP_META_TOOLS: Anthropic.Tool[] = [
         uri: { type: "string", description: "Resource URI" },
       },
       required: ["server", "uri"],
-    } as Anthropic.Tool["input_schema"],
+    },
   },
   {
     name: "list_mcp_prompts",
@@ -160,7 +206,7 @@ const MCP_META_TOOLS: Anthropic.Tool[] = [
     input_schema: {
       type: "object",
       properties: {},
-    } as Anthropic.Tool["input_schema"],
+    },
   },
   {
     name: "get_mcp_prompt",
@@ -174,15 +220,15 @@ const MCP_META_TOOLS: Anthropic.Tool[] = [
         arguments: { type: "object", description: "Optional prompt arguments" },
       },
       required: ["server", "name"],
-    } as Anthropic.Tool["input_schema"],
+    },
   },
 ];
 
 /** Schema for the ask_user tool (always available in all modes). */
-const ASK_USER_TOOL: Anthropic.Tool = {
+const ASK_USER_TOOL: ToolDefinition = {
   name: "ask_user",
   description:
-    "Ask the user one or more questions and wait for their responses before continuing. Use this proactively to clarify intent, gather preferences, or present choices — rather than guessing or making assumptions. Supports multiple question types in a single call.",
+    "Ask the user one or more questions and wait for their responses before continuing. Use this proactively to clarify intent, gather preferences, or present choices — rather than guessing or making assumptions. Supports multiple question types in a single call. For multiple_choice and multiple_select questions, always include a 'recommended' field indicating which option you would suggest — this helps the user decide quickly.",
   input_schema: {
     type: "object",
     properties: {
@@ -221,6 +267,11 @@ const ASK_USER_TOOL: Anthropic.Tool = {
               description:
                 "Answer options (required for multiple_choice and multiple_select)",
             },
+            recommended: {
+              type: "string",
+              description:
+                "The option value you recommend for this question (must exactly match one of the options strings). Always provide this for multiple_choice and multiple_select questions.",
+            },
             scale_min: {
               type: "number",
               description: "Scale minimum (default: 1)",
@@ -243,11 +294,11 @@ const ASK_USER_TOOL: Anthropic.Tool = {
       },
     },
     required: ["questions"],
-  } as Anthropic.Tool["input_schema"],
+  },
 };
 
 /** Schema for the switch_mode meta-tool (always available, regardless of mode). */
-const SWITCH_MODE_TOOL: Anthropic.Tool = {
+const SWITCH_MODE_TOOL: ToolDefinition = {
   name: "switch_mode",
   description:
     "Request to switch the current agent mode (e.g. from 'code' to 'architect'). The user must approve the switch. Available modes: code, architect, ask, debug.",
@@ -264,11 +315,11 @@ const SWITCH_MODE_TOOL: Anthropic.Tool = {
       },
     },
     required: ["mode"],
-  } as Anthropic.Tool["input_schema"],
+  },
 };
 
 /** Background agent management tools (only available in foreground sessions). */
-const BG_AGENT_TOOLS: Anthropic.Tool[] = [
+const BG_AGENT_TOOLS: ToolDefinition[] = [
   {
     name: "spawn_background_agent",
     description:
@@ -285,14 +336,32 @@ const BG_AGENT_TOOLS: Anthropic.Tool[] = [
           description:
             "Full instruction for the background agent. Be specific and self-contained — it has no other context.",
         },
+        mode: {
+          type: "string",
+          description: "Optional target mode override (e.g. review, code, ask)",
+        },
+        model: {
+          type: "string",
+          description: "Optional explicit model override",
+        },
+        provider: {
+          type: "string",
+          description:
+            "Optional provider preference/constraint (e.g. anthropic, codex)",
+        },
+        taskClass: {
+          type: "string",
+          description:
+            "Task class used for routing policy (e.g. review_code, review_plan, research, debug)",
+        },
       },
       required: ["task", "message"],
-    } as Anthropic.Tool["input_schema"],
+    },
   },
   {
     name: "get_background_status",
     description:
-      "Non-blocking check on a background agent's progress. Returns immediately with current status and whether it's done. Use this to check if a background agent has finished before deciding whether to call get_background_result, or to show progress while doing other work.",
+      "Non-blocking check on a background agent's progress. Returns immediately with current status and whether it's done. Use this only when you have other work to do in parallel and want a quick progress check. If you just want to wait for the result, call get_background_result directly — do NOT poll this in a loop.",
     input_schema: {
       type: "object",
       properties: {
@@ -302,12 +371,12 @@ const BG_AGENT_TOOLS: Anthropic.Tool[] = [
         },
       },
       required: ["sessionId"],
-    } as Anthropic.Tool["input_schema"],
+    },
   },
   {
     name: "get_background_result",
     description:
-      "Wait for a background agent to finish and return its final response. Blocks until the session completes. Call this when you are ready to use the background agent's output.",
+      "Wait for a background agent to finish and return its final response. Blocks until the session completes. Call this when you are ready to use the background agent's output. This is efficient — do not poll get_background_status first.",
     input_schema: {
       type: "object",
       properties: {
@@ -317,7 +386,27 @@ const BG_AGENT_TOOLS: Anthropic.Tool[] = [
         },
       },
       required: ["sessionId"],
-    } as Anthropic.Tool["input_schema"],
+    },
+  },
+  {
+    name: "kill_background_agent",
+    description:
+      "Stop a running background agent. Use this when you observe (via get_background_status or the todo list) that a background agent is taking too long, going in the wrong direction, or is no longer needed. Returns the agent's partial output collected so far.",
+    input_schema: {
+      type: "object",
+      properties: {
+        sessionId: {
+          type: "string",
+          description: "The sessionId of the background agent to stop",
+        },
+        reason: {
+          type: "string",
+          description:
+            "Brief reason for killing the agent (logged for debugging)",
+        },
+      },
+      required: ["sessionId"],
+    },
   },
 ];
 
@@ -335,6 +424,28 @@ export interface BgStatusResult {
   partialOutput?: string;
 }
 
+// --- Tool Profiles ---
+
+/**
+ * Named tool profiles that restrict the tool set for specific background task types.
+ * Each profile is an allowlist of tool names from the native tool registry.
+ */
+const TOOL_PROFILES: Record<string, Set<string>> = {
+  review: new Set([
+    "read_file",
+    "search_files",
+    "codebase_search",
+    "list_files",
+    "get_diagnostics",
+    "get_hover",
+    "get_symbols",
+    "get_references",
+    "go_to_definition",
+    "go_to_implementation",
+    "get_type_hierarchy",
+  ]),
+};
+
 // --- Public API ---
 
 /**
@@ -342,40 +453,53 @@ export interface BgStatusResult {
  * When mode is provided, only tools allowed by the mode's toolGroups are included.
  * MCP tools (prefixed 'server__tool') are passed as external Anthropic.Tool objects.
  * When isBackground is true, background agent management tools are excluded.
+ * When toolProfile is set, further restricts to only the tools in that profile.
  */
 export function getAgentTools(
   mode?: AgentMode,
-  mcpToolDefs?: Anthropic.Tool[],
+  mcpToolDefs?: ToolDefinition[],
   isBackground?: boolean,
-): Anthropic.Tool[] {
+  toolProfile?: string,
+): ToolDefinition[] {
   const mcpToolNames = (mcpToolDefs ?? []).map((t) => t.name);
   const allowed = mode ? getToolsForMode(mode, mcpToolNames) : null;
+  const profileAllowlist = toolProfile
+    ? (TOOL_PROFILES[toolProfile] ?? new Set<string>())
+    : undefined;
 
   const nativeTools = Object.entries(TOOL_SCHEMAS)
     .filter(([name]) => !EXCLUDED_TOOLS.has(name))
-    .filter(([name]) => !allowed || allowed.has(name))
+    .filter(([name]) => (__DEV_BUILD__ ? true : !DEV_FEEDBACK_TOOLS.has(name)))
+    .filter(
+      ([name]) =>
+        !allowed ||
+        allowed.has(name) ||
+        (__DEV_BUILD__ && DEV_FEEDBACK_TOOLS.has(name)),
+    )
+    .filter(([name]) => !profileAllowlist || profileAllowlist.has(name))
     .map(([name, zodSchema]) => ({
       name,
       description: TOOL_REGISTRY[name]?.description ?? name,
-      input_schema: zodSchemaToJsonSchema(
-        zodSchema,
-      ) as Anthropic.Tool["input_schema"],
+      input_schema: zodSchemaToJsonSchema(zodSchema),
     }));
 
-  // Append MCP tools if the mode allows the 'mcp' group
+  // Append MCP tools if the mode allows the 'mcp' group (and not restricted by profile)
   const allowedMcpTools =
-    !mode || (mode.toolGroups.includes("mcp") && mcpToolDefs)
+    !profileAllowlist &&
+    (!mode || (mode.toolGroups.includes("mcp") && mcpToolDefs))
       ? (mcpToolDefs ?? [])
       : [];
 
-  // Meta-tools and ask_user are always available regardless of mode restrictions.
+  // Meta-tools and ask_user are always available regardless of mode restrictions
+  // (but excluded when a tool profile is active — profiles are meant to be restrictive).
   // Background agents are excluded from switch_mode and spawn tools to prevent
   // inadvertent foreground mode changes and nested spawning.
+  const metaTools = profileAllowlist ? [] : MCP_META_TOOLS;
   return [
     ...nativeTools,
     ...allowedMcpTools,
-    ...MCP_META_TOOLS,
-    ASK_USER_TOOL,
+    ...metaTools,
+    ...(profileAllowlist ? [] : [ASK_USER_TOOL]),
     ...(isBackground ? [] : [SWITCH_MODE_TOOL, ...BG_AGENT_TOOLS]),
   ];
 }
@@ -394,6 +518,8 @@ export interface ToolDispatchContext {
   sessionId: string;
   extensionUri: import("vscode").Uri;
   mcpHub?: McpClientHub;
+  /** Current agent mode slug (e.g. "architect", "code"). Used for mode-specific approval logic. */
+  mode?: string;
   onModeSwitch?: (mode: string, reason?: string) => void;
   onApprovalRequest?: import("../shared/types.js").OnApprovalRequest;
   onQuestion?: (
@@ -402,12 +528,19 @@ export interface ToolDispatchContext {
   ) => Promise<QuestionResponse>;
   /** Called whenever the agent reads a file — used to track files for folded context on condense */
   onFileRead?: (filePath: string) => void;
-  /** Spawn a background agent session. Returns the new session's ID immediately. */
-  onSpawnBackground?: (task: string, message: string) => Promise<string>;
+  /** Spawn a background agent session. Returns routing metadata and new session ID. */
+  onSpawnBackground?: (
+    request: SpawnBackgroundRequest,
+  ) => Promise<SpawnBackgroundResult>;
   /** Non-blocking status check for a background session. */
   onGetBackgroundStatus?: (sessionId: string) => BgStatusResult;
   /** Wait for a background session to finish and return its last assistant message. */
   onGetBackgroundResult?: (sessionId: string) => Promise<string>;
+  /** Kill a running background agent and return its partial output. */
+  onKillBackground?: (
+    sessionId: string,
+    reason?: string,
+  ) => { killed: boolean; partialOutput?: string };
 }
 
 /**
@@ -589,6 +722,7 @@ export async function dispatchToolCall(
         approvalPanel,
         sessionId,
         onApprovalRequest,
+        ctx.mode,
       );
     case "apply_diff":
       return handleApplyDiff(
@@ -623,8 +757,6 @@ export async function dispatchToolCall(
         approvalManager,
         approvalPanel,
         sessionId,
-        undefined,
-        onApprovalRequest,
       );
     case "get_terminal_output":
       return handleGetTerminalOutput(params);
@@ -844,17 +976,28 @@ export async function dispatchToolCall(
           ],
         };
       }
-      const bgId = await ctx.onSpawnBackground(
-        String(params.task ?? ""),
-        String(params.message ?? ""),
-      );
+      const result = await ctx.onSpawnBackground({
+        task: String(params.task ?? ""),
+        message: String(params.message ?? ""),
+        mode:
+          params.mode !== undefined && params.mode !== null
+            ? String(params.mode)
+            : undefined,
+        model:
+          params.model !== undefined && params.model !== null
+            ? String(params.model)
+            : undefined,
+        provider:
+          params.provider !== undefined && params.provider !== null
+            ? String(params.provider)
+            : undefined,
+        taskClass:
+          params.taskClass !== undefined && params.taskClass !== null
+            ? String(params.taskClass)
+            : undefined,
+      });
       return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ sessionId: bgId, status: "started" }),
-          },
-        ],
+        content: [{ type: "text", text: JSON.stringify(result) }],
       };
     }
 
@@ -898,6 +1041,92 @@ export async function dispatchToolCall(
       return {
         content: [{ type: "text", text: bgResult }],
       };
+    }
+
+    case "kill_background_agent": {
+      if (!ctx.onKillBackground) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                error: "Background agents not available",
+              }),
+            },
+          ],
+        };
+      }
+      const killResult = ctx.onKillBackground(
+        String(params.sessionId ?? ""),
+        params.reason !== undefined ? String(params.reason) : undefined,
+      );
+      return {
+        content: [{ type: "text", text: JSON.stringify(killResult) }],
+      };
+    }
+
+    case "send_feedback": {
+      if (!__DEV_BUILD__) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ error: "Unknown tool: send_feedback" }),
+            },
+          ],
+        };
+      }
+      return handleSendFeedback(
+        {
+          tool_name: String(params.tool_name ?? ""),
+          feedback: String(params.feedback ?? ""),
+          tool_params:
+            params.tool_params !== undefined
+              ? String(params.tool_params)
+              : undefined,
+          tool_result_summary:
+            params.tool_result_summary !== undefined
+              ? String(params.tool_result_summary)
+              : undefined,
+        },
+        sessionId,
+      );
+    }
+
+    case "get_feedback": {
+      if (!__DEV_BUILD__) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ error: "Unknown tool: get_feedback" }),
+            },
+          ],
+        };
+      }
+      return handleGetFeedback({
+        tool_name:
+          params.tool_name !== undefined ? String(params.tool_name) : undefined,
+      });
+    }
+
+    case "delete_feedback": {
+      if (!__DEV_BUILD__) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ error: "Unknown tool: delete_feedback" }),
+            },
+          ],
+        };
+      }
+      const indices = Array.isArray(params.indices)
+        ? params.indices
+            .map((v: unknown) => Number(v))
+            .filter((n: number) => Number.isFinite(n))
+        : [];
+      return handleDeleteFeedback({ indices });
     }
 
     default:

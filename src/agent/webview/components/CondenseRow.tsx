@@ -88,6 +88,12 @@ export function CondenseRow({ message }: CondenseRowProps) {
           </span>
         )}
       </div>
+      {info?.validationWarnings && info.validationWarnings.length > 0 && (
+        <div class="condense-row-detail" style={{ marginTop: "4px" }}>
+          <i class="codicon codicon-warning" />{" "}
+          {info.validationWarnings.join(" · ")}
+        </div>
+      )}
       <div class="condense-row-line" />
     </div>
   );

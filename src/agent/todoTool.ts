@@ -1,4 +1,4 @@
-import type Anthropic from "@anthropic-ai/sdk";
+import type { ToolDefinition } from "./providers/types.js";
 
 /**
  * Agent-internal todo tracking tool.
@@ -20,7 +20,7 @@ export interface TodoItem {
 
 export const TODO_TOOL_NAME = "todo_write";
 
-export const todoTool: Anthropic.Tool = {
+export const todoTool: ToolDefinition = {
   name: TODO_TOOL_NAME,
   description: `Create and manage a structured task list to track your progress on complex tasks. The entire todo list is replaced each call — always include all items (completed, in-progress, and pending).
 
@@ -92,7 +92,7 @@ export interface TodoToolInput {
  * and the parsed todo list for the webview.
  */
 export function handleTodoWrite(input: TodoToolInput): {
-  content: Anthropic.ToolResultBlockParam["content"];
+  content: string;
   todos: TodoItem[];
 } {
   const todos = Array.isArray(input.todos) ? input.todos : [];

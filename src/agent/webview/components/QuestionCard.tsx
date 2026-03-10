@@ -263,6 +263,9 @@ function QuestionInput({ question, value, onChange }: QuestionInputProps) {
             />
           )}
           {opt}
+          {question.recommended === opt && (
+            <span class="question-recommended-badge">Recommended</span>
+          )}
         </button>
       ))}
     </div>

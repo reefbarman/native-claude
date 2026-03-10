@@ -38,7 +38,12 @@ interface MetadataFile {
 
 const SCHEMA_VERSION = 1;
 const SESSIONS_FILE = "sessions.json";
-const AGENTLINK_GITIGNORE_ENTRIES = ["history/", "transcripts/"] as const;
+const AGENTLINK_GITIGNORE_ENTRIES = [
+  "history/",
+  "transcripts/",
+  "debug/",
+  "checkpoints/",
+] as const;
 
 /**
  * Persists agent sessions to .agentlink/history/{sessionId}/.

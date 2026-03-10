@@ -1,0 +1,60 @@
+{
+  "defaults": {
+    "taskClass": "general",
+    "preferredMode": "code",
+    "providerStrategy": "same",
+    "modelTier": "balanced",
+    "useForegroundModelByDefault": true
+  },
+  "taskClasses": {
+    "review_code": {
+      "preferredMode": "review",
+      "providerStrategy": "opposite",
+      "modelTier": "deep_reasoning",
+      "useForegroundModelByDefault": false,
+      "requireReviewCapableModel": true,
+      "thinkingBudget": 4096,
+      "maxToolCalls": 10,
+      "maxApiTurns": 5,
+      "toolProfile": "review"
+    },
+    "review_plan": {
+      "preferredMode": "review",
+      "providerStrategy": "opposite",
+      "modelTier": "balanced",
+      "useForegroundModelByDefault": false,
+      "requireReviewCapableModel": false,
+      "thinkingBudget": 0,
+      "maxToolCalls": 5,
+      "maxApiTurns": 3,
+      "toolProfile": "review"
+    },
+    "research": {
+      "preferredMode": "ask",
+      "providerStrategy": "same",
+      "modelTier": "balanced"
+    },
+    "explore": {
+      "preferredMode": "architect",
+      "providerStrategy": "same",
+      "modelTier": "balanced"
+    },
+    "debug": {
+      "preferredMode": "debug",
+      "providerStrategy": "same",
+      "modelTier": "balanced"
+    },
+    "design": {
+      "preferredMode": "architect",
+      "providerStrategy": "same",
+      "modelTier": "deep_reasoning"
+    },
+    "general": {
+      "preferredMode": "code",
+      "providerStrategy": "same",
+      "modelTier": "balanced",
+      "useForegroundModelByDefault": true
+    }
+  },
+  "fallbackProviderOrder": ["anthropic", "codex"]
+}

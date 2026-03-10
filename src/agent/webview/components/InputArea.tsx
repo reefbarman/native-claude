@@ -1,14 +1,48 @@
 import { useState, useRef, useCallback, useEffect } from "preact/hooks";
 import { FilePicker } from "./FilePicker";
-import { AttachmentChip } from "./AttachmentChip";
+import {
+  AttachmentChip,
+  ImageAttachmentChip,
+  DocumentAttachmentChip,
+} from "./AttachmentChip";
 import { SlashCommandPopup } from "./SlashCommandPopup";
 import { ModeSelector } from "./ModeSelector";
+import { ModelSelector } from "./ModelSelector";
 import { WriteApprovalSelector } from "./WriteApprovalSelector";
 import type { Injection } from "../App";
-import type { SlashCommandInfo, ModeInfo } from "../types";
+import type { SlashCommandInfo, ModeInfo, WebviewModelInfo } from "../types";
+
+/** A pasted image or PDF held in webview state before sending. */
+export interface MediaAttachment {
+  id: string;
+  name: string;
+  mimeType: string;
+  dataUrl: string;
+  kind: "image" | "document";
+}
+
+const ACCEPTED_IMAGE_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+]);
+const ACCEPTED_DOC_TYPES = new Set(["application/pdf"]);
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024; // 10 MB
+const MAX_DOC_BYTES = 10 * 1024 * 1024; // 10 MB (conservative for v1)
 
 interface InputAreaProps {
-  onSend: (text: string, attachments: string[], displayText?: string) => void;
+  onSend: (
+    text: string,
+    attachments: string[],
+    displayText?: string,
+    media?: Array<{
+      name: string;
+      mimeType: string;
+      base64: string;
+      kind: "image" | "document";
+    }>,
+  ) => void;
   onStop: () => void;
   streaming: boolean;
   thinkingEnabled: boolean;
@@ -24,6 +58,9 @@ interface InputAreaProps {
   currentMode?: string;
   onSwitchMode?: (slug: string) => void;
   currentModel?: string;
+  availableModels?: WebviewModelInfo[];
+  onSelectModel?: (modelId: string) => void;
+  onSignIn?: (provider: string) => void;
   agentWriteApproval?: string;
   onSetAgentWriteApproval?: (mode: string) => void;
 }
@@ -45,11 +82,17 @@ export function InputArea({
   currentMode = "code",
   onSwitchMode,
   currentModel = "claude-sonnet-4-6",
+  availableModels = [],
+  onSelectModel,
+  onSignIn,
   agentWriteApproval = "prompt",
   onSetAgentWriteApproval,
 }: InputAreaProps) {
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<string[]>([]);
+  const [mediaAttachments, setMediaAttachments] = useState<MediaAttachment[]>(
+    [],
+  );
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerQuery, setPickerQuery] = useState("");
   const [atStart, setAtStart] = useState(-1); // cursor position of the @ that triggered the picker
@@ -65,11 +108,13 @@ export function InputArea({
 
   const handleSubmit = useCallback(() => {
     const trimmed = text.trim();
-    if (!trimmed && attachments.length === 0) return;
+    if (!trimmed && attachments.length === 0 && mediaAttachments.length === 0)
+      return;
 
     // Intercept slash commands typed manually (e.g. /mode architect)
     if (
       !attachments.length &&
+      !mediaAttachments.length &&
       trimmed.startsWith("/") &&
       !trimmed.startsWith("//")
     ) {
@@ -92,26 +137,45 @@ export function InputArea({
       }
     }
 
-    onSend(trimmed, attachments);
+    // Strip data URL prefix to get raw base64 for each media attachment
+    const media =
+      mediaAttachments.length > 0
+        ? mediaAttachments.map((m) => {
+            const commaIdx = m.dataUrl.indexOf(",");
+            const base64 =
+              commaIdx >= 0 ? m.dataUrl.slice(commaIdx + 1) : m.dataUrl;
+            return {
+              name: m.name,
+              mimeType: m.mimeType,
+              base64,
+              kind: m.kind,
+            };
+          })
+        : undefined;
+
+    onSend(trimmed, attachments, undefined, media);
     setText("");
     setAttachments([]);
+    setMediaAttachments([]);
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
     }
   }, [
     text,
     attachments,
+    mediaAttachments,
     streaming,
     onSend,
     slashCommands,
     onExecuteBuiltinCommand,
   ]);
 
-  const AVAILABLE_MODELS = [
-    { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" },
-    { id: "claude-opus-4-6", label: "Claude Opus 4.6" },
-    { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5" },
-  ];
+  // Build model list from dynamic provider data, with a fallback for
+  // the brief window before the extension sends the first agentModelsUpdate.
+  const modelList: Array<{ id: string; label: string }> =
+    availableModels.length > 0
+      ? availableModels.map((m) => ({ id: m.id, label: m.displayName }))
+      : [{ id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" }];
 
   const closeSlash = useCallback(() => {
     setSlashOpen(false);
@@ -135,7 +199,7 @@ export function InputArea({
     }
     // Sub-view: model picker
     if (slashView === "model") {
-      return AVAILABLE_MODELS.map((m) => ({
+      return modelList.map((m) => ({
         name: `__model:${m.id}`,
         description: m.label,
         source: "builtin" as const,
@@ -167,8 +231,7 @@ export function InputArea({
     const currentModeName =
       modes.find((m) => m.slug === currentMode)?.name ?? currentMode;
     const currentModelLabel =
-      AVAILABLE_MODELS.find((m) => m.id === currentModel)?.label ??
-      currentModel;
+      modelList.find((m) => m.id === currentModel)?.label ?? currentModel;
     return slashCommands
       .filter((c) => c.name.toLowerCase().startsWith(slashQuery.toLowerCase()))
       .map((c) => {
@@ -184,6 +247,8 @@ export function InputArea({
         if (c.name === "clear") return { ...c, icon: "clear-all" };
         if (c.name === "help") return { ...c, icon: "question" };
         if (c.name === "condense") return { ...c, icon: "fold" };
+        if (c.name === "checkpoint") return { ...c, icon: "git-commit" };
+        if (c.name === "revert") return { ...c, icon: "history" };
         return c;
       });
   })();
@@ -191,6 +256,9 @@ export function InputArea({
   // Commands that execute immediately with no args needed
   const ZERO_ARG_BUILTINS = new Set([
     "new",
+    "condense",
+    "checkpoint",
+    "revert",
     "help",
     "mcp-refresh",
     "mcp-status",
@@ -375,6 +443,70 @@ export function InputArea({
     setAttachments((prev) => prev.filter((p) => p !== path));
   }, []);
 
+  const handleRemoveMedia = useCallback((id: string) => {
+    setMediaAttachments((prev) => prev.filter((m) => m.id !== id));
+  }, []);
+
+  const handlePaste = useCallback(
+    (e: ClipboardEvent) => {
+      if (!e.clipboardData) return;
+
+      const items = Array.from(e.clipboardData.items);
+      const mediaItems: DataTransferItem[] = [];
+
+      for (const item of items) {
+        if (item.kind !== "file") continue;
+        if (
+          ACCEPTED_IMAGE_TYPES.has(item.type) ||
+          ACCEPTED_DOC_TYPES.has(item.type)
+        ) {
+          mediaItems.push(item);
+        }
+      }
+
+      if (mediaItems.length === 0) return; // Let text paste through
+
+      e.preventDefault();
+
+      for (const item of mediaItems) {
+        const file = item.getAsFile();
+        if (!file) continue;
+
+        const isImage = ACCEPTED_IMAGE_TYPES.has(item.type);
+        const maxBytes = isImage ? MAX_IMAGE_BYTES : MAX_DOC_BYTES;
+
+        if (file.size > maxBytes) {
+          const limitMB = Math.round(maxBytes / (1024 * 1024));
+          const sizeMB = (file.size / (1024 * 1024)).toFixed(1);
+          // Post an error to the extension for display
+          vscodeApi.postMessage({
+            command: "agentToast",
+            message: `File too large (${sizeMB}MB). Max ${limitMB}MB for ${isImage ? "images" : "PDFs"}.`,
+            level: "error",
+          });
+          continue;
+        }
+
+        const reader = new FileReader();
+        reader.onload = () => {
+          const dataUrl = reader.result as string;
+          const attachment: MediaAttachment = {
+            id: crypto.randomUUID(),
+            name:
+              file.name ||
+              (isImage ? "pasted-image.png" : "pasted-document.pdf"),
+            mimeType: item.type,
+            dataUrl,
+            kind: isImage ? "image" : "document",
+          };
+          setMediaAttachments((prev) => [...prev, attachment]);
+        };
+        reader.readAsDataURL(file);
+      }
+    },
+    [vscodeApi],
+  );
+
   const handleInput = useCallback(
     (e: Event) => {
       const target = e.target as HTMLTextAreaElement;
@@ -428,7 +560,9 @@ export function InputArea({
         // Check if user just typed / at start or after whitespace
         if (
           value[cursor - 1] === "/" &&
-          (cursor === 1 || value[cursor - 2] === "\n")
+          (cursor === 1 ||
+            value[cursor - 2] === "\n" ||
+            value[cursor - 2] === " ")
         ) {
           setSlashStart(cursor - 1);
           setSlashQuery("");
@@ -618,6 +752,14 @@ export function InputArea({
             onSelect={onSwitchMode}
           />
         )}
+        {availableModels.length > 0 && onSelectModel && (
+          <ModelSelector
+            currentModel={currentModel}
+            models={availableModels}
+            onSelect={onSelectModel}
+            onSignIn={onSignIn}
+          />
+        )}
         <button
           class={`toolbar-control thinking-toggle ${thinkingEnabled ? "active" : ""}`}
           onClick={onToggleThinking}
@@ -656,7 +798,7 @@ export function InputArea({
           </button>
         )}
       </div>
-      {attachments.length > 0 && (
+      {(attachments.length > 0 || mediaAttachments.length > 0) && (
         <div class="attachment-chips">
           {attachments.map((path) => (
             <AttachmentChip
@@ -665,6 +807,27 @@ export function InputArea({
               onRemove={handleRemoveAttachment}
             />
           ))}
+          {mediaAttachments
+            .filter((m) => m.kind === "image")
+            .map((img) => (
+              <ImageAttachmentChip
+                key={img.id}
+                id={img.id}
+                name={img.name}
+                dataUrl={img.dataUrl}
+                onRemove={handleRemoveMedia}
+              />
+            ))}
+          {mediaAttachments
+            .filter((m) => m.kind === "document")
+            .map((doc) => (
+              <DocumentAttachmentChip
+                key={doc.id}
+                id={doc.id}
+                name={doc.name}
+                onRemove={handleRemoveMedia}
+              />
+            ))}
         </div>
       )}
       {pickerOpen && (
@@ -713,6 +876,7 @@ export function InputArea({
           value={text}
           onInput={handleInput}
           onKeyDown={handleKeyDown}
+          onPaste={handlePaste}
           rows={1}
         />
         {streaming ? (
@@ -728,7 +892,11 @@ export function InputArea({
           <button
             class="send-button"
             onClick={handleSubmit}
-            disabled={!text.trim() && attachments.length === 0}
+            disabled={
+              !text.trim() &&
+              attachments.length === 0 &&
+              mediaAttachments.length === 0
+            }
             title="Send message (Enter)"
             type="button"
           >

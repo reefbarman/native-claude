@@ -486,6 +486,79 @@ Close managed terminals. With no arguments, closes all terminals created by Agen
 | --------- | --------- | -------------------------------------------------------------------------------- |
 | `names`   | string[]? | Terminal names to close (e.g. `["Server", "Tests"]`). Omit to close all managed. |
 
+### spawn_background_agent
+
+Spawn a background agent that runs in parallel with the current session. Use this for independent tasks like reviews, research, diagnostics, or alternative approaches.
+
+| Parameter        | Type    | Description                                                            |
+| ---------------- | ------- | ---------------------------------------------------------------------- |
+| `task`           | string  | Short label shown in UI                                                |
+| `message`        | string  | Full instruction for the background agent                              |
+| `mode`           | string? | Optional mode override (`code`, `architect`, `ask`, `debug`, `review`) |
+| `model`          | string? | Optional explicit model override                                       |
+| `provider`       | string? | Optional provider preference/constraint                                |
+| `taskClass`      | string? | Routing profile key (e.g. `review_code`, `review_plan`, `research`)    |
+| `timeoutSeconds` | number? | Per-session timeout budget                                             |
+| `tokenBudget`    | number? | Total token budget cap for background run                              |
+| `maxToolCalls`   | number? | Max tool-call budget for background run                                |
+
+Returns structured JSON including:
+
+- `sessionId`
+- `resolvedMode`, `resolvedModel`, `resolvedProvider`
+- `taskClass`
+- `routingReason`
+- `fallbackUsed`
+
+### get_background_status
+
+Non-blocking status check for a background session.
+
+| Parameter   | Type   | Description                             |
+| ----------- | ------ | --------------------------------------- |
+| `sessionId` | string | Background session id from spawn result |
+
+Returns JSON with `status`, `currentTool`, `done`, and optional `partialOutput`.
+
+### get_background_result
+
+Block until a background session finishes and return its final assistant output text.
+
+| Parameter   | Type   | Description                             |
+| ----------- | ------ | --------------------------------------- |
+| `sessionId` | string | Background session id from spawn result |
+
+### Background routing and review mode
+
+AgentLink includes static routing policy for background agents (`src/agent/backgroundModelRouting.config.json`) with explainable outcomes.
+
+- **Default behavior**: non-review tasks stay on the foreground model when policy says `useForegroundModelByDefault`.
+- **Review behavior**: review task classes (e.g. `review_code`, `review_plan`) prefer opposite-provider routing when available.
+- **Fallback behavior**: deterministic fallback order is used when preferred candidates are unavailable or unauthenticated.
+- **Transparency**: routing decisions are returned by `spawn_background_agent`, logged as `[bg-route]`, and shown in background UI/debug info.
+
+### Background guardrails
+
+Background runs enforce explicit safety limits:
+
+- Max concurrent background sessions (spawn rejection with deterministic error)
+- Per-session timeout (`timeoutSeconds`)
+- Token budget cap (`tokenBudget`)
+- Tool-call cap (`maxToolCalls`)
+
+Guardrail events are logged as `[bg-guard]` and surfaced in UI metadata.
+
+### Review mode
+
+`review` is a first-class mode across backend/UI/settings and is designed for structured technical review output.
+
+Expected review output format includes:
+
+- Executive summary
+- Findings table (severity/category/location/issue/recommendation)
+- Open questions / assumptions
+- Recommended next actions
+
 ### get_terminal_output
 
 Get the output and status of a background or timed-out command. Use after `execute_command` with `background: true`, or after a foreground command that timed out (`timed_out: true` in the response).

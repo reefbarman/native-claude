@@ -180,12 +180,22 @@ describe("getAgentTools", () => {
     }
   });
 
-  it("does not include excluded tools (handshake, send_feedback, get_feedback)", () => {
+  it("does not include handshake", () => {
     const names = getAgentTools().map((t) => t.name);
     expect(names).not.toContain("handshake");
-    expect(names).not.toContain("send_feedback");
-    expect(names).not.toContain("get_feedback");
-    expect(names).not.toContain("delete_feedback");
+  });
+
+  it("gates feedback tools by build type", () => {
+    const names = getAgentTools().map((t) => t.name);
+    if (__DEV_BUILD__) {
+      expect(names).toContain("send_feedback");
+      expect(names).toContain("get_feedback");
+      expect(names).toContain("delete_feedback");
+    } else {
+      expect(names).not.toContain("send_feedback");
+      expect(names).not.toContain("get_feedback");
+      expect(names).not.toContain("delete_feedback");
+    }
   });
 
   it("includes the core file tools", () => {
@@ -197,11 +207,133 @@ describe("getAgentTools", () => {
     expect(names).toContain("get_diagnostics");
   });
 
+  it("restricts tools when toolProfile is set to 'review'", () => {
+    const reviewTools = getAgentTools(undefined, undefined, true, "review");
+    const names = reviewTools.map((t) => t.name);
+    // Should include read-only review tools
+    expect(names).toContain("read_file");
+    expect(names).toContain("search_files");
+    expect(names).toContain("codebase_search");
+    expect(names).toContain("get_diagnostics");
+    expect(names).toContain("get_hover");
+    expect(names).toContain("get_symbols");
+    expect(names).toContain("get_references");
+    // Should NOT include write tools, command tools, or MCP meta tools
+    expect(names).not.toContain("write_file");
+    expect(names).not.toContain("apply_diff");
+    expect(names).not.toContain("execute_command");
+    expect(names).not.toContain("find_and_replace");
+    expect(names).not.toContain("list_mcp_resources");
+    expect(names).not.toContain("ask_user");
+  });
+
+  it("does not restrict tools when toolProfile is undefined", () => {
+    const allTools = getAgentTools(undefined, undefined, true);
+    const reviewTools = getAgentTools(undefined, undefined, true, "review");
+    expect(allTools.length).toBeGreaterThan(reviewTools.length);
+  });
+
   it("returns tools with valid JSON Schema input_schema (properties + type)", () => {
     for (const tool of getAgentTools()) {
       // Schema must be an object type with properties
       expect(tool.input_schema.type).toBe("object");
     }
+  });
+});
+
+describe("spawn_background_agent tool", () => {
+  it("schema includes routing params but not guardrail params", () => {
+    const spawnTool = getAgentTools().find(
+      (t) => t.name === "spawn_background_agent",
+    );
+    expect(spawnTool).toBeDefined();
+    const props = (spawnTool?.input_schema.properties ?? {}) as Record<
+      string,
+      unknown
+    >;
+    expect(props.mode).toBeDefined();
+    expect(props.model).toBeDefined();
+    expect(props.provider).toBeDefined();
+    expect(props.taskClass).toBeDefined();
+    // Guardrail params removed — background agents run without limits
+    expect(props.timeoutSeconds).toBeUndefined();
+    expect(props.tokenBudget).toBeUndefined();
+    expect(props.maxToolCalls).toBeUndefined();
+  });
+
+  it("dispatches structured request and returns structured result", async () => {
+    const onSpawnBackground = vi.fn().mockResolvedValue({
+      sessionId: "bg-123",
+      resolvedMode: "review",
+      resolvedModel: "claude-sonnet-4-6",
+      resolvedProvider: "anthropic",
+      taskClass: "review_code",
+      routingReason: "routed by opposite provider strategy",
+      fallbackUsed: false,
+    });
+
+    const result = await dispatchToolCall(
+      "spawn_background_agent",
+      {
+        task: "Review patch",
+        message: "Review the recent changes",
+        mode: "review",
+        model: "claude-sonnet-4-6",
+        provider: "anthropic",
+        taskClass: "review_code",
+      },
+      { ...mockCtx, onSpawnBackground },
+    );
+
+    expect(onSpawnBackground).toHaveBeenCalledWith({
+      task: "Review patch",
+      message: "Review the recent changes",
+      mode: "review",
+      model: "claude-sonnet-4-6",
+      provider: "anthropic",
+      taskClass: "review_code",
+    });
+
+    const text = (result.content[0] as { type: string; text: string }).text;
+    expect(JSON.parse(text)).toMatchObject({
+      sessionId: "bg-123",
+      resolvedMode: "review",
+      taskClass: "review_code",
+      fallbackUsed: false,
+    });
+  });
+
+  it("kill_background_agent tool exists in schema", () => {
+    const killTool = getAgentTools().find(
+      (t) => t.name === "kill_background_agent",
+    );
+    expect(killTool).toBeDefined();
+    const props = (killTool?.input_schema.properties ?? {}) as Record<
+      string,
+      unknown
+    >;
+    expect(props.sessionId).toBeDefined();
+    expect(props.reason).toBeDefined();
+  });
+
+  it("dispatches kill_background_agent to onKillBackground callback", async () => {
+    const onKillBackground = vi.fn().mockReturnValue({
+      killed: true,
+      partialOutput: "some partial work",
+    });
+
+    const result = await dispatchToolCall(
+      "kill_background_agent",
+      { sessionId: "bg-456", reason: "taking too long" },
+      { ...mockCtx, onKillBackground },
+    );
+
+    expect(onKillBackground).toHaveBeenCalledWith("bg-456", "taking too long");
+    const text = (result.content[0] as { type: string; text: string }).text;
+    expect(JSON.parse(text)).toMatchObject({
+      killed: true,
+      partialOutput: "some partial work",
+    });
   });
 });
 
@@ -246,8 +378,6 @@ describe("dispatchToolCall", () => {
       mockCtx.approvalManager,
       mockCtx.approvalPanel,
       mockCtx.sessionId,
-      undefined,
-      mockCtx.onApprovalRequest,
     );
     expect(result.content[0]).toMatchObject({ type: "text", text: "output" });
   });
@@ -265,6 +395,7 @@ describe("dispatchToolCall", () => {
       mockCtx.approvalPanel,
       mockCtx.sessionId,
       mockCtx.onApprovalRequest,
+      mockCtx.mode,
     );
   });
 

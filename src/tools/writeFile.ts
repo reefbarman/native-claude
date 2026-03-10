@@ -20,6 +20,7 @@ export async function handleWriteFile(
   approvalPanel: ApprovalPanelProvider,
   sessionId: string,
   onApprovalRequest?: OnApprovalRequest,
+  mode?: string,
 ): Promise<ToolResult> {
   try {
     const { absolutePath: filePath, inWorkspace } = resolveAndValidatePath(
@@ -39,9 +40,20 @@ export async function handleWriteFile(
       .getConfiguration("agentlink")
       .get<boolean>("masterBypass", false);
 
+    // In architect mode, auto-approve the first write to a plans/ file (new file only).
+    const isNewPlanFile =
+      mode === "architect" &&
+      inWorkspace &&
+      relPath.startsWith("plans/") &&
+      !(await fs
+        .access(filePath)
+        .then(() => true)
+        .catch(() => false));
+
     // Auto-approve check (includes recent single-use approvals within TTL)
     const canAutoApprove =
       masterBypass ||
+      isNewPlanFile ||
       (inWorkspace
         ? approvalManager.isAgentWriteApproved(sessionId, filePath)
         : approvalManager.isFileWriteApproved(sessionId, filePath));

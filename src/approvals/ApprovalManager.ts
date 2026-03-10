@@ -289,6 +289,15 @@ export class ApprovalManager {
     this._onDidChange.fire();
   }
 
+  /** Reset session-level agent write approval for a single session (e.g. on mode switch). */
+  resetSessionAgentWriteApproval(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (session?.agentWriteApproved) {
+      session.agentWriteApproved = false;
+      this._onDidChange.fire();
+    }
+  }
+
   resetAgentWriteApproval(): void {
     this.configStore.updateGlobalConfig((c) => {
       c.agentWriteApproved = false;

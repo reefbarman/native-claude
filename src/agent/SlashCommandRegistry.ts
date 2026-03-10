@@ -106,19 +106,19 @@ export const BUILTIN_COMMANDS: SlashCommand[] = [
   },
   {
     name: "condense",
-    description: "Condense conversation context (coming in Phase 4)",
+    description: "Condense conversation context",
     source: "builtin",
     builtin: true,
   },
   {
     name: "checkpoint",
-    description: "Create a checkpoint (coming in Phase 4)",
+    description: "Create a workspace checkpoint",
     source: "builtin",
     builtin: true,
   },
   {
     name: "revert",
-    description: "Revert to a checkpoint (coming in Phase 4)",
+    description: "Revert to the latest checkpoint or /revert <checkpoint-id>",
     source: "builtin",
     builtin: true,
   },

@@ -37,6 +37,12 @@ import { AgentSessionManager } from "./agent/AgentSessionManager.js";
 import { SessionStore } from "./agent/SessionStore.js";
 import type { AgentConfig } from "./agent/types.js";
 import { AgentCodeActionProvider } from "./agent/AgentCodeActionProvider.js";
+import { AnthropicProvider } from "./agent/providers/anthropic/index.js";
+import {
+  providerRegistry,
+  CodexProvider,
+  codexOAuthManager,
+} from "./agent/providers/index.js";
 
 export const DIFF_VIEW_URI_SCHEME = "agentlink-diff";
 
@@ -509,6 +515,19 @@ export function activate(context: vscode.ExtensionContext): void {
     autoCondenseThreshold: getConfig<number>("autoCondenseThreshold") ?? 0.9,
   };
 
+  // Register the Anthropic provider with the global registry.
+  // The API key is resolved lazily inside AnthropicProvider (env, config, CLI credentials).
+  providerRegistry.register(new AnthropicProvider(undefined, log));
+
+  // Register the Codex provider (OAuth-based, ChatGPT Plus/Pro subscription).
+  codexOAuthManager.initialize(context);
+  providerRegistry.register(new CodexProvider(codexOAuthManager, log));
+
+  // Re-send model list to webview when Codex auth state changes (sign-in/out).
+  codexOAuthManager.onAuthStateChanged = () => {
+    chatViewProvider.refreshModels();
+  };
+
   const workspaceCwd =
     vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
   const isDevMode = context.extensionMode === vscode.ExtensionMode.Development;
@@ -559,12 +578,14 @@ export function activate(context: vscode.ExtensionContext): void {
     onFileRead: (filePath) => {
       agentSessionManager.getForegroundSession()?.trackFileRead(filePath);
     },
-    onSpawnBackground: (task, message) =>
-      agentSessionManager.spawnBackground(task, message),
+    onSpawnBackground: (request) =>
+      agentSessionManager.spawnBackground(request),
     onGetBackgroundStatus: (sessionId) =>
       agentSessionManager.getBackgroundStatus(sessionId),
     onGetBackgroundResult: (sessionId) =>
       agentSessionManager.waitForBackground(sessionId),
+    onKillBackground: (sessionId, reason) =>
+      agentSessionManager.killBackground(sessionId, reason),
   });
 
   chatViewProvider.setApprovalManager(approvalManager);
@@ -689,6 +710,31 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
     vscode.commands.registerCommand("agentlink.installHooks", () => {
       installHooks(context.extensionUri, log);
+    }),
+    vscode.commands.registerCommand("agentlink.codexSignIn", async () => {
+      try {
+        const authUrl = codexOAuthManager.startAuthorizationFlow();
+        await vscode.env.openExternal(vscode.Uri.parse(authUrl));
+        log("[codex] Opened browser for OAuth sign-in");
+        const creds = await codexOAuthManager.waitForCallback();
+        log(`[codex] Signed in as ${creds.email ?? "unknown"}`);
+        vscode.window.showInformationMessage(
+          `Signed in to OpenAI Codex${creds.email ? ` as ${creds.email}` : ""}.`,
+        );
+      } catch (err) {
+        log(`[codex] Sign-in failed: ${err}`);
+        vscode.window.showErrorMessage(
+          `Codex sign-in failed: ${err instanceof Error ? err.message : err}`,
+        );
+      }
+    }),
+    vscode.commands.registerCommand("agentlink.codexSignOut", async () => {
+      const wasAuthed = await codexOAuthManager.isAuthenticated();
+      codexOAuthManager.clearCredentials();
+      if (wasAuthed) {
+        vscode.window.showInformationMessage("Signed out of OpenAI Codex.");
+      }
+      log("[codex] Signed out");
     }),
     vscode.commands.registerCommand("agentlink.startServer", () =>
       startServer(context),

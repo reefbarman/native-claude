@@ -1,17 +1,17 @@
 import type { ToolResult } from "../shared/types.js";
 import type { TodoItem } from "./todoTool.js";
-import type Anthropic from "@anthropic-ai/sdk";
+import type { MessageParam } from "./providers/types.js";
 
 // --- Agent Message (conversation history with condense metadata) ---
 
 /**
- * Extends Anthropic.MessageParam with non-destructive condense tracking.
+ * Extends MessageParam with non-destructive condense tracking.
  * - isSummary: marks this message as a condensation summary
  * - condenseId: UUID set on the summary message
  * - condenseParent: UUID of the summary that replaced this message
  *   (messages with condenseParent are filtered from API history when their summary exists)
  */
-export type AgentMessage = Anthropic.MessageParam & {
+export type AgentMessage = MessageParam & {
   isSummary?: boolean;
   condenseId?: string;
   condenseParent?: string;
@@ -52,6 +52,16 @@ export type AgentEvent =
       prevInputTokens: number;
       /** Estimated input tokens after condensing */
       newInputTokens: number;
+      /** Non-fatal validator/retry warnings for this condense run */
+      validationWarnings?: string[];
+      metadata?: {
+        inputMessageCount: number;
+        sourceUserMessageCount: number;
+        hadPriorSummaryInInput: boolean;
+        retryUsed: boolean;
+        validatorErrors: string[];
+        sourceHash: string;
+      };
     }
   | {
       type: "condense_error";
@@ -112,9 +122,3 @@ export interface AgentConfig {
   autoCondense: boolean;
   autoCondenseThreshold: number; // 0–1, e.g. 0.9 = 90%
 }
-
-// Models that support extended thinking
-export const THINKING_MODELS = new Set([
-  "claude-opus-4-6",
-  "claude-sonnet-4-6",
-]);

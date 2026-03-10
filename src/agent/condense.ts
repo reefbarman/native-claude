@@ -13,10 +13,19 @@
  * - generateFoldedFileContext() uses our existing tree-sitter infrastructure
  */
 
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import * as fs from "fs/promises";
 import * as path from "path";
-import Anthropic from "@anthropic-ai/sdk";
+import type {
+  ContentBlock,
+  ToolUseBlock,
+  ToolResultBlock,
+  TextBlock,
+  ModelProvider,
+  MessageParam,
+} from "./providers/types.js";
+import { CODEX_CONDENSE_MODEL_FALLBACKS } from "./providers/index.js";
+
 import type { AgentMessage } from "./types.js";
 import {
   initTreeSitter,
@@ -27,9 +36,6 @@ import {
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-/** Use a fast, cheap model for summarization — quality is comparable for this structured extraction task. */
-const CONDENSE_MODEL = "claude-haiku-4-5-20251001";
 
 // ---------------------------------------------------------------------------
 // Prompts
@@ -49,6 +55,13 @@ The goal is for work to continue seamlessly after condensation — as if it neve
 const CONDENSE_INSTRUCTIONS = `Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions.
 
 This summary should be thorough in capturing technical details, code patterns, and architectural decisions essential for continuing development work without losing context.
+
+CRITICAL accuracy rules:
+- Include only claims grounded in the provided conversation content.
+- If something is uncertain or not directly evidenced, say "Unknown from transcript".
+- Do NOT invent quantitative outcomes (test counts, error counts, token values) unless explicitly present.
+- Do NOT mark work "complete" when pending work is still described.
+- "All User Messages" must be literal user-authored messages only (exclude tool results and system condense prompts).
 
 Before providing your final summary, wrap your analysis in <analysis> tags. In your analysis:
 
@@ -93,9 +106,7 @@ Format your response exactly as:
 // Tool block → text conversion (for summarization API call)
 // ---------------------------------------------------------------------------
 
-export function toolUseToText(
-  block: Anthropic.Messages.ToolUseBlockParam,
-): string {
+export function toolUseToText(block: ToolUseBlock): string {
   let input: string;
   if (typeof block.input === "object" && block.input !== null) {
     input = Object.entries(block.input)
@@ -110,9 +121,7 @@ export function toolUseToText(
   return `[Tool Use: ${block.name}]\n${input}`;
 }
 
-export function toolResultToText(
-  block: Anthropic.Messages.ToolResultBlockParam,
-): string {
+export function toolResultToText(block: ToolResultBlock): string {
   const errSuffix = block.is_error ? " (Error)" : "";
   if (typeof block.content === "string") {
     return `[Tool Result${errSuffix}]\n${block.content}`;
@@ -131,8 +140,8 @@ export function toolResultToText(
 }
 
 function convertToolBlocksToText(
-  content: string | Anthropic.Messages.ContentBlockParam[],
-): string | Anthropic.Messages.ContentBlockParam[] {
+  content: string | ContentBlock[],
+): string | ContentBlock[] {
   if (typeof content === "string") return content;
   return content.map((block) => {
     if (block.type === "tool_use")
@@ -143,24 +152,57 @@ function convertToolBlocksToText(
   });
 }
 
-function stripImages(
-  content: string | Anthropic.Messages.ContentBlockParam[],
-): string | Anthropic.Messages.ContentBlockParam[] {
+function stripMedia(content: string | ContentBlock[]): string | ContentBlock[] {
   if (typeof content === "string") return content;
   return content.map((block) => {
     if (block.type === "image")
       return { type: "text" as const, text: "[Image]" };
+    if (block.type === "document") {
+      const title = (block as { title?: string }).title ?? "PDF";
+      return { type: "text" as const, text: `[Document: ${title}]` };
+    }
     return block;
   });
+}
+
+const MAX_TOOL_RESULT_TEXT_CHARS = 20_000;
+
+function normalizeToolResultText(text: string): string {
+  if (text.length <= MAX_TOOL_RESULT_TEXT_CHARS) return text;
+  const headChars = Math.floor(MAX_TOOL_RESULT_TEXT_CHARS * 0.5);
+  const head = text.slice(0, headChars);
+  const tail = text.slice(
+    text.length - (MAX_TOOL_RESULT_TEXT_CHARS - headChars),
+  );
+  const omittedChars = text.length - head.length - tail.length;
+  const omittedTokens = Math.ceil(omittedChars / 4);
+  return `${head}\n\n[... ~${omittedTokens.toLocaleString()} tokens (~${omittedChars.toLocaleString()} chars) omitted from middle ...]\n\n${tail}`;
 }
 
 function transformMessagesForCondensing(
   messages: AgentMessage[],
 ): AgentMessage[] {
-  return messages.map((msg) => ({
-    ...msg,
-    content: stripImages(convertToolBlocksToText(msg.content)),
-  }));
+  return messages.map((msg) => {
+    const transformed = stripMedia(convertToolBlocksToText(msg.content));
+    if (typeof transformed === "string") {
+      return {
+        ...msg,
+        content:
+          msg.role === "user" && msg.isSummary
+            ? transformed
+            : normalizeToolResultText(transformed),
+      };
+    }
+    const normalizedBlocks = transformed.map((block) =>
+      block.type === "text"
+        ? { ...block, text: normalizeToolResultText(block.text) }
+        : block,
+    );
+    return {
+      ...msg,
+      content: normalizedBlocks,
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -181,15 +223,13 @@ export function injectSyntheticToolResults(
     if (msg.role === "assistant" && Array.isArray(msg.content)) {
       for (const block of msg.content) {
         if (block.type === "tool_use")
-          toolCallIds.add((block as Anthropic.Messages.ToolUseBlockParam).id);
+          toolCallIds.add((block as ToolUseBlock).id);
       }
     }
     if (msg.role === "user" && Array.isArray(msg.content)) {
       for (const block of msg.content) {
         if (block.type === "tool_result")
-          toolResultIds.add(
-            (block as Anthropic.Messages.ToolResultBlockParam).tool_use_id,
-          );
+          toolResultIds.add((block as ToolResultBlock).tool_use_id);
       }
     }
   }
@@ -197,12 +237,11 @@ export function injectSyntheticToolResults(
   const orphans = [...toolCallIds].filter((id) => !toolResultIds.has(id));
   if (orphans.length === 0) return messages;
 
-  const syntheticResults: Anthropic.Messages.ToolResultBlockParam[] =
-    orphans.map((id) => ({
-      type: "tool_result" as const,
-      tool_use_id: id,
-      content: "Context condensation triggered. Tool execution deferred.",
-    }));
+  const syntheticResults: ToolResultBlock[] = orphans.map((id) => ({
+    type: "tool_result" as const,
+    tool_use_id: id,
+    content: "Context condensation triggered. Tool execution deferred.",
+  }));
 
   return [...messages, { role: "user", content: syntheticResults }];
 }
@@ -212,13 +251,14 @@ export function injectSyntheticToolResults(
 // ---------------------------------------------------------------------------
 
 /**
- * Returns messages since the last summary (inclusive). If no summary, returns all.
+ * Returns messages after the last summary (exclusive). If no summary, returns all.
+ * This avoids recursively re-summarizing prior summary prose.
  */
 export function getMessagesSinceLastSummary(
   messages: AgentMessage[],
 ): AgentMessage[] {
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].isSummary) return messages.slice(i);
+    if (messages[i].isSummary) return messages.slice(i + 1);
   }
   return messages;
 }
@@ -266,7 +306,7 @@ export function getEffectiveHistory(messages: AgentMessage[]): AgentMessage[] {
     if (msg.role === "assistant" && Array.isArray(msg.content)) {
       for (const block of msg.content) {
         if (block.type === "tool_use")
-          toolUseIds.add((block as Anthropic.Messages.ToolUseBlockParam).id);
+          toolUseIds.add((block as ToolUseBlock).id);
       }
     }
   }
@@ -276,9 +316,7 @@ export function getEffectiveHistory(messages: AgentMessage[]): AgentMessage[] {
       if (msg.role === "user" && Array.isArray(msg.content)) {
         const kept = msg.content.filter((block) => {
           if (block.type === "tool_result") {
-            return toolUseIds.has(
-              (block as Anthropic.Messages.ToolResultBlockParam).tool_use_id,
-            );
+            return toolUseIds.has((block as ToolResultBlock).tool_use_id);
           }
           return true;
         });
@@ -378,7 +416,7 @@ export async function generateFoldedFileContext(
 
 export interface SummarizeOptions {
   messages: AgentMessage[];
-  client: Anthropic;
+  provider: ModelProvider;
   systemPrompt: string;
   isAutomatic: boolean;
   filesRead?: string[];
@@ -391,15 +429,149 @@ export interface SummarizeResult {
   summary: string;
   prevInputTokens: number;
   newInputTokens: number;
+  /** Non-fatal validator/retry warnings */
+  validationWarnings?: string[];
+  /** Structured condense metadata for debugging/forensics */
+  metadata?: {
+    inputMessageCount: number;
+    sourceUserMessageCount: number;
+    hadPriorSummaryInInput: boolean;
+    retryUsed: boolean;
+    validatorErrors: string[];
+    sourceHash: string;
+  };
   error?: string;
+}
+
+function extractCanonicalUserMessages(messages: AgentMessage[]): string[] {
+  return messages
+    .filter(
+      (m) =>
+        m.role === "user" &&
+        typeof m.content === "string" &&
+        !m.isSummary &&
+        !m.content.includes("## Conversation Summary"),
+    )
+    .map((m) => (m.content as string).trim())
+    .filter((t) => t.length > 0);
+}
+
+function extractPendingTasksHeuristic(messages: AgentMessage[]): string[] {
+  const userTexts = extractCanonicalUserMessages(messages);
+  const candidates: string[] = [];
+  for (const text of userTexts.slice(-8)) {
+    const lower = text.toLowerCase();
+    if (
+      /(todo|next|left|implement|fix|add|finish|continue|do that|lets do that|let's do that)/.test(
+        lower,
+      )
+    ) {
+      candidates.push(text);
+    }
+  }
+  return [...new Set(candidates)].slice(-6);
+}
+
+function renderDeterministicSections(options: {
+  userMessages: string[];
+  pendingTasks: string[];
+}): string {
+  const userLines =
+    options.userMessages.length > 0
+      ? options.userMessages.map((m, i) => `${i + 1}. "${m}"`).join("\n")
+      : "1. None";
+
+  const pendingLines =
+    options.pendingTasks.length > 0
+      ? options.pendingTasks.map((t) => `- ${t}`).join("\n")
+      : "- None explicitly identified";
+
+  return [
+    "<system-reminder>",
+    "## Canonical User Messages (deterministic)",
+    userLines,
+    "",
+    "## Pending Tasks (deterministic heuristic)",
+    pendingLines,
+    "</system-reminder>",
+  ].join("\n");
+}
+
+function isUnsupportedCodexModelError(message: string): boolean {
+  return /model is not supported|unsupported model|invalid model/i.test(
+    message,
+  );
+}
+
+function validateSummary(options: {
+  summaryText: string;
+  canonicalUserMessages: string[];
+}): { errors: string[]; warnings: string[] } {
+  const { summaryText, canonicalUserMessages } = options;
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  const lower = summaryText.toLowerCase();
+
+  if (!/all user messages/i.test(summaryText)) {
+    warnings.push(
+      "Summary missing an explicit 'All User Messages' section header.",
+    );
+  }
+
+  const unsupportedQuant =
+    /(\d+\s*\/\s*\d+\s+tests?\s+pass|all\s+tests\s+pass(ed)?|\b\d+\s+tests\s+pass(ed)?)/i;
+  if (unsupportedQuant.test(summaryText)) {
+    errors.push(
+      "Summary includes high-confidence test pass counts/claims; requires direct evidence.",
+    );
+  }
+
+  if (
+    /(feature-complete|fully complete|all done|nothing left)/i.test(lower) &&
+    /(not yet|in progress|pending|todo|to do|left to)/i.test(lower)
+  ) {
+    errors.push(
+      "Summary has a completion contradiction (complete vs pending).",
+    );
+  }
+
+  const quoted = [...summaryText.matchAll(/"([^"]{2,400})"/g)].map((m) => m[1]);
+  const unmatched = quoted.filter(
+    (q) =>
+      q.trim().length > 4 &&
+      !canonicalUserMessages.some((u) => u.includes(q) || q.includes(u)),
+  );
+  if (unmatched.length > 0) {
+    warnings.push(
+      `Summary contains ${unmatched.length} quoted strings not matched to canonical user messages.`,
+    );
+  }
+
+  return { errors, warnings };
+}
+
+function sourceWindowHash(messages: AgentMessage[]): string {
+  const basis = messages
+    .map(
+      (m) =>
+        `${m.role}:${typeof m.content === "string" ? m.content : JSON.stringify(m.content)}`,
+    )
+    .join("\n---\n");
+  return createHash("sha256").update(basis).digest("hex").slice(0, 16);
+}
+
+function extractSummaryText(raw: string): string {
+  const summary = raw.trim();
+  if (!summary) return "";
+  const summaryMatch = summary.match(/<summary>([\s\S]*?)<\/summary>/i);
+  return summaryMatch ? summaryMatch[1].trim() : summary;
 }
 
 export async function summarizeConversation(
   options: SummarizeOptions,
   prevInputTokens = 0,
 ): Promise<SummarizeResult> {
-  const { messages, client, systemPrompt, isAutomatic, filesRead, cwd } =
-    options;
+  const { messages, provider, systemPrompt, filesRead, cwd } = options;
 
   const errorResult = (error: string): SummarizeResult => ({
     messages,
@@ -409,9 +581,7 @@ export async function summarizeConversation(
     error,
   });
 
-  // Get messages to summarize (since last summary, or all)
   const toSummarize = getMessagesSinceLastSummary(messages);
-
   if (toSummarize.length <= 1) {
     return errorResult(
       messages.length <= 1
@@ -420,75 +590,130 @@ export async function summarizeConversation(
     );
   }
 
-  // Handle orphan tool calls
-  const withSyntheticResults = injectSyntheticToolResults(toSummarize);
+  const hadPriorSummaryInInput = toSummarize.some((m) => m.isSummary);
+  const canonicalUserMessages = extractCanonicalUserMessages(toSummarize);
+  const pendingTasks = extractPendingTasksHeuristic(toSummarize);
+  const deterministicSections = renderDeterministicSections({
+    userMessages: canonicalUserMessages,
+    pendingTasks,
+  });
 
-  // Transform for summarization (tool blocks → text, strip images)
+  const withSyntheticResults = injectSyntheticToolResults(toSummarize);
   const transformed = transformMessagesForCondensing(withSyntheticResults);
 
-  // The final user message is the condensing instructions
-  const finalMsg: Anthropic.MessageParam = {
+  const finalMsg: MessageParam = {
     role: "user",
-    content: CONDENSE_INSTRUCTIONS,
+    content: `${CONDENSE_INSTRUCTIONS}\n\n${deterministicSections}`,
   };
 
-  const requestMessages: Anthropic.MessageParam[] = [
+  const requestMessages: MessageParam[] = [
     ...transformed.map(({ role, content }) => ({ role, content })),
     finalMsg,
   ];
 
-  // Start file context generation in parallel with the API call
   const fileContextPromise =
     filesRead && filesRead.length > 0 && cwd
       ? generateFoldedFileContext(filesRead, cwd).catch(() => [] as string[])
       : Promise.resolve([] as string[]);
 
-  let summary = "";
-  let outputTokens = 0;
+  const validationWarnings: string[] = [];
+  let retryUsed = false;
+  let validatorErrors: string[] = [];
+  let summaryText = "";
 
-  try {
-    const stream = client.messages.stream({
-      model: CONDENSE_MODEL,
-      system: CONDENSE_SYSTEM_PROMPT,
-      messages: requestMessages,
-      max_tokens: 8192,
-    });
+  const completeOnce = async (
+    extraInstruction?: string,
+  ): Promise<{ text: string; error?: string }> => {
+    const adjustedMessages =
+      extraInstruction && requestMessages.length > 0
+        ? [
+            ...requestMessages.slice(0, -1),
+            {
+              role: "user" as const,
+              content: `${requestMessages[requestMessages.length - 1].content}\n\n${extraInstruction}`,
+            },
+          ]
+        : requestMessages;
 
-    for await (const event of stream) {
-      if (
-        event.type === "content_block_delta" &&
-        event.delta.type === "text_delta"
-      ) {
-        summary += event.delta.text;
-      } else if (event.type === "message_delta" && event.usage) {
-        outputTokens = event.usage.output_tokens;
+    const modelCandidates =
+      provider.id === "codex"
+        ? [...CODEX_CONDENSE_MODEL_FALLBACKS]
+        : [provider.condenseModel];
+
+    let lastError = "";
+
+    for (const model of modelCandidates) {
+      try {
+        const result = await provider.complete({
+          model,
+          systemPrompt: CONDENSE_SYSTEM_PROMPT,
+          messages: adjustedMessages,
+          maxTokens: 8192,
+          temperature: 0,
+        });
+        return { text: result.text };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        lastError = msg;
+        const shouldRetry =
+          provider.id === "codex" && isUnsupportedCodexModelError(msg);
+        if (!shouldRetry) {
+          return { text: "", error: `Condensing API call failed: ${msg}` };
+        }
       }
     }
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return errorResult(`Condensing API call failed: ${msg}`);
+
+    return { text: "", error: `Condensing API call failed: ${lastError}` };
+  };
+
+  const first = await completeOnce();
+  if (first.error) return errorResult(first.error);
+  summaryText = extractSummaryText(first.text);
+  if (!summaryText) return errorResult("Condensing produced no output.");
+
+  let validation = validateSummary({
+    summaryText,
+    canonicalUserMessages,
+  });
+  validatorErrors = [...validation.errors];
+  validationWarnings.push(...validation.warnings);
+
+  if (validation.errors.length > 0) {
+    retryUsed = true;
+    const retry = await completeOnce(
+      `VALIDATION FAILED. Fix these issues and regenerate a corrected summary:\n- ${validation.errors.join("\n- ")}\n\nDo not invent unsupported metrics or completion claims.`,
+    );
+    if (retry.error) {
+      validationWarnings.push(
+        `Validation retry failed, using first-pass summary: ${retry.error}`,
+      );
+    } else {
+      const retried = extractSummaryText(retry.text);
+      if (retried) {
+        summaryText = retried;
+        validation = validateSummary({ summaryText, canonicalUserMessages });
+        validatorErrors = [...validation.errors];
+        validationWarnings.push(...validation.warnings);
+      }
+    }
+    if (validatorErrors.length > 0) {
+      validationWarnings.push(
+        `Summary still has validator issues after retry: ${validatorErrors.join("; ")}`,
+      );
+    }
   }
 
-  summary = summary.trim();
-  if (!summary) return errorResult("Condensing produced no output.");
-
-  // Extract just the <summary> block if present
-  const summaryMatch = summary.match(/<summary>([\s\S]*?)<\/summary>/i);
-  const summaryText = summaryMatch ? summaryMatch[1].trim() : summary;
-
-  // Build summary message content blocks.
-  // cache_control on the first block marks the summary as a stable prefix —
-  // subsequent turns will read it from cache at 0.1x cost instead of full price.
-  const summaryContent: Anthropic.Messages.ContentBlockParam[] = [
+  const summaryContent: ContentBlock[] = [
     {
       type: "text",
       text: `## Conversation Summary\n\n${summaryText}`,
-      cache_control: { type: "ephemeral" },
-    },
+    } satisfies TextBlock,
+    {
+      type: "text",
+      text: deterministicSections,
+    } satisfies TextBlock,
   ];
 
-  // Extract corrections section and promote it to its own system-reminder block
-  // so it survives future condensings prominently
   const correctionsMatch = summaryText.match(
     /\*\*User Corrections[^*]*\*\*([\s\S]*?)(?=\n\*\*|\n\d+\.|$)/i,
   );
@@ -502,15 +727,12 @@ export async function summarizeConversation(
     }
   }
 
-  // Await file context (already running in parallel with the API call)
   const fileContextSections = await fileContextPromise;
   for (const section of fileContextSections) {
     summaryContent.push({ type: "text", text: section });
   }
 
-  // Build the summary message
   const condenseId = randomUUID();
-
   const summaryMessage: AgentMessage = {
     role: "user",
     content: summaryContent,
@@ -518,16 +740,14 @@ export async function summarizeConversation(
     condenseId,
   };
 
-  // Tag all messages (except messages[0] — always keep original task) with condenseParent
   const newMessages: AgentMessage[] = messages.map((msg, idx) => {
-    if (idx === 0) return msg; // never hide the original task
-    if (msg.condenseParent) return msg; // already tagged from a prior condense
+    if (idx === 0) return msg;
+    if (msg.condenseParent) return msg;
     return { ...msg, condenseParent: condenseId };
   });
 
   newMessages.push(summaryMessage);
 
-  // Estimate new context size: systemPrompt + summary
   const newInputTokens = Math.ceil(
     (systemPrompt.length +
       summaryContent.reduce(
@@ -542,5 +762,14 @@ export async function summarizeConversation(
     summary: summaryText,
     prevInputTokens,
     newInputTokens,
+    validationWarnings,
+    metadata: {
+      inputMessageCount: toSummarize.length,
+      sourceUserMessageCount: canonicalUserMessages.length,
+      hadPriorSummaryInInput,
+      retryUsed,
+      validatorErrors,
+      sourceHash: sourceWindowHash(toSummarize),
+    },
   };
 }

@@ -2,9 +2,27 @@ interface ErrorBlockProps {
   error: string;
   retryable: boolean;
   onRetry?: () => void;
+  onSignIn?: () => void;
 }
 
-export function ErrorBlock({ error, retryable, onRetry }: ErrorBlockProps) {
+function isAuthError(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  return (
+    lower.includes("authentication_error") ||
+    lower.includes("invalid x-api-key") ||
+    lower.includes("invalid api key") ||
+    (lower.includes("401") && !lower.includes("tool"))
+  );
+}
+
+export function ErrorBlock({
+  error,
+  retryable,
+  onRetry,
+  onSignIn,
+}: ErrorBlockProps) {
+  const authError = isAuthError(error);
+
   return (
     <div class="error-block">
       <div class="error-icon">
@@ -12,17 +30,31 @@ export function ErrorBlock({ error, retryable, onRetry }: ErrorBlockProps) {
       </div>
       <div class="error-body">
         <span class="error-message">{error}</span>
-        {retryable && (
+        {authError && onSignIn ? (
           <span class="error-hint">
-            This error may be transient. Try again.
+            Sign in to authenticate your API access.
           </span>
+        ) : (
+          retryable && (
+            <span class="error-hint">
+              This error may be transient. Try again.
+            </span>
+          )
         )}
-        {retryable && onRetry && (
-          <button class="error-retry-btn" onClick={onRetry}>
-            <i class="codicon codicon-refresh" />
-            Retry
-          </button>
-        )}
+        <div class="error-actions">
+          {authError && onSignIn && (
+            <button class="error-sign-in-btn" onClick={onSignIn}>
+              <i class="codicon codicon-key" />
+              Sign in
+            </button>
+          )}
+          {retryable && onRetry && (
+            <button class="error-retry-btn" onClick={onRetry}>
+              <i class="codicon codicon-refresh" />
+              Retry
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );

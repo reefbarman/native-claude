@@ -36,6 +36,12 @@ export const BUILT_IN_MODES: AgentMode[] = [
     icon: "debug",
     toolGroups: ["read", "command", "language", "search", "mcp"],
   },
+  {
+    slug: "review",
+    name: "Review",
+    icon: "checklist",
+    toolGroups: ["read", "language", "search"],
+  },
 ];
 
 /** Custom mode schema as stored in .agentlink/modes.json */

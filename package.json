@@ -2,7 +2,7 @@
   "name": "agentlink",
   "displayName": "AgentLink",
   "description": "MCP server that provides AI agents with native VS Code tools — diff-based file editing, integrated terminal, diagnostics",
-  "version": "1.3.36",
+  "version": "1.3.57",
   "publisher": "agentlink",
   "repository": {
     "type": "git",
@@ -136,6 +136,14 @@
       {
         "command": "agentlink.explainWithAgent",
         "title": "Explain with AgentLink"
+      },
+      {
+        "command": "agentlink.codexSignIn",
+        "title": "AgentLink: Sign In to OpenAI Codex"
+      },
+      {
+        "command": "agentlink.codexSignOut",
+        "title": "AgentLink: Sign Out of OpenAI Codex"
       }
     ],
     "menus": {
@@ -306,11 +314,7 @@
         "agentlink.agentModel": {
           "type": "string",
           "default": "claude-sonnet-4-6",
-          "enum": [
-            "claude-sonnet-4-6",
-            "claude-opus-4-6"
-          ],
-          "description": "Model to use for the built-in agent chat."
+          "description": "Model to use for the built-in agent chat. Use /model in the chat to see available models."
         },
         "agentlink.agentMaxTokens": {
           "type": "number",
@@ -356,7 +360,8 @@
             "code",
             "architect",
             "ask",
-            "debug"
+            "debug",
+            "review"
           ],
           "description": "Default mode for new agent chat sessions."
         }

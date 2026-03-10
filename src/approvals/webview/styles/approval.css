@@ -171,7 +171,8 @@ body {
   resize: none;
   outline: none;
   min-height: 22px;
-  overflow-y: hidden;
+  max-height: 200px;
+  overflow-y: auto;
   padding: 0;
 }
 .terminal-input.edited {

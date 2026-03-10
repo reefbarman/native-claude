@@ -146,11 +146,77 @@ function parseMarkdown(text: string): {
   return { html, mermaidSources };
 }
 
+// Matches file paths like `src/foo/bar.ts`, `/abs/path.ts`, `src/foo.ts:42`
+const FILE_PATH_RE =
+  /(?<![:/])\b((?:(?:\/[\w.\-]+)+|[\w][\w\-]*(?:\/[\w.\-]+)+)\.\w{1,8})(?::(\d+)(?:-\d+)?)?/g;
+
+function linkifyFilePathNodes(
+  container: HTMLElement,
+  onOpenFile: (path: string, line?: number) => void,
+) {
+  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      let el = node.parentElement;
+      while (el && el !== container) {
+        const tag = el.tagName;
+        if (tag === "CODE" || tag === "PRE" || tag === "A") {
+          return NodeFilter.FILTER_REJECT;
+        }
+        el = el.parentElement;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+
+  const textNodes: Text[] = [];
+  let n: Node | null;
+  while ((n = walker.nextNode())) textNodes.push(n as Text);
+
+  for (const textNode of textNodes) {
+    const text = textNode.nodeValue ?? "";
+    FILE_PATH_RE.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    let lastIndex = 0;
+    const parts: Node[] = [];
+
+    while ((match = FILE_PATH_RE.exec(text)) !== null) {
+      if (match.index > lastIndex) {
+        parts.push(document.createTextNode(text.slice(lastIndex, match.index)));
+      }
+      const filePath = match[1];
+      const line = match[2] ? parseInt(match[2], 10) : undefined;
+      const a = document.createElement("a");
+      a.className = "file-path-link";
+      a.textContent = match[0];
+      a.href = "#";
+      a.title = `Open ${filePath}${line !== undefined ? `:${line}` : ""}`;
+      a.addEventListener("click", (e) => {
+        e.preventDefault();
+        onOpenFile(filePath, line);
+      });
+      parts.push(a);
+      lastIndex = match.index + match[0].length;
+    }
+
+    if (parts.length > 0) {
+      if (lastIndex < text.length) {
+        parts.push(document.createTextNode(text.slice(lastIndex)));
+      }
+      const parent = textNode.parentNode;
+      if (parent) {
+        for (const p of parts) parent.insertBefore(p, textNode);
+        parent.removeChild(textNode);
+      }
+    }
+  }
+}
+
 interface StreamingTextProps {
   text: string;
   streaming: boolean;
   onRevealStart?: () => void;
   onOpenMermaidPanel?: (source: string) => void;
+  onOpenFile?: (path: string, line?: number) => void;
 }
 
 // Minimum chars to buffer before we start revealing (~1200 chars ≈ a few paragraphs)
@@ -167,6 +233,7 @@ export function StreamingText({
   streaming,
   onRevealStart,
   onOpenMermaidPanel,
+  onOpenFile,
 }: StreamingTextProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [revealedLen, setRevealedLen] = useState(streaming ? 0 : text.length);
@@ -249,6 +316,11 @@ export function StreamingText({
     if (!containerRef.current) return;
     containerRef.current.innerHTML = parsed.html;
 
+    // Linkify bare file paths in text nodes (skips code/pre blocks)
+    if (onOpenFile) {
+      linkifyFilePathNodes(containerRef.current, onOpenFile);
+    }
+
     // Re-stamp already-rendered diagrams — their SVGs were lost when innerHTML was reset
     // We cache rendered SVGs so we can restore them instantly
     containerRef.current
@@ -287,12 +359,14 @@ export function StreamingText({
           container.getAttribute("data-mermaid-idx") ?? "",
           10,
         );
-        const source = Number.isFinite(idx) ? mermaidSourcesRef.current[idx] : "";
+        const source = Number.isFinite(idx)
+          ? mermaidSourcesRef.current[idx]
+          : "";
         if (!source) return;
         onOpenMermaidPanel?.(source);
       });
     });
-  }, [parsed.html, onOpenMermaidPanel]);
+  }, [parsed.html, onOpenMermaidPanel, onOpenFile]);
 
   // Cache for rendered SVGs — survives innerHTML resets
   const mermaidSvgCache = useRef<Map<number, string>>(new Map());

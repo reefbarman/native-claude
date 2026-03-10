@@ -70,15 +70,23 @@ function getToolSummary(
       return [{ type: "text", text: String(p.query ?? "").slice(0, 60) }];
     case "write_file": {
       const path = String(p.path ?? "");
+      if (extractField(result, "error")) {
+        return [filePart(path), { type: "text", text: " — error" }];
+      }
       const op = extractField(result, "operation") ?? "written";
       return [filePart(path), { type: "text", text: ` (${op})` }];
     }
     case "apply_diff": {
       const path = String(p.path ?? "");
       const status = extractField(result, "status") ?? "";
+      const hasError = !!extractField(result, "error");
       return [
         filePart(path),
-        ...(status ? [{ type: "text" as const, text: ` — ${status}` }] : []),
+        ...(status
+          ? [{ type: "text" as const, text: ` — ${status}` }]
+          : hasError
+            ? [{ type: "text" as const, text: " — error" }]
+            : []),
       ];
     }
     case "find_and_replace": {
@@ -208,7 +216,11 @@ function extractField(text: string, field: string): string | null {
   // Try JSON parse first
   try {
     const obj = JSON.parse(text);
-    if (obj && field in obj) return String(obj[field]);
+    if (obj && typeof obj === "object" && field in obj) {
+      const value = (obj as Record<string, unknown>)[field];
+      if (value === null || value === undefined) return null;
+      return String(value);
+    }
   } catch {
     // Try regex fallback for partial JSON
     const re = new RegExp(`"${field}"\\s*:\\s*"?([^",}]+)`);
@@ -318,6 +330,102 @@ function tokenizeJson(src: string): Token[] {
   return tokens;
 }
 
+function parseResultObject(result: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(result);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    // Ignore parse errors — many tools return plain text.
+  }
+  return null;
+}
+
+function getResultStatus(
+  payload: Record<string, unknown> | null,
+): string | null {
+  if (!payload) return null;
+  const status = payload.status;
+  return typeof status === "string" ? status.toLowerCase() : null;
+}
+
+function hasToolError(payload: Record<string, unknown> | null): boolean {
+  if (!payload) return false;
+  if (typeof payload.error === "string" && payload.error.trim()) return true;
+  const status = getResultStatus(payload);
+  return status === "error" || status === "failed";
+}
+
+function hasToolWarning(payload: Record<string, unknown> | null): boolean {
+  if (!payload) return false;
+  if (payload.partial === true) return true;
+
+  const failedBlocks = payload.failed_blocks;
+  if (Array.isArray(failedBlocks) && failedBlocks.length > 0) return true;
+
+  const malformedBlocks = payload.malformed_blocks;
+  if (typeof malformedBlocks === "number" && malformedBlocks > 0) return true;
+
+  const status = getResultStatus(payload);
+  return (
+    status === "cancelled" ||
+    status === "rejected" ||
+    status === "rejected_by_user" ||
+    status === "timed_out" ||
+    status === "force-completed"
+  );
+}
+
+export interface ToolCallVisualState {
+  statusClass: "tool-running" | "tool-success" | "tool-warning" | "tool-error";
+  statusIconClass:
+    | "codicon-loading codicon-modifier-spin"
+    | "codicon-check"
+    | "codicon-warning"
+    | "codicon-error";
+  cmdExitBadge: string | null;
+}
+
+export function getToolCallVisualState(toolCall: {
+  name: string;
+  complete: boolean;
+  result: string;
+}): ToolCallVisualState {
+  const { complete, name, result } = toolCall;
+  const resultPayload = complete ? parseResultObject(result) : null;
+  const rawExitCode =
+    name === "execute_command" && complete
+      ? extractField(result, "exit_code")
+      : null;
+  const cmdExitBadge =
+    rawExitCode !== null && rawExitCode !== "0" ? rawExitCode : null;
+
+  const isError = complete && hasToolError(resultPayload);
+  const isWarning =
+    complete &&
+    !isError &&
+    (cmdExitBadge !== null || hasToolWarning(resultPayload));
+
+  const statusClass = !complete
+    ? "tool-running"
+    : isError
+      ? "tool-error"
+      : isWarning
+        ? "tool-warning"
+        : "tool-success";
+
+  const statusIconClass = !complete
+    ? "codicon-loading codicon-modifier-spin"
+    : isError
+      ? "codicon-error"
+      : isWarning
+        ? "codicon-warning"
+        : "codicon-check";
+
+  return { statusClass, statusIconClass, cmdExitBadge };
+}
+
 export function ToolCallBlock({ toolCall, onOpenFile }: ToolCallBlockProps) {
   const [expanded, setExpanded] = useState(false);
 
@@ -330,25 +438,8 @@ export function ToolCallBlock({ toolCall, onOpenFile }: ToolCallBlockProps) {
     complete,
   );
 
-  // Detect failed execute_command (non-zero exit code, distinct from tool failure)
-  const cmdExitBadge =
-    toolCall.name === "execute_command" && complete
-      ? ((
-          summaryParts.find(
-            (p) =>
-              p.type === "text" &&
-              (p as { type: "text"; text: string }).text.startsWith(
-                "\x00exit:",
-              ),
-          ) as { type: "text"; text: string } | undefined
-        )?.text.slice(6) ?? null)
-      : null;
-  const cmdFailed = cmdExitBadge !== null;
-  const statusClass = complete
-    ? cmdFailed
-      ? "tool-complete tool-cmd-failed"
-      : "tool-complete"
-    : "tool-running";
+  const { statusClass, statusIconClass, cmdExitBadge } =
+    getToolCallVisualState(toolCall);
 
   const handleFileClick = useCallback(
     (e: MouseEvent, path: string, line?: number) => {
@@ -380,11 +471,7 @@ export function ToolCallBlock({ toolCall, onOpenFile }: ToolCallBlockProps) {
         <i
           class={`codicon codicon-chevron-${expanded ? "down" : "right"} tool-call-chevron`}
         />
-        {complete ? (
-          <i class="codicon tool-call-status-icon codicon-check" />
-        ) : (
-          <i class="codicon tool-call-status-icon codicon-loading codicon-modifier-spin" />
-        )}
+        <i class={`codicon tool-call-status-icon ${statusIconClass}`} />
         <span class="tool-call-name">{toolCall.name}</span>
         {cmdExitBadge !== null && (
           <span class="tool-exit-badge">exit {cmdExitBadge}</span>

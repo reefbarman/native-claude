@@ -28,7 +28,7 @@ export const TOOL_GROUPS: Record<string, string[]> = {
     "get_type_hierarchy",
     "get_inlay_hints",
   ],
-  search: ["search_files", "codebase_search"],
+  search: ["codebase_search", "search_files"],
   plan: ["write_file", "apply_diff", "execute_command", "get_terminal_output"],
   mcp: [], // populated dynamically from McpClientHub
 };

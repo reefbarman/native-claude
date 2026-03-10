@@ -20,7 +20,7 @@ import { Semaphore } from "../util/Semaphore.js";
 /** Serializes the approval-check phase so pending dialogs block other commands. */
 const approvalGate = new Semaphore(1);
 
-import { type ToolResult, type OnApprovalRequest } from "../shared/types.js";
+import { type ToolResult } from "../shared/types.js";
 
 export async function handleExecuteCommand(
   params: {
@@ -43,7 +43,6 @@ export async function handleExecuteCommand(
   approvalPanel: ApprovalPanelProvider,
   sessionId: string,
   trackerCtx?: TrackerContext,
-  onApprovalRequest?: OnApprovalRequest,
 ): Promise<ToolResult> {
   try {
     if (!params.command || params.command.trim().length === 0) {
@@ -139,7 +138,6 @@ export async function handleExecuteCommand(
           approvalManager,
           approvalPanel,
           sessionId,
-          onApprovalRequest,
         );
 
         if (!approvalResult.approved) {
@@ -248,7 +246,6 @@ async function approveSubCommands(
   approvalManager: ApprovalManager,
   approvalPanel: ApprovalPanelProvider,
   sessionId: string,
-  onApprovalRequest?: OnApprovalRequest,
 ): Promise<{
   approved: boolean;
   reason?: string;
@@ -282,33 +279,6 @@ async function approveSubCommands(
     }
     return { command: cmd };
   });
-
-  if (onApprovalRequest) {
-    const choice = await onApprovalRequest({
-      kind: "command",
-      title: "Allow command execution?",
-      detail: fullCommand,
-      choices: [
-        { label: "Allow once", value: "run-once", isPrimary: true },
-        { label: "Allow for session", value: "run-session" },
-        { label: "Deny", value: "reject", isDanger: true },
-      ],
-    });
-    if (choice === "reject") {
-      return { approved: false };
-    }
-    if (choice === "run-session") {
-      // Approve all sub-commands for the session
-      for (const cmd of subCommands) {
-        approvalManager.addCommandRule(
-          sessionId,
-          { pattern: cmd, mode: "prefix" },
-          "session",
-        );
-      }
-    }
-    return { approved: true };
-  }
 
   // Show dialog with full command + enriched sub-command entries
   const { promise } = approvalPanel.enqueueCommandApproval(
