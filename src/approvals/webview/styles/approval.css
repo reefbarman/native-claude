@@ -244,7 +244,7 @@ body {
 .btn-secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
 .btn-danger {
   background: var(--vscode-inputValidation-errorBackground, #5a1d1d);
-  color: var(--vscode-errorForeground, #f48771);
+  color: var(--vscode-inputValidation-errorForeground, var(--vscode-errorForeground, #f48771));
   border-color: var(--vscode-inputValidation-errorBorder, #be1100);
 }
 .btn-danger:hover { opacity: 0.9; }
