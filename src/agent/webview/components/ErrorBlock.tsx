@@ -34,13 +34,13 @@ export function ErrorBlock({
           <span class="error-hint">
             Sign in to authenticate your API access.
           </span>
-        ) : (
-          retryable && (
-            <span class="error-hint">
-              This error may be transient. Try again.
-            </span>
-          )
-        )}
+        ) : retryable ? (
+          <span class="error-hint">
+            This error may be transient. Try again.
+          </span>
+        ) : onRetry ? (
+          <span class="error-hint">Retry to run the last request again.</span>
+        ) : null}
         <div class="error-actions">
           {authError && onSignIn && (
             <button class="error-sign-in-btn" onClick={onSignIn}>
@@ -48,7 +48,7 @@ export function ErrorBlock({
               Sign in
             </button>
           )}
-          {retryable && onRetry && (
+          {onRetry && (
             <button class="error-retry-btn" onClick={onRetry}>
               <i class="codicon codicon-refresh" />
               Retry

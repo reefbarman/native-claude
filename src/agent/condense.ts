@@ -62,6 +62,8 @@ CRITICAL accuracy rules:
 - Do NOT invent quantitative outcomes (test counts, error counts, token values) unless explicitly present.
 - Do NOT mark work "complete" when pending work is still described.
 - "All User Messages" must be literal user-authored messages only (exclude tool results and system condense prompts).
+- The session's system prompt, tool definitions, and MCP/tool-server availability are preserved outside the condensed transcript and will be reattached on future requests. Do not treat them as lost conversation state.
+- If preserved runtime context is relevant to ongoing work, mention only the specific tools/server capabilities that matter; do not waste summary space restating the entire tool catalog.
 
 Before providing your final summary, wrap your analysis in <analysis> tags. In your analysis:
 
@@ -275,6 +277,37 @@ export function getMessagesSinceLastSummary(
 export function getEffectiveHistory(messages: AgentMessage[]): AgentMessage[] {
   if (messages.length === 0) return messages;
 
+  const filterOrphanToolResults = (window: AgentMessage[]): AgentMessage[] => {
+    const toolUseIds = new Set<string>();
+    for (const msg of window) {
+      if (msg.role === "assistant" && Array.isArray(msg.content)) {
+        for (const block of msg.content) {
+          if (block.type === "tool_use") {
+            toolUseIds.add((block as ToolUseBlock).id);
+          }
+        }
+      }
+    }
+
+    return window
+      .map((msg) => {
+        if (msg.role === "user" && Array.isArray(msg.content)) {
+          const kept = msg.content.filter((block) => {
+            if (block.type === "tool_result") {
+              return toolUseIds.has((block as ToolResultBlock).tool_use_id);
+            }
+            return true;
+          });
+          if (kept.length === 0) return null;
+          if (kept.length !== msg.content.length) {
+            return { ...msg, content: kept };
+          }
+        }
+        return msg;
+      })
+      .filter((msg): msg is AgentMessage => msg !== null);
+  };
+
   // Find the most recent summary
   let lastSummaryIdx = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -286,49 +319,51 @@ export function getEffectiveHistory(messages: AgentMessage[]): AgentMessage[] {
 
   if (lastSummaryIdx === -1) return messages; // no summary yet
 
-  // Collect existing condenseIds so we can filter orphaned parents
-  const existingCondenseIds = new Set<string>();
-  for (const msg of messages) {
-    if (msg.isSummary && msg.condenseId)
-      existingCondenseIds.add(msg.condenseId);
+  const fromSummary = filterOrphanToolResults(messages.slice(lastSummaryIdx));
+  const summary = fromSummary[0];
+  if (!summary?.isSummary) {
+    return fromSummary;
   }
 
-  // Fresh-start: summary onwards, filtering orphan tool_results.
-  // We intentionally do NOT prepend messages[0] (original task) here — it would create
-  // two consecutive user messages ([original_task, summary] both have role "user"),
-  // which the Anthropic API rejects. The summary already captures the original task
-  // in its "Primary Request and Intent" section.
-  const fromSummary = messages.slice(lastSummaryIdx);
+  const laterMessages = fromSummary.slice(1);
+  const canonicalUserMessages = extractCanonicalUserMessages(messages);
+  const pendingTasks = extractPendingTasksHeuristic(messages);
+  const resumeAnchor = extractResumeAnchor({
+    userMessages: canonicalUserMessages,
+    pendingTasks,
+  });
 
-  // Collect tool_use IDs visible in the fresh window (for orphan tool_result filtering)
-  const toolUseIds = new Set<string>();
-  for (const msg of fromSummary) {
-    if (msg.role === "assistant" && Array.isArray(msg.content)) {
-      for (const block of msg.content) {
-        if (block.type === "tool_use")
-          toolUseIds.add((block as ToolUseBlock).id);
-      }
-    }
+  const preservedContext = summary.preservedContext;
+
+  const resumeContextMessage: AgentMessage = {
+    role: "user",
+    isResumeContext: true,
+    content: [
+      {
+        type: "text",
+        text: renderDeterministicSections({
+          userMessages: canonicalUserMessages,
+          pendingTasks,
+          resumeAnchor,
+          preservedContext,
+        }),
+      } satisfies TextBlock,
+    ],
+  };
+
+  let insertionIndex = laterMessages.findIndex(
+    (msg) => msg.role === "user" && !msg.isSummary,
+  );
+  if (insertionIndex === -1) {
+    insertionIndex = 0;
   }
 
-  const filtered = fromSummary
-    .map((msg) => {
-      if (msg.role === "user" && Array.isArray(msg.content)) {
-        const kept = msg.content.filter((block) => {
-          if (block.type === "tool_result") {
-            return toolUseIds.has((block as ToolResultBlock).tool_use_id);
-          }
-          return true;
-        });
-        if (kept.length === 0) return null;
-        if (kept.length !== msg.content.length)
-          return { ...msg, content: kept };
-      }
-      return msg;
-    })
-    .filter((msg): msg is AgentMessage => msg !== null);
-
-  return filtered;
+  return [
+    summary,
+    ...laterMessages.slice(0, insertionIndex),
+    resumeContextMessage,
+    ...laterMessages.slice(insertionIndex),
+  ];
 }
 
 // ---------------------------------------------------------------------------
@@ -421,6 +456,10 @@ export interface SummarizeOptions {
   isAutomatic: boolean;
   filesRead?: string[];
   cwd?: string;
+  preservedContext?: {
+    toolNames: string[];
+    mcpServerNames?: string[];
+  };
 }
 
 export interface SummarizeResult {
@@ -439,20 +478,38 @@ export interface SummarizeResult {
     retryUsed: boolean;
     validatorErrors: string[];
     sourceHash: string;
+    providerId: string;
+    condenseModel: string;
+    modelCandidates: string[];
+    selectedModel: string;
+    latestUserMessage: string;
+    currentTask: string;
+    pendingTasks: string[];
+    canonicalUserMessages: string[];
+    requestMessageCount: number;
+    effectiveHistoryMessageCount: number;
+    effectiveHistoryRoles: string[];
   };
   error?: string;
 }
 
 function extractCanonicalUserMessages(messages: AgentMessage[]): string[] {
   return messages
-    .filter(
-      (m) =>
-        m.role === "user" &&
-        typeof m.content === "string" &&
-        !m.isSummary &&
-        !m.content.includes("## Conversation Summary"),
-    )
-    .map((m) => (m.content as string).trim())
+    .filter((m) => m.role === "user" && !m.isSummary && !m.isResumeContext)
+    .map((m) => {
+      if (typeof m.content === "string") {
+        return m.content.trim();
+      }
+      if (!Array.isArray(m.content)) {
+        return "";
+      }
+      return m.content
+        .filter((block): block is TextBlock => block.type === "text")
+        .map((block) => block.text.trim())
+        .filter((text) => text.length > 0)
+        .join("\n")
+        .trim();
+    })
     .filter((t) => t.length > 0);
 }
 
@@ -472,9 +529,30 @@ function extractPendingTasksHeuristic(messages: AgentMessage[]): string[] {
   return [...new Set(candidates)].slice(-6);
 }
 
-function renderDeterministicSections(options: {
+function extractResumeAnchor(options: {
   userMessages: string[];
   pendingTasks: string[];
+}): { latestUserMessage: string; currentTask: string } {
+  const latestUserMessage =
+    options.userMessages[options.userMessages.length - 1] ??
+    "Unknown from transcript";
+  const currentTask =
+    options.pendingTasks[options.pendingTasks.length - 1] ??
+    "Unknown from transcript";
+  return { latestUserMessage, currentTask };
+}
+
+export function renderDeterministicSections(options: {
+  userMessages: string[];
+  pendingTasks: string[];
+  resumeAnchor: {
+    latestUserMessage: string;
+    currentTask: string;
+  };
+  preservedContext?: {
+    toolNames: string[];
+    mcpServerNames?: string[];
+  };
 }): string {
   const userLines =
     options.userMessages.length > 0
@@ -486,15 +564,90 @@ function renderDeterministicSections(options: {
       ? options.pendingTasks.map((t) => `- ${t}`).join("\n")
       : "- None explicitly identified";
 
+  const toolLines = options.preservedContext?.toolNames?.length
+    ? options.preservedContext.toolNames.map((name) => `- ${name}`).join("\n")
+    : "- Unknown";
+
+  const serverLines = options.preservedContext?.mcpServerNames?.length
+    ? options.preservedContext.mcpServerNames
+        .map((name) => `- ${name}`)
+        .join("\n")
+    : "- None";
+
   return [
     "<system-reminder>",
+    "## Resume Anchor (deterministic)",
+    `- Latest user message: "${options.resumeAnchor.latestUserMessage}"`,
+    `- Continue from this task: "${options.resumeAnchor.currentTask}"`,
+    "",
     "## Canonical User Messages (deterministic)",
     userLines,
     "",
     "## Pending Tasks (deterministic heuristic)",
     pendingLines,
+    "",
+    "## Preserved Runtime Context (reattached outside transcript)",
+    "### Available tool names",
+    toolLines,
+    "",
+    "### MCP servers with exposed tools",
+    serverLines,
     "</system-reminder>",
   ].join("\n");
+}
+
+function normalizeWhitespace(text: string): string {
+  return text.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function extractNumberedSection(summaryText: string, title: string): string {
+  const escapedTitle = title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const numberedMatch = summaryText.match(
+    new RegExp(
+      `(?:^|\\n)\\d+\\.\\s+\\*\\*${escapedTitle}(?:[^*]*)\\*\\*:?([\\s\\S]*?)(?=\\n\\d+\\.\\s+\\*\\*|$)`,
+      "i",
+    ),
+  );
+  if (numberedMatch?.[1]) return numberedMatch[1].trim();
+
+  const boldMatch = summaryText.match(
+    new RegExp(
+      `(?:^|\\n)\\*\\*${escapedTitle}(?:[^*]*)\\*\\*:?([\\s\\S]*?)(?=\\n(?:\\d+\\.\\s+\\*\\*|\\*\\*)|$)`,
+      "i",
+    ),
+  );
+  return boldMatch?.[1]?.trim() ?? "";
+}
+
+function buildDeterministicFallbackSummary(options: {
+  userMessages: string[];
+  pendingTasks: string[];
+  resumeAnchor: {
+    latestUserMessage: string;
+    currentTask: string;
+  };
+}): string {
+  const allUserMessages =
+    options.userMessages.length > 0
+      ? options.userMessages.map((m) => `- "${m}"`).join("\n")
+      : "- None";
+  const pendingTasks =
+    options.pendingTasks.length > 0
+      ? options.pendingTasks.map((t) => `- ${t}`).join("\n")
+      : "- None explicitly identified";
+
+  return [
+    "1. **Primary Request and Intent**: Continue the active work captured in the latest user message and pending task anchor.",
+    "2. **Key Technical Concepts**: Unknown from transcript.",
+    "3. **Files and Code Sections**: Unknown from transcript.",
+    "4. **Errors and Fixes**: Unknown from transcript.",
+    "5. **Problem Solving**: Use the deterministic resume anchor and canonical user messages below as the source of truth.",
+    `6. **All User Messages**:\n${allUserMessages}`,
+    "7. **User Corrections & Behavioral Directives**: Unknown from transcript.",
+    `8. **Pending Tasks**:\n${pendingTasks}`,
+    `9. **Current Work**: Continue from this task: "${options.resumeAnchor.currentTask}". Latest user message: "${options.resumeAnchor.latestUserMessage}".`,
+    `10. **Optional Next Step**: Resume work on "${options.resumeAnchor.currentTask}".`,
+  ].join("\n\n");
 }
 
 function isUnsupportedCodexModelError(message: string): boolean {
@@ -506,7 +659,15 @@ function isUnsupportedCodexModelError(message: string): boolean {
 function validateSummary(options: {
   summaryText: string;
   canonicalUserMessages: string[];
-}): { errors: string[]; warnings: string[] } {
+}): {
+  errors: string[];
+  warnings: string[];
+  stats: {
+    unmatchedQuotedStrings: number;
+    preservedCanonicalMessages: number;
+    latestUserMessagePreserved: boolean;
+  };
+} {
   const { summaryText, canonicalUserMessages } = options;
   const errors: string[] = [];
   const warnings: string[] = [];
@@ -535,6 +696,38 @@ function validateSummary(options: {
     );
   }
 
+  const allUserMessagesSection = extractNumberedSection(
+    summaryText,
+    "All User Messages",
+  );
+  const normalizedAllUserMessagesSection = normalizeWhitespace(
+    allUserMessagesSection,
+  );
+  const normalizedCanonicalMessages =
+    canonicalUserMessages.map(normalizeWhitespace);
+  const preservedCanonicalMessages = normalizedCanonicalMessages.filter(
+    (message) => normalizedAllUserMessagesSection.includes(message),
+  ).length;
+  const latestCanonicalMessage = normalizedCanonicalMessages.at(-1);
+  const latestUserMessagePreserved = latestCanonicalMessage
+    ? normalizedAllUserMessagesSection.includes(latestCanonicalMessage)
+    : true;
+
+  if (canonicalUserMessages.length > 0 && !latestUserMessagePreserved) {
+    errors.push(
+      "Summary's 'All User Messages' section does not preserve the latest canonical user message verbatim.",
+    );
+  }
+
+  if (
+    canonicalUserMessages.length > 1 &&
+    preservedCanonicalMessages < Math.min(2, canonicalUserMessages.length)
+  ) {
+    warnings.push(
+      `Summary preserved only ${preservedCanonicalMessages}/${canonicalUserMessages.length} canonical user messages verbatim in the 'All User Messages' section.`,
+    );
+  }
+
   const quoted = [...summaryText.matchAll(/"([^"]{2,400})"/g)].map((m) => m[1]);
   const unmatched = quoted.filter(
     (q) =>
@@ -547,7 +740,15 @@ function validateSummary(options: {
     );
   }
 
-  return { errors, warnings };
+  return {
+    errors,
+    warnings,
+    stats: {
+      unmatchedQuotedStrings: unmatched.length,
+      preservedCanonicalMessages,
+      latestUserMessagePreserved,
+    },
+  };
 }
 
 function sourceWindowHash(messages: AgentMessage[]): string {
@@ -571,7 +772,8 @@ export async function summarizeConversation(
   options: SummarizeOptions,
   prevInputTokens = 0,
 ): Promise<SummarizeResult> {
-  const { messages, provider, systemPrompt, filesRead, cwd } = options;
+  const { messages, provider, systemPrompt, filesRead, cwd, preservedContext } =
+    options;
 
   const errorResult = (error: string): SummarizeResult => ({
     messages,
@@ -593,9 +795,15 @@ export async function summarizeConversation(
   const hadPriorSummaryInInput = toSummarize.some((m) => m.isSummary);
   const canonicalUserMessages = extractCanonicalUserMessages(toSummarize);
   const pendingTasks = extractPendingTasksHeuristic(toSummarize);
+  const resumeAnchor = extractResumeAnchor({
+    userMessages: canonicalUserMessages,
+    pendingTasks,
+  });
   const deterministicSections = renderDeterministicSections({
     userMessages: canonicalUserMessages,
     pendingTasks,
+    resumeAnchor,
+    preservedContext,
   });
 
   const withSyntheticResults = injectSyntheticToolResults(toSummarize);
@@ -620,6 +828,11 @@ export async function summarizeConversation(
   let retryUsed = false;
   let validatorErrors: string[] = [];
   let summaryText = "";
+  const modelCandidates =
+    provider.id === "codex"
+      ? [...CODEX_CONDENSE_MODEL_FALLBACKS]
+      : [provider.condenseModel];
+  let selectedModel = modelCandidates[0];
 
   const completeOnce = async (
     extraInstruction?: string,
@@ -635,11 +848,6 @@ export async function summarizeConversation(
           ]
         : requestMessages;
 
-    const modelCandidates =
-      provider.id === "codex"
-        ? [...CODEX_CONDENSE_MODEL_FALLBACKS]
-        : [provider.condenseModel];
-
     let lastError = "";
 
     for (const model of modelCandidates) {
@@ -651,6 +859,7 @@ export async function summarizeConversation(
           maxTokens: 8192,
           temperature: 0,
         });
+        selectedModel = model;
         return { text: result.text };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -700,17 +909,25 @@ export async function summarizeConversation(
       validationWarnings.push(
         `Summary still has validator issues after retry: ${validatorErrors.join("; ")}`,
       );
+      summaryText = buildDeterministicFallbackSummary({
+        userMessages: canonicalUserMessages,
+        pendingTasks,
+        resumeAnchor,
+      });
+      validationWarnings.push(
+        "Fell back to a deterministic summary because the model-authored summary could not be trusted after retry.",
+      );
     }
   }
 
   const summaryContent: ContentBlock[] = [
     {
       type: "text",
-      text: `## Conversation Summary\n\n${summaryText}`,
+      text: deterministicSections,
     } satisfies TextBlock,
     {
       type: "text",
-      text: deterministicSections,
+      text: `## Conversation Summary\n\n${summaryText}`,
     } satisfies TextBlock,
   ];
 
@@ -738,6 +955,7 @@ export async function summarizeConversation(
     content: summaryContent,
     isSummary: true,
     condenseId,
+    preservedContext,
   };
 
   const newMessages: AgentMessage[] = messages.map((msg, idx) => {
@@ -757,6 +975,8 @@ export async function summarizeConversation(
       4,
   );
 
+  const effectiveHistory = getEffectiveHistory(newMessages);
+
   return {
     messages: newMessages,
     summary: summaryText,
@@ -770,6 +990,21 @@ export async function summarizeConversation(
       retryUsed,
       validatorErrors,
       sourceHash: sourceWindowHash(toSummarize),
+      providerId: provider.id,
+      condenseModel: provider.condenseModel,
+      modelCandidates,
+      selectedModel,
+      latestUserMessage: resumeAnchor.latestUserMessage,
+      currentTask: resumeAnchor.currentTask,
+      pendingTasks,
+      canonicalUserMessages,
+      requestMessageCount: requestMessages.length,
+      effectiveHistoryMessageCount: effectiveHistory.length,
+      effectiveHistoryRoles: effectiveHistory.map((msg) => {
+        if (msg.isSummary) return `${msg.role}:summary`;
+        if (msg.isResumeContext) return `${msg.role}:resume`;
+        return msg.role;
+      }),
     },
   };
 }

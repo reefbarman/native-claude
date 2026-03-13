@@ -5,6 +5,7 @@ export interface SpawnBackgroundRequest {
   model?: string;
   provider?: string;
   taskClass?: string;
+  modelTier?: ModelTier;
 }
 
 export interface SpawnBackgroundResult {

@@ -499,6 +499,7 @@ Spawn a background agent that runs in parallel with the current session. Use thi
 | `model`          | string? | Optional explicit model override                                       |
 | `provider`       | string? | Optional provider preference/constraint                                |
 | `taskClass`      | string? | Routing profile key (e.g. `review_code`, `review_plan`, `research`)    |
+| `modelTier`      | string? | Optional routing tier override (`cheap`, `balanced`, `deep_reasoning`) |
 | `timeoutSeconds` | number? | Per-session timeout budget                                             |
 | `tokenBudget`    | number? | Total token budget cap for background run                              |
 | `maxToolCalls`   | number? | Max tool-call budget for background run                                |
@@ -535,6 +536,7 @@ AgentLink includes static routing policy for background agents (`src/agent/backg
 
 - **Default behavior**: non-review tasks stay on the foreground model when policy says `useForegroundModelByDefault`.
 - **Review behavior**: review task classes (e.g. `review_code`, `review_plan`) prefer opposite-provider routing when available.
+- **Review complexity**: review spawns can explicitly set `modelTier`; otherwise review routing defaults to `balanced` for routine reviews and upgrades to `deep_reasoning` for complex reviews based on task/message heuristics.
 - **Fallback behavior**: deterministic fallback order is used when preferred candidates are unavailable or unauthenticated.
 - **Transparency**: routing decisions are returned by `spawn_background_agent`, logged as `[bg-route]`, and shown in background UI/debug info.
 

@@ -63,6 +63,36 @@ function pickMode(
   return request.mode?.trim() || rule.preferredMode || foregroundMode || "code";
 }
 
+function inferReviewTier(
+  request: SpawnBackgroundRequest,
+): ModelTier | undefined {
+  const taskClass = request.taskClass?.trim().toLowerCase();
+  if (!taskClass?.startsWith("review_")) return undefined;
+
+  const text = `${request.task}\n${request.message}`.toLowerCase();
+  const deepSignals = [
+    /\bcomplex\b/,
+    /\bcritical\b/,
+    /\bsecurity\b/,
+    /\brisky?\b/,
+    /\bdeep\s+review\b/,
+    /\bthorough\b/,
+    /\barchitecture\b/,
+    /\bprincipal[-\s]engineer\b/,
+    /\bnon[- ]?obvious\b/,
+    /\bedge cases?\b/,
+    /\bmulti[- ]file\b/,
+    /\bcross[- ](cutting|system|module)\b/,
+    /\bcorrectness\b/,
+    /\bdata integrity\b/,
+    /\bproduction\b/,
+  ];
+
+  return deepSignals.some((pattern) => pattern.test(text))
+    ? "deep_reasoning"
+    : "balanced";
+}
+
 function scoreModel(model: ModelInfo, tier: ModelTier): number {
   const id = model.id.toLowerCase();
   const caps = model.capabilities;
@@ -74,13 +104,17 @@ function scoreModel(model: ModelInfo, tier: ModelTier): number {
 
   const cheapHints = /haiku|spark|mini|lite/;
   const deepHints = /opus|max|5\.3|sonnet|pro/;
+  const isOpus = /opus/.test(id);
+  const isSonnet = /sonnet/.test(id);
 
   if (tier === "deep_reasoning") {
     return (
       base +
       (caps.supportsThinking ? 120 : -120) +
       (deepHints.test(id) ? 80 : 0) +
-      (cheapHints.test(id) ? -100 : 0)
+      (cheapHints.test(id) ? -100 : 0) +
+      (isOpus ? 30 : 0) +
+      (isSonnet ? 10 : 0)
     );
   }
 
@@ -98,7 +132,9 @@ function scoreModel(model: ModelInfo, tier: ModelTier): number {
     base +
     (caps.supportsThinking ? 30 : 0) +
     (cheapHints.test(id) ? 20 : 0) +
-    (deepHints.test(id) ? 20 : 0)
+    (deepHints.test(id) ? 20 : 0) +
+    (isSonnet ? 25 : 0) +
+    (isOpus ? -10 : 0)
   );
 }
 
@@ -168,7 +204,11 @@ export async function resolveBackgroundRoute(
     };
   }
 
-  const modelTier = rule.modelTier ?? "balanced";
+  const modelTier =
+    request.modelTier ??
+    inferReviewTier(request) ??
+    rule.modelTier ??
+    "balanced";
   const strategy = rule.providerStrategy ?? "same";
   const specificProvider = rule.specificProvider;
 

@@ -255,6 +255,7 @@ describe("spawn_background_agent tool", () => {
     expect(props.model).toBeDefined();
     expect(props.provider).toBeDefined();
     expect(props.taskClass).toBeDefined();
+    expect(props.modelTier).toBeDefined();
     // Guardrail params removed — background agents run without limits
     expect(props.timeoutSeconds).toBeUndefined();
     expect(props.tokenBudget).toBeUndefined();
@@ -281,6 +282,7 @@ describe("spawn_background_agent tool", () => {
         model: "claude-sonnet-4-6",
         provider: "anthropic",
         taskClass: "review_code",
+        modelTier: "deep_reasoning",
       },
       { ...mockCtx, onSpawnBackground },
     );
@@ -292,6 +294,7 @@ describe("spawn_background_agent tool", () => {
       model: "claude-sonnet-4-6",
       provider: "anthropic",
       taskClass: "review_code",
+      modelTier: "deep_reasoning",
     });
 
     const text = (result.content[0] as { type: string; text: string }).text;

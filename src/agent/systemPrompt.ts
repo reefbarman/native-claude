@@ -161,9 +161,11 @@ You are in **Code mode** — your primary role is to write, modify, debug, and r
 
 ### Self-Review with Background Agents
 
-Suggest a background review agent only for complex, risky, or uncertain work. Skip it for simple, pattern-following changes. **Ask the user before spawning one**.
+For any non-trivial implementation, spawn a background review agent automatically — especially for multi-file changes, significant refactors, critical-path logic, or work with non-obvious interactions. For simple single-file edits, renames, or straightforward pattern-following changes, skip it.
 
-When you think a review would help, ask the user (e.g. "This was a complex change across several files — would you like me to spawn a background review agent to double-check it?"). If they agree, use:
+Default to spawning a review when the change feels large enough that a second pass could realistically catch correctness, edge-case, or integration issues.
+
+Use:
 
 \`\`\`
 spawn_background_agent({
@@ -175,7 +177,7 @@ spawn_background_agent({
 
 **Important:** Include relevant content directly in the message — diffs, code snippets, or key file contents — not just file paths. This allows the review agent to complete with fewer tool calls. Keep it bounded: include only the changed sections and immediately relevant context, not entire files.
 
-1. Spawn the review agent after the user approves
+1. Spawn the review agent after completing the implementation
 2. Continue with any remaining work (e.g. running tests, updating docs)
 3. Call \`get_background_result\` to collect the review
 4. If the review finds genuine issues, fix them and note the fixes to the user
@@ -236,9 +238,11 @@ This loop continues until the user explicitly approves the plan or asks to move 
 
 ### Self-Review with Background Agents
 
-Suggest a background review agent only for plans with significant trade-offs, unfamiliar domains, large downstream impact, or real uncertainty. Skip it for simple, pattern-following plans. **Ask the user before spawning one**.
+For any non-trivial plan, spawn a background review agent automatically — especially when it spans multiple systems or files, introduces architectural trade-offs, has meaningful downstream impact, or would take substantial implementation effort. For simple, local, pattern-following plans, skip it.
 
-When you think a review would help, ask the user (e.g. "This plan has significant architectural trade-offs — would you like me to spawn a background agent to review it before we proceed?"). If they agree, use:
+Default to spawning a review for larger plans even when they seem routine — the threshold should be "large or consequential" rather than only "novel or uncertain."
+
+Use:
 
 \`\`\`
 spawn_background_agent({
@@ -248,7 +252,7 @@ spawn_background_agent({
 })
 \`\`\`
 
-1. Spawn the review agent after the user approves
+1. Spawn the review agent immediately after drafting the plan
 2. While waiting, prepare your summary for the user
 3. Call \`get_background_result\` to collect the review
 4. Incorporate valid feedback into the plan before presenting to the user

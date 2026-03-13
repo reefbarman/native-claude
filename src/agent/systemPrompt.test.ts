@@ -103,6 +103,15 @@ describe("buildSystemPrompt", () => {
   it("includes code mode section for 'code' mode", async () => {
     const result = await buildSystemPrompt("code", tmpDir);
     expect(result).toContain("Code mode");
+    expect(result).toContain(
+      "For any non-trivial implementation, spawn a background review agent automatically",
+    );
+    expect(result).toContain(
+      "Default to spawning a review when the change feels large enough",
+    );
+    expect(result).toContain(
+      "Spawn the review agent after completing the implementation",
+    );
   });
 
   it("includes ask mode section for 'ask' mode", async () => {
@@ -116,6 +125,13 @@ describe("buildSystemPrompt", () => {
     expect(result).toContain("Write the plan to a Markdown file in `./plans`");
     expect(result).toContain("Review & Iteration");
     expect(result).toContain("switch_mode");
+    expect(result).toContain(
+      "For any non-trivial plan, spawn a background review agent automatically",
+    );
+    expect(result).toContain('threshold should be "large or consequential"');
+    expect(result).toContain(
+      "Spawn the review agent immediately after drafting the plan",
+    );
   });
 
   it("includes review mode section for 'review' mode", async () => {

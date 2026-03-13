@@ -10,7 +10,6 @@
     "review_code": {
       "preferredMode": "review",
       "providerStrategy": "opposite",
-      "modelTier": "deep_reasoning",
       "useForegroundModelByDefault": false,
       "requireReviewCapableModel": true,
       "thinkingBudget": 4096,

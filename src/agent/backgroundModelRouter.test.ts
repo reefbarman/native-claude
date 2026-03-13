@@ -115,6 +115,87 @@ describe("resolveBackgroundRoute", () => {
     expect(route.routingReason).toContain("opposite");
   });
 
+  it("prefers sonnet for routine anthropic review fallbacks", async () => {
+    const sonnet = makeModel("claude-sonnet-4-6", "anthropic");
+    const opus = makeModel("claude-opus-4-6", "anthropic");
+    const codexModel = makeModel("gpt-5-mini", "codex", {
+      supportsThinking: false,
+    });
+    const registry = makeRegistry([
+      makeProvider("anthropic", [sonnet, opus], true),
+      makeProvider("codex", [codexModel], false),
+    ]);
+
+    const route = await resolveBackgroundRoute(
+      registry,
+      {
+        task: "Review patch",
+        message: "Quick review of these changes",
+        taskClass: "review_code",
+      },
+      { mode: "code", model: "gpt-5" },
+    );
+
+    expect(route.resolvedProvider).toBe("anthropic");
+    expect(route.resolvedModel).toBe("claude-sonnet-4-6");
+    expect(route.fallbackUsed).toBe(false);
+    expect(route.routingReason).toContain("tier=balanced");
+  });
+
+  it("prefers opus for complex anthropic review fallbacks", async () => {
+    const sonnet = makeModel("claude-sonnet-4-6", "anthropic");
+    const opus = makeModel("claude-opus-4-6", "anthropic");
+    const codexModel = makeModel("gpt-5-mini", "codex", {
+      supportsThinking: false,
+    });
+    const registry = makeRegistry([
+      makeProvider("anthropic", [sonnet, opus], true),
+      makeProvider("codex", [codexModel], false),
+    ]);
+
+    const route = await resolveBackgroundRoute(
+      registry,
+      {
+        task: "Review critical auth refactor",
+        message:
+          "Do a thorough multi-file review focused on correctness, security, and edge cases.",
+        taskClass: "review_code",
+      },
+      { mode: "code", model: "gpt-5" },
+    );
+
+    expect(route.resolvedProvider).toBe("anthropic");
+    expect(route.resolvedModel).toBe("claude-opus-4-6");
+    expect(route.fallbackUsed).toBe(false);
+    expect(route.routingReason).toContain("tier=deep_reasoning");
+  });
+
+  it("honors explicit modelTier override for review tasks", async () => {
+    const sonnet = makeModel("claude-sonnet-4-6", "anthropic");
+    const opus = makeModel("claude-opus-4-6", "anthropic");
+    const codexModel = makeModel("gpt-5-mini", "codex", {
+      supportsThinking: false,
+    });
+    const registry = makeRegistry([
+      makeProvider("anthropic", [sonnet, opus], true),
+      makeProvider("codex", [codexModel], false),
+    ]);
+
+    const route = await resolveBackgroundRoute(
+      registry,
+      {
+        task: "Review patch",
+        message: "Quick review",
+        taskClass: "review_code",
+        modelTier: "deep_reasoning",
+      },
+      { mode: "code", model: "gpt-5" },
+    );
+
+    expect(route.resolvedModel).toBe("claude-opus-4-6");
+    expect(route.routingReason).toContain("tier=deep_reasoning");
+  });
+
   it("falls back when opposite provider is unavailable/auth-missing", async () => {
     const anthModel = makeModel("claude-sonnet-4-6", "anthropic");
     const codexModel = makeModel("gpt-5", "codex");

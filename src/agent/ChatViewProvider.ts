@@ -54,6 +54,7 @@ export type ExtensionToWebview =
       toolName: string;
       result: string;
       durationMs: number;
+      input?: unknown;
     }
   | {
       type: "agentUserAnnotation";
@@ -183,6 +184,25 @@ export type ExtensionToWebview =
       summary: string;
       durationMs: number;
       validationWarnings?: string[];
+      metadata?: {
+        inputMessageCount: number;
+        sourceUserMessageCount: number;
+        hadPriorSummaryInInput: boolean;
+        retryUsed: boolean;
+        validatorErrors: string[];
+        sourceHash: string;
+        providerId: string;
+        condenseModel: string;
+        modelCandidates: string[];
+        selectedModel: string;
+        latestUserMessage: string;
+        currentTask: string;
+        pendingTasks: string[];
+        canonicalUserMessages: string[];
+        requestMessageCount: number;
+        effectiveHistoryMessageCount: number;
+        effectiveHistoryRoles: string[];
+      };
     }
   | {
       type: "agentCondenseError";
@@ -255,6 +275,7 @@ export type ExtensionToWebview =
       toolName: string;
       result: string;
       durationMs: number;
+      input?: unknown;
     }
   | {
       type: "agentBgApiRequest";
@@ -1698,9 +1719,78 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const text = msg.text as string;
         const queueId = msg.queueId as string;
         const displayText = msg.displayText as string | undefined;
-        if (sessionId && text && queueId && this.sessionManager) {
+        const attachments = (msg.attachments as string[] | undefined) ?? [];
+        const images =
+          (msg.images as
+            | Array<{ name: string; mimeType: string; base64: string }>
+            | undefined) ?? [];
+        const documents =
+          (msg.documents as
+            | Array<{ name: string; mimeType: string; base64: string }>
+            | undefined) ?? [];
+        if (
+          sessionId &&
+          queueId &&
+          this.sessionManager &&
+          (text ||
+            attachments.length > 0 ||
+            images.length > 0 ||
+            documents.length > 0)
+        ) {
           const session = this.sessionManager.getSession(sessionId);
-          session?.setPendingInterjection(text, queueId, displayText);
+          session?.setPendingInterjection(
+            text,
+            queueId,
+            displayText,
+            attachments.length > 0 ? attachments : undefined,
+            images.length > 0 ? images : undefined,
+            documents.length > 0 ? documents : undefined,
+          );
+        }
+        break;
+      }
+
+      case "agentUpdateQueuedMessage": {
+        const sessionId = msg.sessionId as string;
+        const text = msg.text as string;
+        const queueId = msg.queueId as string;
+        const displayText = msg.displayText as string | undefined;
+        const attachments = (msg.attachments as string[] | undefined) ?? [];
+        const images =
+          (msg.images as
+            | Array<{ name: string; mimeType: string; base64: string }>
+            | undefined) ?? [];
+        const documents =
+          (msg.documents as
+            | Array<{ name: string; mimeType: string; base64: string }>
+            | undefined) ?? [];
+        if (
+          sessionId &&
+          queueId &&
+          this.sessionManager &&
+          (text ||
+            attachments.length > 0 ||
+            images.length > 0 ||
+            documents.length > 0)
+        ) {
+          const session = this.sessionManager.getSession(sessionId);
+          session?.updatePendingInterjection(queueId, {
+            text,
+            displayText,
+            attachments: attachments.length > 0 ? attachments : undefined,
+            images: images.length > 0 ? images : undefined,
+            documents: documents.length > 0 ? documents : undefined,
+          });
+        }
+        break;
+      }
+
+      case "agentRemoveQueuedMessage": {
+        const sessionId = msg.sessionId as string;
+        const queueId = msg.queueId as string;
+        if (sessionId && queueId && this.sessionManager) {
+          const session = this.sessionManager.getSession(sessionId);
+          session?.clearPendingInterjectionIf(queueId);
         }
         break;
       }
@@ -1886,6 +1976,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           toolName: event.toolName,
           result: resultText,
           durationMs: event.durationMs,
+          input: event.input,
         });
         // Mark completed in the sidebar's tool call tracker
         this.toolCallTracker?.completeAgentCall(event.toolCallId);
@@ -1933,11 +2024,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         });
         break;
 
-      case "error":
+      case "error": {
         this.flushDeltaBuffersNow();
         this.log(
           `[agent] error: ${event.error} (retryable=${event.retryable})`,
         );
+        const session = this.sessionManager?.getSession(sessionId);
+        if (session) {
+          session.appendRuntimeError(event.error, event.retryable);
+          this.sessionManager?.saveSession(sessionId);
+        }
         this.postMessage({
           type: isBackground ? "agentBgError" : "agentError",
           sessionId,
@@ -1953,6 +2049,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this.sendBgSessionsUpdate();
         }
         break;
+      }
 
       case "condense_start":
         this.condenseStartTimes.set(sessionId, Date.now());
@@ -1979,6 +2076,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           summary: event.summary,
           durationMs: condenseDurationMs,
           validationWarnings: event.validationWarnings,
+          metadata: event.metadata,
         });
         if (__DEV_BUILD__ && this.cwd) {
           this.writeCondenseDebug(sessionId, event).catch((err) => {
@@ -2079,6 +2177,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         retryUsed: boolean;
         validatorErrors: string[];
         sourceHash: string;
+        providerId: string;
+        condenseModel: string;
+        modelCandidates: string[];
+        selectedModel: string;
+        latestUserMessage: string;
+        currentTask: string;
+        pendingTasks: string[];
+        canonicalUserMessages: string[];
+        requestMessageCount: number;
+        effectiveHistoryMessageCount: number;
+        effectiveHistoryRoles: string[];
       };
     },
   ): Promise<void> {
@@ -2115,11 +2224,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       summaryLines.push(``);
       summaryLines.push(`## Metadata`);
       summaryLines.push(``);
+      summaryLines.push(`- providerId: ${event.metadata.providerId}`);
+      summaryLines.push(`- condenseModel: ${event.metadata.condenseModel}`);
+      summaryLines.push(
+        `- modelCandidates: ${event.metadata.modelCandidates.join(" | ")}`,
+      );
+      summaryLines.push(`- selectedModel: ${event.metadata.selectedModel}`);
       summaryLines.push(
         `- inputMessageCount: ${event.metadata.inputMessageCount}`,
       );
       summaryLines.push(
         `- sourceUserMessageCount: ${event.metadata.sourceUserMessageCount}`,
+      );
+      summaryLines.push(
+        `- requestMessageCount: ${event.metadata.requestMessageCount}`,
+      );
+      summaryLines.push(
+        `- effectiveHistoryMessageCount: ${event.metadata.effectiveHistoryMessageCount}`,
+      );
+      summaryLines.push(
+        `- effectiveHistoryRoles: ${event.metadata.effectiveHistoryRoles.join(" | ")}`,
       );
       summaryLines.push(
         `- hadPriorSummaryInInput: ${event.metadata.hadPriorSummaryInInput}`,
@@ -2130,6 +2254,36 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         summaryLines.push(
           `- validatorErrors: ${event.metadata.validatorErrors.join(" | ")}`,
         );
+      }
+
+      summaryLines.push(``);
+      summaryLines.push(`## Resume Anchor Inputs`);
+      summaryLines.push(``);
+      summaryLines.push(
+        `- latestUserMessage: ${event.metadata.latestUserMessage}`,
+      );
+      summaryLines.push(`- currentTask: ${event.metadata.currentTask}`);
+
+      summaryLines.push(``);
+      summaryLines.push(`### Pending Tasks`);
+      summaryLines.push(``);
+      if (event.metadata.pendingTasks.length > 0) {
+        for (const task of event.metadata.pendingTasks) {
+          summaryLines.push(`- ${task}`);
+        }
+      } else {
+        summaryLines.push(`- None`);
+      }
+
+      summaryLines.push(``);
+      summaryLines.push(`### Canonical User Messages`);
+      summaryLines.push(``);
+      if (event.metadata.canonicalUserMessages.length > 0) {
+        for (const message of event.metadata.canonicalUserMessages) {
+          summaryLines.push(`- ${message}`);
+        }
+      } else {
+        summaryLines.push(`- None`);
       }
     }
     fs.writeFileSync(

@@ -1,5 +1,6 @@
 import { randomUUID } from "crypto";
 import * as fs from "fs/promises";
+import { readFileSync } from "fs";
 import * as path from "path";
 import type { AgentSession } from "./AgentSession.js";
 import type { AgentEvent } from "./types.js";
@@ -51,18 +52,21 @@ function buildErrorMessage(err: unknown): string {
 
 /** Returns true for transient errors that are safe to retry. */
 function isRetryableError(msg: string): boolean {
+  const lower = msg.toLowerCase();
   return (
-    msg.includes("rate_limit") ||
-    msg.includes("overloaded") ||
-    msg.includes("529") ||
-    msg.includes("Connection error") ||
-    msg.includes("ECONNREFUSED") ||
-    msg.includes("ENOTFOUND") ||
-    msg.includes("ETIMEDOUT") ||
-    msg.includes("timed out") ||
-    msg.includes("fetch failed") ||
-    msg.includes("other side closed") ||
-    msg.includes("terminated")
+    lower.includes("rate_limit") ||
+    lower.includes("overloaded") ||
+    lower.includes("529") ||
+    lower.includes("connection error") ||
+    lower.includes("econnrefused") ||
+    lower.includes("enotfound") ||
+    lower.includes("etimedout") ||
+    lower.includes("timed out") ||
+    lower.includes("fetch failed") ||
+    lower.includes("other side closed") ||
+    lower.includes("terminated") ||
+    lower.includes("an error occurred while processing your request") ||
+    lower.includes("please include the request id")
   );
 }
 
@@ -282,17 +286,85 @@ export class AgentEngine {
       while (true) {
         if (signal.aborted) break;
 
+        // Include tools when dispatch context is available, filtered by mode.
+        // Compute this before any condense path so both automatic and retry-triggered
+        // condenses see the same preserved runtime context that future requests will use.
+        const mcpToolDefs = this.toolCtx?.mcpHub?.getToolDefs() ?? [];
+        const rawTools = this.toolCtx
+          ? [
+              ...getAgentTools(
+                session.agentMode,
+                mcpToolDefs,
+                opts?.isBackground,
+                opts?.toolProfile,
+              ),
+              todoTool,
+            ]
+          : undefined;
+        const preservedContext = {
+          toolNames: rawTools?.map((t) => t.name) ?? [],
+          mcpServerNames: [
+            ...new Set(
+              mcpToolDefs
+                .map((t) => {
+                  const sep = t.name.indexOf("__");
+                  return sep === -1 ? "" : t.name.slice(0, sep);
+                })
+                .filter((name) => name.length > 0),
+            ),
+          ],
+        };
+
         // --- Auto-condense check ---
         // Run before each API call (except the very first) to keep context in bounds.
+        const resolveQueuedAttachments = (
+          text: string,
+          attachments?: string[],
+        ) => {
+          if (!attachments?.length) return text;
+          const blocks: string[] = [];
+          for (const filePath of attachments) {
+            try {
+              const absPath = path.isAbsolute(filePath)
+                ? filePath
+                : path.join(session.cwd, filePath);
+              const content = readFileSync(absPath, "utf-8");
+              const ext = path.extname(filePath).slice(1) || "";
+              blocks.push(
+                `<file path="${filePath}">\n\`\`\`${ext}\n${content}\n\`\`\`\n</file>`,
+              );
+            } catch {
+              blocks.push(
+                `<file path="${filePath}">\n[Error: could not read file]\n</file>`,
+              );
+            }
+          }
+          return `${blocks.join("\n\n")}\n\n${text}`;
+        };
+
         if (
           this.isOverCondenseThreshold(session, undefined, provider) &&
           !hasUnansweredUserTurn(session)
         ) {
-          yield* this.condenseSession(session, true, provider);
+          yield* this.condenseSession(
+            session,
+            true,
+            provider,
+            preservedContext,
+          );
           if (signal.aborted) break;
           const interjection = session.consumePendingInterjection();
           if (interjection) {
-            session.addUserMessage(interjection.text);
+            const resolvedInterjectionText = resolveQueuedAttachments(
+              interjection.text,
+              interjection.attachments,
+            );
+            session.addUserMessage(resolvedInterjectionText);
+            session.setPendingMedia(
+              session.messageCount - 1,
+              interjection.images,
+              interjection.documents,
+            );
             yield {
               type: "user_interjection" as const,
               text: interjection.text,
@@ -314,20 +386,6 @@ export class AgentEngine {
         const maxTokens = useThinking
           ? Math.max(session.maxTokens, session.thinkingBudget + 4096)
           : session.maxTokens;
-
-        // Include tools when dispatch context is available, filtered by mode
-        const mcpToolDefs = this.toolCtx?.mcpHub?.getToolDefs() ?? [];
-        const rawTools = this.toolCtx
-          ? [
-              ...getAgentTools(
-                session.agentMode,
-                mcpToolDefs,
-                opts?.isBackground,
-                opts?.toolProfile,
-              ),
-              todoTool,
-            ]
-          : undefined;
 
         // Rebuild with cache_control only when the tool set changes
         const fingerprint = rawTools
@@ -494,7 +552,12 @@ export class AgentEngine {
               message:
                 "Context limit exceeded — condensing conversation and retrying…",
             };
-            yield* this.condenseSession(session, true, provider);
+            yield* this.condenseSession(
+              session,
+              true,
+              provider,
+              preservedContext,
+            );
             if (signal.aborted) break;
             continue;
           }
@@ -744,12 +807,16 @@ export class AgentEngine {
 
         // Yield tool_result events (after history is updated)
         for (const tr of toolResults) {
+          const toolUseBlock = toolUseBlocks.find(
+            (b) => b.id === tr.tool_use_id,
+          );
           yield {
             type: "tool_result" as const,
             toolCallId: tr.tool_use_id,
             toolName: tr.toolName,
             result: tr.result.content,
             durationMs: tr.durationMs,
+            input: toolUseBlock?.input,
           };
         }
 
@@ -762,14 +829,28 @@ export class AgentEngine {
           !signal.aborted &&
           this.isOverCondenseThreshold(session, toolResults, provider)
         ) {
-          yield* this.condenseSession(session, true, provider);
+          yield* this.condenseSession(
+            session,
+            true,
+            provider,
+            preservedContext,
+          );
         }
 
         // Inject any pending user interjection between tool batches
         if (!signal.aborted) {
           const interjection = session.consumePendingInterjection();
           if (interjection) {
-            session.addUserMessage(interjection.text);
+            const resolvedInterjectionText = resolveQueuedAttachments(
+              interjection.text,
+              interjection.attachments,
+            );
+            session.addUserMessage(resolvedInterjectionText);
+            session.setPendingMedia(
+              session.messageCount - 1,
+              interjection.images,
+              interjection.documents,
+            );
             yield {
               type: "user_interjection" as const,
               text: interjection.text,
@@ -785,11 +866,16 @@ export class AgentEngine {
       if (signal.aborted) return;
       // Retryable errors are handled inside the loop with auto-retry.
       // Anything reaching here is non-retryable or exhausted all retries.
-      // Auth errors are marked retryable so the UI can offer a Retry button.
+      // Auth and exhausted transient errors are marked retryable so the UI can
+      // always offer a sensible retry path.
+      const errorMessage = buildErrorMessage(err);
       const isAuth =
-        err instanceof AuthenticationError ||
-        isAuthError(buildErrorMessage(err));
-      yield { type: "error", error: buildErrorMessage(err), retryable: isAuth };
+        err instanceof AuthenticationError || isAuthError(errorMessage);
+      yield {
+        type: "error",
+        error: errorMessage,
+        retryable: isAuth || isRetryableError(errorMessage),
+      };
       return;
     } finally {
       session.status = "idle";
@@ -957,6 +1043,7 @@ export class AgentEngine {
     session: AgentSession,
     isAutomatic: boolean,
     provider?: ModelProvider,
+    preservedContext?: { toolNames: string[]; mcpServerNames?: string[] },
   ): AsyncGenerator<AgentEvent> {
     yield { type: "condense_start", isAutomatic };
 
@@ -974,6 +1061,7 @@ export class AgentEngine {
         isAutomatic,
         filesRead: [...session.filesRead],
         cwd: session.cwd,
+        preservedContext,
       },
       prevInputTokens,
     );

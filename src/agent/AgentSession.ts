@@ -93,6 +93,9 @@ export class AgentSession {
     text: string;
     queueId: string;
     displayText?: string;
+    attachments?: string[];
+    images?: Array<{ name: string; mimeType: string; base64: string }>;
+    documents?: Array<{ name: string; mimeType: string; base64: string }>;
   } | null = null;
 
   /**
@@ -215,10 +218,13 @@ export class AgentSession {
 
   /**
    * Effective history to send to the API.
-   * Filters out messages tagged with condenseParent whose summary still exists.
+   * Filters out messages tagged with condenseParent whose summary still exists,
+   * plus persisted runtime-error notes that are for local context only.
    */
   getMessages(): AgentMessage[] {
-    return injectSyntheticToolResults(getEffectiveHistory(this.messages));
+    return injectSyntheticToolResults(
+      getEffectiveHistory(this.messages).filter((m) => !m.runtimeError),
+    );
   }
 
   get messageCount(): number {
@@ -227,6 +233,21 @@ export class AgentSession {
 
   addUserMessage(text: string): void {
     this.messages.push({ role: "user", content: text } as AgentMessage);
+    this.lastActiveAt = Date.now();
+  }
+
+  appendRuntimeError(message: string, retryable: boolean): void {
+    const last = this.messages[this.messages.length - 1];
+    if (last?.runtimeError?.message === message) {
+      last.runtimeError.retryable = retryable;
+      this.lastActiveAt = Date.now();
+      return;
+    }
+    this.messages.push({
+      role: "assistant",
+      content: [{ type: "text", text: message }],
+      runtimeError: { message, retryable },
+    } as AgentMessage);
     this.lastActiveAt = Date.now();
   }
 
@@ -362,19 +383,47 @@ export class AgentSession {
     text: string,
     queueId: string,
     displayText?: string,
+    attachments?: string[],
+    images?: Array<{ name: string; mimeType: string; base64: string }>,
+    documents?: Array<{ name: string; mimeType: string; base64: string }>,
   ): boolean {
     // Only register the first queued item; subsequent items wait until done
     if (this._pendingInterjection === null) {
-      this._pendingInterjection = { text, queueId, displayText };
+      this._pendingInterjection = {
+        text,
+        queueId,
+        displayText,
+        attachments,
+        images,
+        documents,
+      };
       return true;
     }
     return false;
+  }
+
+  updatePendingInterjection(
+    queueId: string,
+    updates: {
+      text: string;
+      displayText?: string;
+      attachments?: string[];
+      images?: Array<{ name: string; mimeType: string; base64: string }>;
+      documents?: Array<{ name: string; mimeType: string; base64: string }>;
+    },
+  ): boolean {
+    if (this._pendingInterjection?.queueId !== queueId) return false;
+    this._pendingInterjection = { queueId, ...updates };
+    return true;
   }
 
   consumePendingInterjection(): {
     text: string;
     queueId: string;
     displayText?: string;
+    attachments?: string[];
+    images?: Array<{ name: string; mimeType: string; base64: string }>;
+    documents?: Array<{ name: string; mimeType: string; base64: string }>;
   } | null {
     const interjection = this._pendingInterjection;
     this._pendingInterjection = null;
@@ -393,9 +442,14 @@ export class AgentSession {
    * Remove a pending interjection by queueId if it hasn't been consumed yet.
    * Returns the removed interjection, or null if it was already consumed.
    */
-  clearPendingInterjectionIf(
-    queueId: string,
-  ): { text: string; queueId: string; displayText?: string } | null {
+  clearPendingInterjectionIf(queueId: string): {
+    text: string;
+    queueId: string;
+    displayText?: string;
+    attachments?: string[];
+    images?: Array<{ name: string; mimeType: string; base64: string }>;
+    documents?: Array<{ name: string; mimeType: string; base64: string }>;
+  } | null {
     if (this._pendingInterjection?.queueId === queueId) {
       const interjection = this._pendingInterjection;
       this._pendingInterjection = null;

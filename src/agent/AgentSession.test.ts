@@ -166,6 +166,82 @@ describe("AgentSession", () => {
       expect(msgs[0].role).toBe("user");
       expect(msgs[1].role).toBe("assistant");
     });
+
+    it("keeps runtime errors in full history but excludes them from provider history", async () => {
+      const session = await makeSession();
+      session.addUserMessage("user msg");
+      session.appendRuntimeError(
+        "Codex API error: An error occurred while processing your request.",
+        true,
+      );
+
+      expect(session.getAllMessages()).toHaveLength(2);
+      expect(session.getAllMessages()[1]?.runtimeError).toEqual({
+        message:
+          "Codex API error: An error occurred while processing your request.",
+        retryable: true,
+      });
+
+      const msgs = session.getMessages();
+      expect(msgs).toHaveLength(1);
+      expect(msgs[0]).toEqual({ role: "user", content: "user msg" });
+    });
+
+    it("dedupes consecutive identical runtime errors", async () => {
+      const session = await makeSession();
+      session.appendRuntimeError("same error", false);
+      session.appendRuntimeError("same error", true);
+
+      expect(session.getAllMessages()).toHaveLength(1);
+      expect(session.getAllMessages()[0]?.runtimeError).toEqual({
+        message: "same error",
+        retryable: true,
+      });
+    });
+
+    it("injects canonical resume context into provider history after a condense summary", async () => {
+      const session = await makeSession();
+      session.replaceMessages([
+        {
+          role: "user",
+          isSummary: true,
+          condenseId: "condense-1",
+          preservedContext: {
+            toolNames: ["read_file"],
+            mcpServerNames: ["linear"],
+          },
+          content: [
+            {
+              type: "text",
+              text: '<system-reminder>\n## Resume Anchor (deterministic)\n- Latest user message: "Fix issue"\n- Continue from this task: "Fix issue"\n\n## Canonical User Messages (deterministic)\n1. "Fix issue"\n\n## Pending Tasks (deterministic heuristic)\n- Fix issue\n\n## Preserved Runtime Context (reattached outside transcript)\n### Available tool names\n- read_file\n\n### MCP servers with exposed tools\n- linear\n</system-reminder>',
+            },
+            { type: "text", text: "## Conversation Summary\n\nSummary body" },
+          ],
+        },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "Need a bit more context." }],
+        },
+        { role: "user", content: "Continue fixing the issue." },
+      ]);
+
+      const msgs = session.getMessages();
+      expect(msgs).toHaveLength(4);
+      expect(msgs[0]?.isSummary).toBe(true);
+      expect(msgs[1]?.role).toBe("assistant");
+      expect(msgs[2]?.role).toBe("user");
+      expect(msgs[2]?.isResumeContext).toBe(true);
+      expect(Array.isArray(msgs[2]?.content)).toBe(true);
+      const injected = msgs[2]?.content as Array<{
+        type: string;
+        text?: string;
+      }>;
+      expect(injected[0]?.text).toContain("## Resume Anchor (deterministic)");
+      expect(msgs[3]).toEqual({
+        role: "user",
+        content: "Continue fixing the issue.",
+      });
+    });
   });
 
   describe("autoTitle", () => {

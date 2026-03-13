@@ -257,6 +257,45 @@ describe("AgentEngine", () => {
       expect(session.totalCacheReadTokens).toBe(9000);
       expect(session.totalCacheCreationTokens).toBe(1000);
     });
+
+    it("auto-retries Codex processing errors and still marks exhausted failures retryable", async () => {
+      let attempts = 0;
+      const provider = makeMockProvider();
+      provider.stream = async function* () {
+        attempts += 1;
+        yield* [];
+        throw new Error(
+          "Codex API error: An error occurred while processing your request. Please include the request ID req-123 in your message.",
+        );
+      };
+
+      const timerSpy = vi
+        .spyOn(globalThis, "setTimeout")
+        .mockImplementation((fn: TimerHandler) => {
+          if (typeof fn === "function") fn();
+          return 0 as unknown as ReturnType<typeof setTimeout>;
+        });
+
+      try {
+        const session = await makeSession();
+        session.addUserMessage("hello");
+        const engine = new AgentEngine(makeRegistry(provider));
+
+        const events = await collectEvents(engine.run(session));
+        const warnings = events.filter((e) => e.type === "warning");
+        const errorEvent = events.find((e) => e.type === "error");
+
+        expect(attempts).toBe(4);
+        expect(warnings).toHaveLength(3);
+        expect(errorEvent).toBeDefined();
+        expect(errorEvent).toMatchObject({
+          type: "error",
+          retryable: true,
+        });
+      } finally {
+        timerSpy.mockRestore();
+      }
+    });
   });
 
   describe("condenseSession", () => {

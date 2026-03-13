@@ -170,7 +170,7 @@ export class CheckpointManager {
         // Create initial commit as base
         await this.git
           .env(env)
-          .add(".")
+          .add(this.workspaceDir)
           .catch(() => undefined); // ignore errors from unreadable files
 
         const result = await this.git
@@ -221,7 +221,7 @@ export class CheckpointManager {
 
       await this.git
         .env(env)
-        .add(".")
+        .add(this.workspaceDir)
         .catch(() => undefined); // ignore errors (unreadable files, etc.)
 
       const message = `checkpoint-${this.taskId}-turn${turnIndex}`;
@@ -309,7 +309,7 @@ export class CheckpointManager {
       // Stash current state as safety net
       await this.git
         .env(env)
-        .add(".")
+        .add(this.workspaceDir)
         .catch(() => undefined);
 
       try {

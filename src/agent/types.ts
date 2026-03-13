@@ -13,8 +13,17 @@ import type { MessageParam } from "./providers/types.js";
  */
 export type AgentMessage = MessageParam & {
   isSummary?: boolean;
+  isResumeContext?: boolean;
   condenseId?: string;
   condenseParent?: string;
+  preservedContext?: {
+    toolNames: string[];
+    mcpServerNames?: string[];
+  };
+  runtimeError?: {
+    message: string;
+    retryable: boolean;
+  };
 };
 
 // --- Agent Events (emitted by AgentEngine) ---
@@ -36,6 +45,7 @@ export type AgentEvent =
       toolName: string;
       result: ToolResult["content"];
       durationMs: number;
+      input?: unknown;
     }
   | { type: "todo_update"; todos: TodoItem[] }
   | {
@@ -61,6 +71,17 @@ export type AgentEvent =
         retryUsed: boolean;
         validatorErrors: string[];
         sourceHash: string;
+        providerId: string;
+        condenseModel: string;
+        modelCandidates: string[];
+        selectedModel: string;
+        latestUserMessage: string;
+        currentTask: string;
+        pendingTasks: string[];
+        canonicalUserMessages: string[];
+        requestMessageCount: number;
+        effectiveHistoryMessageCount: number;
+        effectiveHistoryRoles: string[];
       };
     }
   | {

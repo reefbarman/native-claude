@@ -237,7 +237,7 @@ export function MessageBubble({
         <ErrorBlock
           error={message.error.message}
           retryable={message.error.retryable}
-          onRetry={message.error.retryable ? onRetry : undefined}
+          onRetry={onRetry}
           onSignIn={onSignIn}
         />
       )}

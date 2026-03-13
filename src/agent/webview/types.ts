@@ -82,6 +82,7 @@ export type ExtensionMessage =
       toolName: string;
       result: string;
       durationMs: number;
+      input?: unknown;
     }
   | {
       type: "agentUserAnnotation";
@@ -291,6 +292,7 @@ export type ExtensionMessage =
       toolName: string;
       result: string;
       durationMs: number;
+      input?: unknown;
     }
   | {
       type: "agentBgApiRequest";

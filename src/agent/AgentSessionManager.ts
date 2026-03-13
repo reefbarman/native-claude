@@ -1,14 +1,15 @@
 import { randomUUID } from "node:crypto";
 import type { AgentConfig, SessionInfo } from "./types.js";
-import { hasPendingTodos, type TodoItem } from "./todoTool.js";
+import { hasPendingTodos, todoTool, type TodoItem } from "./todoTool.js";
 import { AgentSession } from "./AgentSession.js";
 import { AgentEngine } from "./AgentEngine.js";
 import type { AgentEvent } from "./types.js";
 import type { AgentMode } from "./modes.js";
-import type {
-  ToolDispatchContext,
-  BgStatusResult,
-  QuestionResponse,
+import {
+  getAgentTools,
+  type ToolDispatchContext,
+  type BgStatusResult,
+  type QuestionResponse,
 } from "./toolAdapter.js";
 import type { Question } from "./webview/types.js";
 import type { SessionStore, SessionSummary } from "./SessionStore.js";
@@ -55,6 +56,16 @@ export class AgentSessionManager {
   private bgErrors = new Map<string, string>();
   /** Set of bg session IDs that were explicitly cancelled by the user. */
   private bgCancelled = new Set<string>();
+  /** Foreground session that launched each background session. */
+  private bgParents = new Map<
+    string,
+    {
+      sessionId: string;
+      task: string;
+    }
+  >();
+  /** Background sessions already used to auto-resume a foreground session. */
+  private bgAutoResumed = new Set<string>();
   /** Routing metadata per background session. */
   private bgMeta = new Map<
     string,
@@ -192,6 +203,13 @@ export class AgentSessionManager {
 
   getSession(id: string): AgentSession | undefined {
     return this.sessions.get(id);
+  }
+
+  saveSession(id: string): void {
+    const session = this.sessions.get(id);
+    if (session) {
+      this.store?.save(session);
+    }
   }
 
   getForegroundSession(): AgentSession | undefined {
@@ -486,11 +504,33 @@ export class AgentSessionManager {
     if (!session) return;
 
     const engine = this.getEngine();
+    const mcpToolDefs = this.toolCtx?.mcpHub?.getToolDefs() ?? [];
+    const rawTools = this.toolCtx
+      ? [...getAgentTools(session.agentMode, mcpToolDefs, false), todoTool]
+      : undefined;
+    const preservedContext = {
+      toolNames: rawTools?.map((t) => t.name) ?? [],
+      mcpServerNames: [
+        ...new Set(
+          mcpToolDefs
+            .map((t) => {
+              const sep = t.name.indexOf("__");
+              return sep === -1 ? "" : t.name.slice(0, sep);
+            })
+            .filter((name) => name.length > 0),
+        ),
+      ],
+    };
     session.status = "streaming";
     this.onSessionsChanged?.();
 
     try {
-      for await (const event of engine.condenseSession(session, false)) {
+      for await (const event of engine.condenseSession(
+        session,
+        false,
+        undefined,
+        preservedContext,
+      )) {
         this.onEvent?.(session.id, event);
       }
       // Persist after condensing — message history has changed
@@ -965,6 +1005,7 @@ export class AgentSessionManager {
     const fg = this.getForegroundSession();
     const foregroundMode = fg?.mode ?? "code";
     const foregroundModel = fg?.model ?? this.config.model;
+    const parentSessionId = fg?.id;
 
     const route = await resolveBackgroundRoute(providerRegistry, request, {
       mode: foregroundMode,
@@ -1008,6 +1049,12 @@ export class AgentSessionManager {
     // (not briefly "idle"/done).
     session.status = "streaming";
     this.sessions.set(session.id, session);
+    if (parentSessionId) {
+      this.bgParents.set(session.id, {
+        sessionId: parentSessionId,
+        task,
+      });
+    }
     this.bgMeta.set(session.id, {
       resolvedMode: route.resolvedMode,
       resolvedModel: route.resolvedModel,
@@ -1110,9 +1157,14 @@ export class AgentSessionManager {
       }
       this.bgResultWaiters.delete(session.id);
       this.onSessionsChanged?.();
+      void this.resumeParentAfterBackgroundCompletion(session.id, resultText);
 
       // Cleanup stored result after 5 minutes to prevent unbounded memory growth
-      setTimeout(() => this.bgFinalResults.delete(session.id), 5 * 60 * 1000);
+      setTimeout(() => {
+        this.bgFinalResults.delete(session.id);
+        this.bgParents.delete(session.id);
+        this.bgAutoResumed.delete(session.id);
+      }, 5 * 60 * 1000);
     })();
 
     return {
@@ -1220,6 +1272,41 @@ export class AgentSessionManager {
   /** Mark a bg session as completed with a timestamp. */
   markBgCompleted(sessionId: string): void {
     this.bgCompletedAt.set(sessionId, Date.now());
+  }
+
+  private async resumeParentAfterBackgroundCompletion(
+    bgSessionId: string,
+    resultText: string,
+  ): Promise<void> {
+    if (this.bgAutoResumed.has(bgSessionId)) return;
+    const parent = this.bgParents.get(bgSessionId);
+    if (!parent) return;
+
+    const session = this.sessions.get(parent.sessionId);
+    if (!session || session.background) return;
+    if (session.status !== "idle") return;
+    if (this.foregroundId !== session.id) return;
+
+    this.bgAutoResumed.add(bgSessionId);
+    try {
+      await this.sendMessage(
+        session.id,
+        [
+          `The background agent for "${parent.task}" has returned while you were stopped.`,
+          "Resume now: summarize the background result for the user and continue the task if more work is needed.",
+          "",
+          `<background_result task="${parent.task}" sessionId="${bgSessionId}">`,
+          resultText,
+          "</background_result>",
+        ].join("\n"),
+        session.mode,
+      );
+    } catch (err) {
+      this.bgAutoResumed.delete(bgSessionId);
+      this.log?.(
+        `[bg-resume] failed to resume foreground for ${bgSessionId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   /**

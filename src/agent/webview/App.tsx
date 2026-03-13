@@ -65,7 +65,15 @@ interface AppState {
   modes: ModeInfo[];
   availableModels: WebviewModelInfo[];
   slashCommands: SlashCommandInfo[];
-  messageQueue: Array<{ id: string; text: string; fullText?: string }>;
+  messageQueue: Array<{
+    id: string;
+    text: string;
+    fullText?: string;
+    isSlashCommand?: boolean;
+    attachments?: string[];
+    images?: Array<{ name: string; mimeType: string; base64: string }>;
+    documents?: Array<{ name: string; mimeType: string; base64: string }>;
+  }>;
   questionRequest: { id: string; questions: Question[] } | null;
   /** Temporary status override shown in the streaming spinner (e.g. "Refreshing credentials…") */
   statusOverride: string | null;
@@ -103,6 +111,7 @@ type AppAction =
       toolName: string;
       result: string;
       durationMs: number;
+      input?: unknown;
     }
   | { type: "TODO_UPDATE"; todos: TodoItem[] }
   | { type: "ADD_ANNOTATION"; text: string; badge: "follow-up" | "rejection" }
@@ -113,7 +122,16 @@ type AppAction =
   | { type: "SET_MODES"; modes: ModeInfo[] }
   | { type: "SET_MODELS"; models: WebviewModelInfo[] }
   | { type: "SET_SLASH_COMMANDS"; commands: SlashCommandInfo[] }
-  | { type: "ENQUEUE_MESSAGE"; id: string; text: string; fullText?: string }
+  | {
+      type: "ENQUEUE_MESSAGE";
+      id: string;
+      text: string;
+      fullText?: string;
+      isSlashCommand?: boolean;
+      attachments?: string[];
+      images?: Array<{ name: string; mimeType: string; base64: string }>;
+      documents?: Array<{ name: string; mimeType: string; base64: string }>;
+    }
   | { type: "EDIT_QUEUE_MESSAGE"; id: string; text: string }
   | { type: "REMOVE_FROM_QUEUE"; id: string }
   | { type: "CLEAR_QUEUE" }
@@ -163,7 +181,16 @@ type AppAction =
  * Tool-result user messages are filtered out as they're internal plumbing.
  * Condense summary messages are rendered as condense rows.
  */
-function agentMessagesToChatMessages(raw: unknown[]): ChatMessage[] {
+export function agentMessagesToChatMessages(raw: unknown[]): ChatMessage[] {
+  const getSummaryText = (content: unknown): string => {
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return "";
+    return (content as Array<{ type: string; text?: string }>)
+      .filter((b) => b.type === "text")
+      .map((b) => b.text ?? "")
+      .join("");
+  };
+
   // First pass: collect tool results keyed by tool_use_id
   const toolResults = new Map<string, string>();
   for (const msg of raw) {
@@ -192,7 +219,53 @@ function agentMessagesToChatMessages(raw: unknown[]): ChatMessage[] {
   // Second pass: build ChatMessages
   const result: ChatMessage[] = [];
   for (const msg of raw) {
-    const m = msg as { role: string; content: unknown; isSummary?: boolean };
+    const m = msg as {
+      role: string;
+      content: unknown;
+      isSummary?: boolean;
+      runtimeError?: { message: string; retryable: boolean };
+    };
+    if (m.runtimeError?.message) {
+      result.push({
+        id: crypto.randomUUID(),
+        role: "warning",
+        content: "",
+        timestamp: Date.now(),
+        blocks: [],
+        warningMessage: m.runtimeError.message,
+        error: {
+          message: m.runtimeError.message,
+          retryable: m.runtimeError.retryable,
+        },
+      });
+      continue;
+    }
+    if (m.isSummary) {
+      const summaryText = getSummaryText(m.content);
+      result.push({
+        id: crypto.randomUUID(),
+        role: "condense",
+        content: "",
+        timestamp: Date.now(),
+        blocks: [],
+        condenseInfo: {
+          prevInputTokens: 0,
+          newInputTokens: 0,
+          errorMessage: undefined,
+        },
+      });
+      if (summaryText) {
+        result.push({
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: "",
+          timestamp: Date.now(),
+          blocks: [{ type: "text", text: summaryText }],
+        });
+      }
+      continue;
+    }
+
     if (m.role === "user") {
       if (typeof m.content === "string") {
         result.push({
@@ -205,81 +278,45 @@ function agentMessagesToChatMessages(raw: unknown[]): ChatMessage[] {
       }
       // Skip tool_result arrays — they're internal and shouldn't be displayed
     } else if (m.role === "assistant") {
-      if (m.isSummary) {
-        // Condense summary — render as a condense row
-        const summaryText =
-          typeof m.content === "string"
-            ? m.content
-            : Array.isArray(m.content)
-              ? (m.content as Array<{ type: string; text?: string }>)
-                  .filter((b) => b.type === "text")
-                  .map((b) => b.text ?? "")
-                  .join("")
-              : "";
+      const blocks: ContentBlock[] = [];
+      const contentArr = Array.isArray(m.content) ? m.content : [];
+      for (const block of contentArr as Array<{
+        type: string;
+        text?: string;
+        id?: string;
+        name?: string;
+        input?: unknown;
+        thinking?: string;
+      }>) {
+        if (block.type === "text" && block.text) {
+          blocks.push({ type: "text", text: block.text });
+        } else if (block.type === "thinking" && block.thinking) {
+          blocks.push({
+            type: "thinking",
+            id: block.id ?? crypto.randomUUID(),
+            text: block.thinking,
+            complete: true,
+          });
+        } else if (block.type === "tool_use") {
+          const toolId = block.id ?? crypto.randomUUID();
+          blocks.push({
+            type: "tool_call",
+            id: toolId,
+            name: block.name ?? "",
+            inputJson: JSON.stringify(block.input ?? {}),
+            result: toolResults.get(toolId) ?? "",
+            complete: true,
+          });
+        }
+      }
+      if (blocks.length > 0) {
         result.push({
           id: crypto.randomUUID(),
-          role: "condense",
+          role: "assistant",
           content: "",
           timestamp: Date.now(),
-          blocks: [],
-          condenseInfo: {
-            prevInputTokens: 0,
-            newInputTokens: 0,
-            // Show the summary text as a hint
-            errorMessage: undefined,
-          },
+          blocks,
         });
-        // Also add a text message with the summary so it's visible
-        if (summaryText) {
-          result.push({
-            id: crypto.randomUUID(),
-            role: "assistant",
-            content: "",
-            timestamp: Date.now(),
-            blocks: [{ type: "text", text: summaryText }],
-          });
-        }
-      } else {
-        const blocks: ContentBlock[] = [];
-        const contentArr = Array.isArray(m.content) ? m.content : [];
-        for (const block of contentArr as Array<{
-          type: string;
-          text?: string;
-          id?: string;
-          name?: string;
-          input?: unknown;
-          thinking?: string;
-        }>) {
-          if (block.type === "text" && block.text) {
-            blocks.push({ type: "text", text: block.text });
-          } else if (block.type === "thinking" && block.thinking) {
-            blocks.push({
-              type: "thinking",
-              id: block.id ?? crypto.randomUUID(),
-              text: block.thinking,
-              complete: true,
-            });
-          } else if (block.type === "tool_use") {
-            const toolId = block.id ?? crypto.randomUUID();
-            blocks.push({
-              type: "tool_call",
-              id: toolId,
-              name: block.name ?? "",
-              inputJson: JSON.stringify(block.input ?? {}),
-              result: toolResults.get(toolId) ?? "",
-              complete: true,
-            });
-          }
-        }
-        if (blocks.length > 0) {
-          result.push({
-            id: crypto.randomUUID(),
-            role: "assistant",
-            content: "",
-            timestamp: Date.now(),
-            blocks,
-          });
-        }
       }
     }
   }
@@ -322,7 +359,7 @@ function cloneLast(messages: ChatMessage[]): {
   return { msgs, last };
 }
 
-function reducer(state: AppState, action: AppAction): AppState {
+export function reducer(state: AppState, action: AppAction): AppState {
   switch (action.type) {
     case "SET_STATE":
       return {
@@ -508,6 +545,10 @@ function reducer(state: AppState, action: AppAction): AppState {
         b.type === "tool_call" && b.id === action.toolCallId
           ? {
               ...b,
+              inputJson:
+                b.inputJson !== "" || action.input === undefined
+                  ? b.inputJson
+                  : JSON.stringify(action.input),
               result: action.result,
               complete: true,
               durationMs: action.durationMs,
@@ -552,11 +593,42 @@ function reducer(state: AppState, action: AppAction): AppState {
             );
             let task = "Background Agent";
             let message: string | undefined;
+
+            const finalInput =
+              action.input &&
+              typeof action.input === "object" &&
+              !Array.isArray(action.input)
+                ? action.input
+                : null;
+            if (finalInput) {
+              const input = finalInput as { task?: unknown; message?: unknown };
+              if (typeof input.task === "string" && input.task)
+                task = input.task;
+              if (typeof input.message === "string" && input.message) {
+                message = input.message;
+              }
+            }
+
             if (toolBlock && toolBlock.type === "tool_call") {
               try {
-                const input = JSON.parse(toolBlock.inputJson);
-                if (input.task) task = input.task;
-                if (input.message) message = input.message;
+                const input = JSON.parse(toolBlock.inputJson) as {
+                  task?: unknown;
+                  message?: unknown;
+                };
+                if (
+                  task === "Background Agent" &&
+                  typeof input.task === "string" &&
+                  input.task
+                ) {
+                  task = input.task;
+                }
+                if (
+                  !message &&
+                  typeof input.message === "string" &&
+                  input.message
+                ) {
+                  message = input.message;
+                }
               } catch {
                 // ignore parse error
               }
@@ -687,10 +759,22 @@ function reducer(state: AppState, action: AppAction): AppState {
           children: t.children ? stopTodos(t.children) : t.children,
         }));
 
+      // Remove the empty assistant placeholder added after condensing if the
+      // agent ended before producing any content (e.g. manual /condense).
+      const last = doneMessages[doneMessages.length - 1];
+      const secondToLast = doneMessages[doneMessages.length - 2];
+      const finalMessages =
+        last?.role === "assistant" &&
+        last.blocks.length === 0 &&
+        !last.error &&
+        secondToLast?.role === "condense"
+          ? doneMessages.slice(0, -1)
+          : doneMessages;
+
       return {
         ...state,
         streaming: false,
-        messages: doneMessages,
+        messages: finalMessages,
         todos: stopTodos(state.todos),
         statusOverride: null,
       };
@@ -744,6 +828,10 @@ function reducer(state: AppState, action: AppAction): AppState {
             id: action.id,
             text: action.text,
             ...(action.fullText ? { fullText: action.fullText } : {}),
+            ...(action.isSlashCommand ? { isSlashCommand: true } : {}),
+            ...(action.attachments ? { attachments: action.attachments } : {}),
+            ...(action.images ? { images: action.images } : {}),
+            ...(action.documents ? { documents: action.documents } : {}),
           },
         ],
       };
@@ -752,7 +840,13 @@ function reducer(state: AppState, action: AppAction): AppState {
       return {
         ...state,
         messageQueue: state.messageQueue.map((q) =>
-          q.id === action.id ? { ...q, text: action.text } : q,
+          q.id === action.id
+            ? {
+                ...q,
+                text: action.text,
+                fullText: action.text,
+              }
+            : q,
         ),
       };
 
@@ -850,6 +944,16 @@ function reducer(state: AppState, action: AppAction): AppState {
               durationMs: action.durationMs,
               validationWarnings: action.validationWarnings,
             },
+          },
+          // Add an empty assistant placeholder so the streaming dots appear
+          // immediately after condensing while waiting for the next API response.
+          // DONE strips this if the agent ends without producing any content.
+          {
+            id: crypto.randomUUID(),
+            role: "assistant" as const,
+            content: "",
+            timestamp: Date.now(),
+            blocks: [],
           },
         ],
         lastInputTokens: action.newInputTokens,
@@ -998,7 +1102,7 @@ function reducer(state: AppState, action: AppAction): AppState {
   }
 }
 
-const initialState: AppState = {
+export const initialState: AppState = {
   messages: [],
   chatState: {
     sessionId: null,
@@ -1256,6 +1360,7 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
             toolName: msg.toolName,
             result: msg.result,
             durationMs: msg.durationMs,
+            input: msg.input,
           });
           break;
         case "agentUserAnnotation":
@@ -1303,12 +1408,17 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
           dispatch({ type: "CLEAR_QUESTION" });
           const queue = messageQueueRef.current;
           if (queue.length > 0) {
-            // Display text for the chat UI (shows slash command names)
+            // Display text for the chat UI (shows slash command names and media indicators)
             const displayCombined = queue.map((q) => q.text).join("\n\n");
             // Full text for the agent (expanded slash command bodies)
             const sendCombined = queue
               .map((q) => q.fullText ?? q.text)
               .join("\n\n");
+            const attachmentsCombined = queue.flatMap(
+              (q) => q.attachments ?? [],
+            );
+            const imagesCombined = queue.flatMap((q) => q.images ?? []);
+            const documentsCombined = queue.flatMap((q) => q.documents ?? []);
             messageQueueRef.current = [];
             dispatch({ type: "CLEAR_QUEUE" });
             setTimeout(() => {
@@ -1316,12 +1426,19 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
               dispatch({
                 type: "ADD_USER_MESSAGE",
                 text: displayCombined,
-                isSlashCommand: queue.some((q) => q.fullText),
+                isSlashCommand:
+                  queue.length === 1 && Boolean(queue[0].isSlashCommand),
               });
               vscodeApi.postMessage({
                 command: "agentSend",
                 text: sendCombined,
-                attachments: [],
+                attachments:
+                  attachmentsCombined.length > 0
+                    ? attachmentsCombined
+                    : undefined,
+                images: imagesCombined.length > 0 ? imagesCombined : undefined,
+                documents:
+                  documentsCombined.length > 0 ? documentsCombined : undefined,
                 sessionId: stateRef.current.sessionId,
                 mode: stateRef.current.mode,
                 thinkingEnabled: thinkingEnabledRef.current,
@@ -1590,33 +1707,6 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
         kind: "image" | "document";
       }>,
     ) => {
-      // While streaming, enqueue the message instead of sending immediately
-      // (media is not supported for queued messages — only text)
-      if (state.streaming) {
-        const display = displayText ?? text;
-        const queueId = crypto.randomUUID();
-        dispatch({
-          type: "ENQUEUE_MESSAGE",
-          id: queueId,
-          text: display,
-          // When displayText differs from text (e.g. slash commands), preserve
-          // the full expanded text so the queue drain sends the right content.
-          fullText: displayText && displayText !== text ? text : undefined,
-        });
-        // Notify extension about this queued item so it can inject it ASAP
-        // between tool batches. Only the first pending item will be used.
-        const fullTextForQueue =
-          displayText && displayText !== text ? text : undefined;
-        vscodeApi.postMessage({
-          command: "agentQueueMessage",
-          text: fullTextForQueue ?? display,
-          displayText: fullTextForQueue ? display : undefined,
-          queueId,
-          sessionId: stateRef.current.sessionId,
-        });
-        return;
-      }
-
       // Build message text: prepend attached file references
       let fullText = text;
       if (attachments.length > 0) {
@@ -1625,8 +1715,22 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
       }
 
       // Split media into images and documents for the extension
-      const images = media?.filter((m) => m.kind === "image") ?? [];
-      const documents = media?.filter((m) => m.kind === "document") ?? [];
+      const images =
+        media
+          ?.filter((m) => m.kind === "image")
+          .map((m) => ({
+            name: m.name,
+            mimeType: m.mimeType,
+            base64: m.base64,
+          })) ?? [];
+      const documents =
+        media
+          ?.filter((m) => m.kind === "document")
+          .map((m) => ({
+            name: m.name,
+            mimeType: m.mimeType,
+            base64: m.base64,
+          })) ?? [];
 
       // Build display text with media indicators
       let displayWithMedia = displayText ?? fullText;
@@ -1644,6 +1748,37 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
           `[${indicators.join(", ")} attached]\n` + displayWithMedia;
       }
 
+      // While streaming, enqueue the message instead of sending immediately.
+      if (state.streaming) {
+        const queueId = crypto.randomUUID();
+        dispatch({
+          type: "ENQUEUE_MESSAGE",
+          id: queueId,
+          text: displayWithMedia,
+          // Preserve the clean payload text whenever the display form differs
+          // (e.g. slash commands or media indicators) so queue drain sends the
+          // actual agent input rather than UI-only decoration.
+          fullText: displayWithMedia !== fullText ? fullText : undefined,
+          isSlashCommand: displayText !== undefined,
+          attachments: attachments.length > 0 ? attachments : undefined,
+          images: images.length > 0 ? images : undefined,
+          documents: documents.length > 0 ? documents : undefined,
+        });
+        // Notify extension about this queued item so it can inject it ASAP
+        // between tool batches. Only the first pending item will be used.
+        vscodeApi.postMessage({
+          command: "agentQueueMessage",
+          text: fullText,
+          displayText: displayWithMedia,
+          queueId,
+          sessionId: stateRef.current.sessionId,
+          attachments: attachments.length > 0 ? attachments : undefined,
+          images: images.length > 0 ? images : undefined,
+          documents: documents.length > 0 ? documents : undefined,
+        });
+        return;
+      }
+
       // displayText is shown in the chat UI; fullText is sent to the agent
       streamingRef.current = true;
       dispatch({
@@ -1655,22 +1790,8 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
         command: "agentSend",
         text: fullText,
         attachments,
-        images:
-          images.length > 0
-            ? images.map((m) => ({
-                name: m.name,
-                mimeType: m.mimeType,
-                base64: m.base64,
-              }))
-            : undefined,
-        documents:
-          documents.length > 0
-            ? documents.map((m) => ({
-                name: m.name,
-                mimeType: m.mimeType,
-                base64: m.base64,
-              }))
-            : undefined,
+        images: images.length > 0 ? images : undefined,
+        documents: documents.length > 0 ? documents : undefined,
         sessionId: stateRef.current.sessionId,
         mode: stateRef.current.mode,
         thinkingEnabled: thinkingEnabledRef.current,
@@ -2161,6 +2282,16 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
                             id: item.id,
                             text: trimmed,
                           });
+                          vscodeApi.postMessage({
+                            command: "agentUpdateQueuedMessage",
+                            sessionId: stateRef.current.sessionId,
+                            queueId: item.id,
+                            text: trimmed,
+                            displayText: trimmed,
+                            attachments: item.attachments,
+                            images: item.images,
+                            documents: item.documents,
+                          });
                         }
                         setEditingQueueId(null);
                       } else if (e.key === "Escape") {
@@ -2201,9 +2332,35 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
                   <button
                     class="icon-button queue-item-remove"
                     title="Remove"
-                    onClick={() =>
-                      dispatch({ type: "REMOVE_FROM_QUEUE", id: item.id })
-                    }
+                    onClick={() => {
+                      dispatch({ type: "REMOVE_FROM_QUEUE", id: item.id });
+                      const wasHead =
+                        messageQueueRef.current[0]?.id === item.id;
+                      const nextQueue = messageQueueRef.current.filter(
+                        (q) => q.id !== item.id,
+                      );
+                      messageQueueRef.current = nextQueue;
+                      if (wasHead) {
+                        vscodeApi.postMessage({
+                          command: "agentRemoveQueuedMessage",
+                          sessionId: stateRef.current.sessionId,
+                          queueId: item.id,
+                        });
+                        const nextHead = nextQueue[0];
+                        if (nextHead) {
+                          vscodeApi.postMessage({
+                            command: "agentQueueMessage",
+                            text: nextHead.fullText ?? nextHead.text,
+                            displayText: nextHead.text,
+                            queueId: nextHead.id,
+                            sessionId: stateRef.current.sessionId,
+                            attachments: nextHead.attachments,
+                            images: nextHead.images,
+                            documents: nextHead.documents,
+                          });
+                        }
+                      }
+                    }}
                   >
                     <i class="codicon codicon-close" />
                   </button>

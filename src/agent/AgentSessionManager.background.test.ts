@@ -32,10 +32,14 @@ const mocks = vi.hoisted(() => {
         totalCacheReadTokens: 0,
         totalCacheCreationTokens: 0,
         addUserMessage: vi.fn(),
+        appendRuntimeError: vi.fn(),
+        consumePendingInterjection: vi.fn(() => null),
+        setPendingMedia: vi.fn(),
+        autoTitle: vi.fn(),
+        getAllMessages: vi.fn(() => []),
         abort: vi.fn(),
         getLastAssistantText: vi.fn(() => "background result"),
         getFullAssistantTranscript: vi.fn(() => "background transcript"),
-        getAllMessages: vi.fn(() => []),
       };
     }),
   };
@@ -203,5 +207,90 @@ describe("AgentSessionManager background agents", () => {
 
     const result = mgr.killBackground("nonexistent");
     expect(result.killed).toBe(false);
+  });
+
+  it("resumes the foreground session when a background result returns after it stopped", async () => {
+    mocks.runBehavior
+      .mockReturnValueOnce(
+        (async function* () {
+          yield { type: "done" };
+        })(),
+      )
+      .mockReturnValueOnce(
+        (async function* () {
+          yield { type: "done" };
+        })(),
+      );
+
+    const mgr = new AgentSessionManager(config, "/tmp");
+    mgr.setToolContext(toolCtx);
+
+    const fg = await mgr.createSession("code");
+    const sendMessageSpy = vi.spyOn(mgr, "sendMessage");
+
+    const result = await mgr.spawnBackground({
+      task: "inspect failing tests",
+      message: "run the investigation",
+    });
+
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(sendMessageSpy).toHaveBeenCalledWith(
+      fg.id,
+      expect.stringContaining(
+        `The background agent for "inspect failing tests" has returned while you were stopped.`,
+      ),
+      fg.mode,
+    );
+    expect(sendMessageSpy).toHaveBeenCalledWith(
+      fg.id,
+      expect.stringContaining(
+        `<background_result task="inspect failing tests" sessionId="${result.sessionId}">`,
+      ),
+      fg.mode,
+    );
+  });
+
+  it("does not resume the foreground session if it is still running", async () => {
+    let releaseForeground: (() => void) | undefined;
+    mocks.runBehavior
+      .mockReturnValueOnce(
+        (async function* () {
+          await new Promise<void>((resolve) => {
+            releaseForeground = resolve;
+          });
+          yield { type: "done" };
+        })(),
+      )
+      .mockReturnValueOnce(
+        (async function* () {
+          yield { type: "done" };
+        })(),
+      );
+
+    const mgr = new AgentSessionManager(config, "/tmp");
+    mgr.setToolContext(toolCtx);
+
+    const fg = await mgr.createSession("code");
+    const sendPromise = mgr.sendMessage(fg.id, "keep working", fg.mode);
+    await new Promise((r) => setTimeout(r, 0));
+
+    const sendMessageSpy = vi.spyOn(mgr, "sendMessage");
+
+    await mgr.spawnBackground({
+      task: "inspect failing tests",
+      message: "run the investigation",
+    });
+
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(sendMessageSpy).not.toHaveBeenCalledWith(
+      fg.id,
+      expect.stringContaining("The background agent for"),
+      fg.mode,
+    );
+
+    releaseForeground?.();
+    await sendPromise;
   });
 });

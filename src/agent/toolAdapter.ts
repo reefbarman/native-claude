@@ -353,6 +353,11 @@ const BG_AGENT_TOOLS: ToolDefinition[] = [
           description:
             "Task class used for routing policy (e.g. review_code, review_plan, research, debug)",
         },
+        modelTier: {
+          type: "string",
+          description:
+            'Optional routing tier override ("cheap", "balanced", or "deep_reasoning"). For review tasks, omit this to let the router infer complexity from the request.',
+        },
       },
       required: ["task", "message"],
     },
@@ -1026,6 +1031,16 @@ export async function dispatchToolCall(
         taskClass:
           params.taskClass !== undefined && params.taskClass !== null
             ? String(params.taskClass)
+            : undefined,
+        modelTier:
+          params.modelTier !== undefined && params.modelTier !== null
+            ? String(params.modelTier) === "cheap" ||
+              String(params.modelTier) === "balanced" ||
+              String(params.modelTier) === "deep_reasoning"
+              ? (String(
+                  params.modelTier,
+                ) as SpawnBackgroundRequest["modelTier"])
+              : undefined
             : undefined,
       });
       return {

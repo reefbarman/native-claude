@@ -150,7 +150,15 @@ export function ChatView({
           msg.role === "condense" ? (
             <CondenseRow key={msg.id} message={msg} />
           ) : msg.role === "warning" ? (
-            <WarningRow key={msg.id} message={msg} />
+            <WarningRow
+              key={msg.id}
+              message={msg}
+              onRetry={
+                msg === messages[messages.length - 1] && msg.error
+                  ? onRetry
+                  : undefined
+              }
+            />
           ) : (
             <>
               {msg.role === "user" &&
@@ -175,7 +183,7 @@ export function ChatView({
                 onOpenFile={onOpenFile}
                 onOpenMermaidPanel={onOpenMermaidPanel}
                 onRetry={
-                  msg === messages[messages.length - 1] && msg.error?.retryable
+                  msg === messages[messages.length - 1] && msg.error
                     ? onRetry
                     : undefined
                 }
