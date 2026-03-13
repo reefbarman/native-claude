@@ -31,6 +31,7 @@ import {
   installHooks,
 } from "./setup.js";
 import { setSecretStorage } from "./services/semanticSearch.js";
+import { setStoredAnthropicApiKey } from "./agent/clientFactory.js";
 import { IndexerManager } from "./indexer/IndexerManager.js";
 import { ChatViewProvider } from "./agent/ChatViewProvider.js";
 import { AgentSessionManager } from "./agent/AgentSessionManager.js";
@@ -443,6 +444,11 @@ export function activate(context: vscode.ExtensionContext): void {
   // Initialize secret storage for secure API key access
   setSecretStorage(context.secrets);
 
+  // Load stored Anthropic API key into memory so createAnthropicClient can use it synchronously.
+  void context.secrets.get("anthropicApiKey").then((key) => {
+    setStoredAnthropicApiKey(key || undefined);
+  });
+
   log("Activating AgentLink extension");
 
   // Config store for disk-based approval rules
@@ -515,19 +521,6 @@ export function activate(context: vscode.ExtensionContext): void {
     autoCondenseThreshold: getConfig<number>("autoCondenseThreshold") ?? 0.9,
   };
 
-  // Register the Anthropic provider with the global registry.
-  // The API key is resolved lazily inside AnthropicProvider (env, config, CLI credentials).
-  providerRegistry.register(new AnthropicProvider(undefined, log));
-
-  // Register the Codex provider (OAuth-based, ChatGPT Plus/Pro subscription).
-  codexOAuthManager.initialize(context);
-  providerRegistry.register(new CodexProvider(codexOAuthManager, log));
-
-  // Re-send model list to webview when Codex auth state changes (sign-in/out).
-  codexOAuthManager.onAuthStateChanged = () => {
-    chatViewProvider.refreshModels();
-  };
-
   const workspaceCwd =
     vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
   const isDevMode = context.extensionMode === vscode.ExtensionMode.Development;
@@ -535,6 +528,20 @@ export function activate(context: vscode.ExtensionContext): void {
     context.extensionUri,
     context.globalState,
   );
+
+  // Register providers after chatViewProvider is created so all auth logs
+  // (including initial client construction) go to the agent output channel.
+  const agentLog = (msg: string) => chatViewProvider.log(msg);
+  providerRegistry.register(new AnthropicProvider(undefined, agentLog));
+
+  // Register the Codex provider (OAuth-based, ChatGPT Plus/Pro subscription).
+  codexOAuthManager.initialize(context);
+  providerRegistry.register(new CodexProvider(codexOAuthManager, agentLog));
+
+  // Re-send model list to webview when Codex auth state changes (sign-in/out).
+  codexOAuthManager.onAuthStateChanged = () => {
+    chatViewProvider.refreshModels();
+  };
   const sessionStore = new SessionStore(workspaceCwd);
   agentSessionManager = new AgentSessionManager(
     agentConfig,
@@ -667,6 +674,26 @@ export function activate(context: vscode.ExtensionContext): void {
       await context.secrets.store("openaiApiKey", key.trim());
       vscode.window.showInformationMessage("OpenAI API key stored securely.");
     }),
+    vscode.commands.registerCommand(
+      "agentlink.setAnthropicApiKey",
+      async () => {
+        const key = await vscode.window.showInputBox({
+          title: "Anthropic API Key",
+          prompt:
+            "Get your API key at https://platform.claude.com/settings/keys — or set ANTHROPIC_API_KEY as an environment variable instead",
+          password: true,
+          ignoreFocusOut: true,
+          validateInput: (v) => (v.trim() ? null : "API key cannot be empty"),
+        });
+        if (!key) return;
+        await context.secrets.store("anthropicApiKey", key.trim());
+        setStoredAnthropicApiKey(key.trim());
+        chatViewProvider.refreshModels();
+        vscode.window.showInformationMessage(
+          "Anthropic API key stored securely.",
+        );
+      },
+    ),
     vscode.commands.registerCommand("agentlink.configureAgents", () =>
       showAgentPickerInSidebar(),
     ),

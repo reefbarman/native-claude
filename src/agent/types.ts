@@ -88,7 +88,12 @@ export type AgentEvent =
       totalCacheReadTokens: number;
       totalCacheCreationTokens: number;
     }
-  | { type: "user_interjection"; text: string; queueId: string };
+  | {
+      type: "user_interjection";
+      text: string;
+      queueId: string;
+      displayText?: string;
+    };
 
 // --- Session types ---
 

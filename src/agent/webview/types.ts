@@ -220,6 +220,8 @@ export type ExtensionMessage =
       type: "agentSessionList";
       sessions: SessionSummary[];
     }
+  | { type: "agentRestoreSessionStart" }
+  | { type: "agentRestoreSessionDone" }
   | {
       type: "agentSessionLoaded";
       sessionId: string;
@@ -228,6 +230,8 @@ export type ExtensionMessage =
       messages: unknown[];
       lastInputTokens: number;
       lastOutputTokens: number;
+      /** True when this came from automatic startup restore rather than explicit user action. */
+      restored?: boolean;
       /** turnIndex → checkpointId mapping for restored sessions */
       checkpoints?: Array<{ turnIndex: number; checkpointId: string }>;
     }
@@ -236,6 +240,8 @@ export type ExtensionMessage =
       sessionId: string;
       text: string;
       queueId: string;
+      /** Display text for the chat bubble (e.g. "/pr") when text is the expanded body */
+      displayText?: string;
     }
   | {
       type: "agentBgSessionsUpdate";

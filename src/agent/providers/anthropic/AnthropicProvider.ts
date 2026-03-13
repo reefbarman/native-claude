@@ -10,6 +10,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { randomUUID } from "crypto";
 import {
   createAnthropicClient,
+  hasAnthropicApiKey,
   refreshClaudeCredentials,
   type AuthSource,
 } from "../../clientFactory.js";
@@ -46,22 +47,19 @@ export class AnthropicProvider implements ModelProvider {
   readonly displayName = "Anthropic";
   readonly condenseModel = ANTHROPIC_CONDENSE_MODEL;
 
-  private client: Anthropic;
-  private authSource: AuthSource;
+  private client: Anthropic | null = null;
+  private authSource: AuthSource = "none";
   private apiKey?: string;
   private log?: (msg: string) => void;
 
   constructor(apiKey?: string, log?: (msg: string) => void) {
-    const result = createAnthropicClient(apiKey, log);
-    this.client = result.client;
-    this.authSource = result.authSource;
     this.apiKey = apiKey;
     this.log = log;
+    this.tryInitializeClient();
   }
 
   async isAuthenticated(): Promise<boolean> {
-    // If we have a client at all, credentials were found at construction time.
-    return true;
+    return hasAnthropicApiKey();
   }
 
   getCapabilities(model: string): ModelCapabilities {
@@ -88,10 +86,11 @@ export class AnthropicProvider implements ModelProvider {
    * Attempt to refresh CLI credentials (runs `claude -p` to force the SDK
    * to refresh the OAuth token), then re-create the Anthropic client.
    * Returns true if the client was successfully refreshed.
+   * Pass an AbortSignal to cancel if the user stops the session.
    */
-  refreshClient(): boolean {
+  async refreshClient(signal?: AbortSignal): Promise<boolean> {
     if (this.authSource !== "cli-credentials") return false;
-    const refreshed = refreshClaudeCredentials(this.log);
+    const refreshed = await refreshClaudeCredentials(this.log, signal);
     if (!refreshed) return false;
     try {
       const result = createAnthropicClient(this.apiKey, this.log);
@@ -108,6 +107,7 @@ export class AnthropicProvider implements ModelProvider {
   }
 
   async *stream(request: StreamRequest): AsyncGenerator<ProviderStreamEvent> {
+    const client = this.getClient();
     const {
       model,
       systemPrompt,
@@ -177,7 +177,7 @@ export class AnthropicProvider implements ModelProvider {
     let cacheReadTokens = 0;
     let cacheCreationTokens = 0;
 
-    const stream = this.client.messages.stream(requestParams, { signal });
+    const stream = client.messages.stream(requestParams, { signal });
 
     for await (const event of stream) {
       switch (event.type) {
@@ -322,9 +322,10 @@ export class AnthropicProvider implements ModelProvider {
   }
 
   async complete(request: CompleteRequest): Promise<CompleteResult> {
+    const client = this.getClient();
     const { model, systemPrompt, messages, maxTokens, temperature } = request;
 
-    const response = await this.client.messages.create({
+    const response = await client.messages.create({
       model,
       max_tokens: maxTokens,
       ...(temperature !== undefined ? { temperature } : {}),
@@ -356,6 +357,30 @@ export class AnthropicProvider implements ModelProvider {
       provider: this.id,
       capabilities: this.getCapabilities(id),
     };
+  }
+
+  private tryInitializeClient(): void {
+    try {
+      const result = createAnthropicClient(this.apiKey, this.log);
+      this.client = result.client;
+      this.authSource = result.authSource;
+    } catch (err) {
+      this.client = null;
+      this.authSource = "none";
+      this.log?.(
+        `[auth] Anthropic client unavailable at startup: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  private getClient(): Anthropic {
+    if (this.client) return this.client;
+    const result = createAnthropicClient(this.apiKey, this.log);
+    this.client = result.client;
+    this.authSource = result.authSource;
+    return result.client;
   }
 }
 

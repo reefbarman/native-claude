@@ -59,6 +59,7 @@ function isRetryableError(msg: string): boolean {
     msg.includes("ECONNREFUSED") ||
     msg.includes("ENOTFOUND") ||
     msg.includes("ETIMEDOUT") ||
+    msg.includes("timed out") ||
     msg.includes("fetch failed") ||
     msg.includes("other side closed") ||
     msg.includes("terminated")
@@ -276,6 +277,8 @@ export class AgentEngine {
 
     try {
       let retryCount = 0;
+      let credentialRefreshCount = 0;
+      const MAX_CREDENTIAL_REFRESHES = 3;
       while (true) {
         if (signal.aborted) break;
 
@@ -294,6 +297,7 @@ export class AgentEngine {
               type: "user_interjection" as const,
               text: interjection.text,
               queueId: interjection.queueId,
+              displayText: interjection.displayText,
             };
           }
         }
@@ -499,16 +503,22 @@ export class AgentEngine {
           if (isAuthError(streamErrMsg)) {
             const anthropicProvider =
               provider instanceof AnthropicProvider ? provider : null;
-            if (anthropicProvider?.currentAuthSource === "cli-credentials") {
+            if (
+              !signal.aborted &&
+              credentialRefreshCount < MAX_CREDENTIAL_REFRESHES &&
+              anthropicProvider?.currentAuthSource === "cli-credentials"
+            ) {
+              credentialRefreshCount++;
               yield {
                 type: "status_update",
-                message: "Refreshing credentials…",
+                message: `Refreshing credentials… (attempt ${credentialRefreshCount}/${MAX_CREDENTIAL_REFRESHES} — ${streamErrMsg})`,
               };
-              if (anthropicProvider.refreshClient()) {
+              if (await anthropicProvider.refreshClient(signal)) {
                 yield {
                   type: "status_update",
                   message: "Credentials refreshed — retrying…",
                 };
+                if (signal.aborted) break;
                 continue;
               }
             }
@@ -764,6 +774,7 @@ export class AgentEngine {
               type: "user_interjection" as const,
               text: interjection.text,
               queueId: interjection.queueId,
+              displayText: interjection.displayText,
             };
           }
         }

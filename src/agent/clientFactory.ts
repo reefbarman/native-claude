@@ -2,14 +2,37 @@ import Anthropic from "@anthropic-ai/sdk";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import { execFileSync } from "child_process";
+import { execFile } from "child_process";
+import { promisify } from "util";
+
+const execFileAsync = promisify(execFile);
 
 /** Which credential source the client was created from. */
 export type AuthSource =
   | "explicit"
   | "env-api-key"
   | "env-oauth-token"
-  | "cli-credentials";
+  | "cli-credentials"
+  | "none";
+
+/**
+ * In-memory cache of an Anthropic API key loaded from VS Code secret storage.
+ * Set at extension activation and updated whenever the user stores a new key.
+ */
+let storedAnthropicApiKey: string | undefined;
+
+export function setStoredAnthropicApiKey(key: string | undefined): void {
+  storedAnthropicApiKey = key;
+}
+
+/** Returns true if any Anthropic API key source is available. */
+export function hasAnthropicApiKey(): boolean {
+  return !!(
+    storedAnthropicApiKey ||
+    process.env.ANTHROPIC_API_KEY ||
+    process.env.CLAUDE_CODE_OAUTH_TOKEN
+  );
+}
 
 export function readClaudeCliCredentials(): string | undefined {
   try {
@@ -31,8 +54,12 @@ export function readClaudeCliCredentials(): string | undefined {
  * print-mode query (`claude -p "hi"`), which boots the SDK and triggers
  * the refresh flow.  Then verify via `claude auth status`.
  * Returns true if the credentials were successfully refreshed.
+ * Pass an AbortSignal to cancel the subprocess if the user stops the session.
  */
-export function refreshClaudeCredentials(log?: (msg: string) => void): boolean {
+export async function refreshClaudeCredentials(
+  log?: (msg: string) => void,
+  signal?: AbortSignal,
+): Promise<boolean> {
   const logLine = log ?? console.log;
   const tokenBefore = readClaudeCliCredentials();
 
@@ -41,14 +68,15 @@ export function refreshClaudeCredentials(log?: (msg: string) => void): boolean {
   // `claude auth status` does NOT trigger a refresh — it only reads state.
   try {
     logLine("[auth] running `claude -p` to trigger OAuth token refresh...");
-    execFileSync("claude", ["-p", "hi", "--max-turns", "1"], {
+    await execFileAsync("claude", ["-p", "hi", "--max-turns", "1"], {
       encoding: "utf-8",
       timeout: 30_000,
       env: { ...process.env, FORCE_COLOR: "0" },
-      stdio: ["pipe", "pipe", "pipe"],
+      signal,
     });
     logLine("[auth] claude -p completed successfully");
   } catch (err) {
+    if (signal?.aborted) return false;
     // The -p call itself may fail (e.g. expired token couldn't be refreshed,
     // network error, or --max-turns not supported on older CLI versions).
     // The token might still have been refreshed before the failure, so
@@ -56,20 +84,24 @@ export function refreshClaudeCredentials(log?: (msg: string) => void): boolean {
     logLine(`[auth] claude -p failed (may still have refreshed): ${err}`);
   }
 
+  if (signal?.aborted) return false;
+
   // Step 2: Verify via `claude auth status` that we're logged in.
   try {
-    const output = execFileSync("claude", ["auth", "status"], {
+    const { stdout } = await execFileAsync("claude", ["auth", "status"], {
       encoding: "utf-8",
       timeout: 15_000,
       env: { ...process.env, FORCE_COLOR: "0" },
+      signal,
     });
-    logLine(`[auth] auth status: ${output.trim()}`);
-    const parsed = JSON.parse(output.trim());
+    logLine(`[auth] auth status: ${stdout.trim()}`);
+    const parsed = JSON.parse(stdout.trim());
     if (parsed.loggedIn !== true) {
       logLine("[auth] credential refresh failed — not logged in");
       return false;
     }
   } catch (err) {
+    if (signal?.aborted) return false;
     logLine(`[auth] auth status check failed: ${err}`);
     return false;
   }
@@ -90,9 +122,9 @@ export function refreshClaudeCredentials(log?: (msg: string) => void): boolean {
  *
  * Resolution order:
  *   1. explicitApiKey parameter → x-api-key, api.anthropic.com
- *   2. ANTHROPIC_API_KEY env var → x-api-key, api.anthropic.com
- *   3. CLAUDE_CODE_OAUTH_TOKEN env var → Bearer, api.claude.ai
- *   4. ~/.claude/.credentials.json claudeAiOauth → Bearer, api.claude.ai
+ *   2. storedAnthropicApiKey (VS Code secret storage) → x-api-key, api.anthropic.com
+ *   3. ANTHROPIC_API_KEY env var → x-api-key, api.anthropic.com
+ *   4. CLAUDE_CODE_OAUTH_TOKEN env var → Bearer, api.anthropic.com
  *
  * Throws if no credential is found.
  */
@@ -107,6 +139,14 @@ export function createAnthropicClient(
     return {
       client: new Anthropic({ apiKey: explicitApiKey }),
       authSource: "explicit",
+    };
+  }
+
+  if (storedAnthropicApiKey) {
+    logLine("[auth] using stored API key from secret storage");
+    return {
+      client: new Anthropic({ apiKey: storedAnthropicApiKey }),
+      authSource: "env-api-key",
     };
   }
 
@@ -128,16 +168,20 @@ export function createAnthropicClient(
     };
   }
 
-  const credToken = readClaudeCliCredentials();
-  if (credToken) {
-    logLine("[auth] using ~/.claude/.credentials.json (apiKey)");
-    return {
-      client: new Anthropic({ apiKey: credToken }),
-      authSource: "cli-credentials",
-    };
-  }
+  // NOTE: Claude CLI credentials (~/.claude/.credentials.json) were previously
+  // used here as a fallback. Left commented out in case direct OAuth support is
+  // re-enabled in a future Claude update.
+  //
+  // const credToken = readClaudeCliCredentials();
+  // if (credToken) {
+  //   logLine("[auth] using ~/.claude/.credentials.json (apiKey)");
+  //   return {
+  //     client: new Anthropic({ apiKey: credToken }),
+  //     authSource: "cli-credentials",
+  //   };
+  // }
 
   throw new Error(
-    "No Anthropic API key found. Set ANTHROPIC_API_KEY, run `claude login`, or configure a key in settings.",
+    "No Anthropic API key found. Set ANTHROPIC_API_KEY, or enter a key via the model picker.",
   );
 }

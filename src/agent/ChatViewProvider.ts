@@ -208,6 +208,8 @@ export type ExtensionToWebview =
       type: "agentSessionList";
       sessions: import("./SessionStore.js").SessionSummary[];
     }
+  | { type: "agentRestoreSessionStart" }
+  | { type: "agentRestoreSessionDone" }
   | {
       type: "agentSessionLoaded";
       sessionId: string;
@@ -216,6 +218,8 @@ export type ExtensionToWebview =
       messages: import("./types.js").AgentMessage[];
       lastInputTokens: number;
       lastOutputTokens: number;
+      /** True when this came from automatic startup restore rather than explicit user action. */
+      restored?: boolean;
       /** turnIndex → checkpointId mapping for restored sessions */
       checkpoints?: Array<{ turnIndex: number; checkpointId: string }>;
     }
@@ -284,6 +288,7 @@ export type ExtensionToWebview =
       sessionId: string;
       text: string;
       queueId: string;
+      displayText?: string;
     }
   | {
       type: "agentDebugInfo";
@@ -885,7 +890,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.postMessage({ type: "agentSessionList", sessions });
   }
 
-  private log(message: string): void {
+  log(message: string): void {
     const timestamp = new Date().toISOString();
     this.outputChannel.appendLine(`[${timestamp}] ${message}`);
   }
@@ -1064,6 +1069,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.pendingMessages = [];
         // Restore last session if there is no foreground session yet
         if (!this.sessionManager?.getForegroundSession()) {
+          this.postMessage({ type: "agentRestoreSessionStart" });
           this.sessionManager
             ?.restoreLastSession()
             .then((session) => {
@@ -1079,13 +1085,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                   // context bar display. We don't persist this value, so send 0 for
                   // loaded sessions to avoid displaying stale cumulative totals.
                   lastOutputTokens: 0,
+                  restored: true,
                   checkpoints: this.getSessionCheckpoints(session.id),
                 });
               }
+              this.postMessage({ type: "agentRestoreSessionDone" });
               this.sendInitialState();
               void this.sendDebugInfo();
             })
             .catch(() => {
+              this.postMessage({ type: "agentRestoreSessionDone" });
               this.sendInitialState();
               void this.sendDebugInfo();
             });
@@ -1688,9 +1697,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const sessionId = msg.sessionId as string;
         const text = msg.text as string;
         const queueId = msg.queueId as string;
+        const displayText = msg.displayText as string | undefined;
         if (sessionId && text && queueId && this.sessionManager) {
           const session = this.sessionManager.getSession(sessionId);
-          session?.setPendingInterjection(text, queueId);
+          session?.setPendingInterjection(text, queueId, displayText);
         }
         break;
       }
@@ -1698,6 +1708,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "agentCodexSignIn": {
         // Trigger Codex sign-in from the webview (e.g. model picker "Sign in" row)
         vscode.commands.executeCommand("agentlink.codexSignIn");
+        break;
+      }
+
+      case "agentAnthropicSignIn": {
+        // Trigger Anthropic API key entry from the webview model picker
+        vscode.commands.executeCommand("agentlink.setAnthropicApiKey");
         break;
       }
 
@@ -2008,6 +2024,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             sessionId,
             text: event.text,
             queueId: event.queueId,
+            displayText: event.displayText,
           });
         }
         break;

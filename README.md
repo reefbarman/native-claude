@@ -98,7 +98,7 @@ AgentLink auto-configures `~/.claude.json` with per-project MCP entries.
 
 **Instructions:** Click **Set Up Instructions** during onboarding (or run `AgentLink: Set Up Instructions` from the command palette) to inject AgentLink tool usage instructions into `~/.claude/CLAUDE.md`. This uses boundary markers (`<!-- BEGIN agentlink -->` / `<!-- END agentlink -->`) so it can be safely re-run without duplicating content.
 
-**Hooks:** Click **Install Hooks** during onboarding (or run `AgentLink: Install Hooks`) to install a [PreToolUse hook](https://docs.anthropic.com/en/docs/claude-code/hooks) that blocks built-in tools (`Read`, `Edit`, `Write`, `Bash`, `Glob`, `Grep`) and forces Claude to use AgentLink equivalents. The hook script is installed to `~/.claude/hooks/` and configured in `~/.claude/settings.json`.
+**Hooks:** Click **Install Hooks** during onboarding (or run `AgentLink: Install Hooks`) to install a [PreToolUse hook](https://docs.anthropic.com/en/docs/claude-code/hooks) that blocks built-in tools (`Read`, `Edit`, `Write`, `Bash`, `Glob`, `Grep`) and forces Claude to use AgentLink equivalents. The hook script is installed to `~/.claude/hooks/` and configured in `~/.claude/settings.json`. For Claude Code CLI sessions, enforcement is skipped when `CLAUDE_CODE_ENTRYPOINT` is unset or set to `cli`.
 
 > **macOS/Linux:** Hooks require `jq` — install with `brew install jq`, `apt install jq`, etc.
 > **Windows:** A PowerShell script is installed automatically (no extra dependencies).
@@ -669,7 +669,7 @@ Each VS Code window runs its own independent MCP server on its own port. The ext
 
 All core features work on Windows: diff views, integrated terminal, diagnostics, language server tools, file operations, and the approval system.
 
-**Hooks:** The PreToolUse enforcement hook installs a PowerShell script (`.ps1`) on Windows instead of the bash (`.sh`) script used on macOS/Linux. This is handled automatically — just click **Install Hooks** as usual. The PowerShell script has the same logic: it blocks built-in tools and forces agents to use AgentLink equivalents.
+**Hooks:** The PreToolUse enforcement hook installs a PowerShell script (`.ps1`) on Windows instead of the bash (`.sh`) script used on macOS/Linux. This is handled automatically — just click **Install Hooks** as usual. The PowerShell script has the same logic: it blocks built-in tools and forces agents to use AgentLink equivalents, except Claude Code CLI sessions where enforcement is skipped when `CLAUDE_CODE_ENTRYPOINT` is unset or `cli`.
 
 **Building from source:** `npm install && npm run build` works on all platforms. The release script (`npm run release`) requires bash — use Git Bash, WSL, or macOS/Linux.
 

@@ -69,6 +69,7 @@ interface AppState {
   questionRequest: { id: string; questions: Question[] } | null;
   /** Temporary status override shown in the streaming spinner (e.g. "Refreshing credentials…") */
   statusOverride: string | null;
+  restoringSession: boolean;
 }
 
 type AppAction =
@@ -116,7 +117,7 @@ type AppAction =
   | { type: "EDIT_QUEUE_MESSAGE"; id: string; text: string }
   | { type: "REMOVE_FROM_QUEUE"; id: string }
   | { type: "CLEAR_QUEUE" }
-  | { type: "ADD_INTERJECTION"; text: string }
+  | { type: "ADD_INTERJECTION"; text: string; isSlashCommand?: boolean }
   | { type: "SET_QUESTION"; id: string; questions: Question[] }
   | { type: "CLEAR_QUESTION" }
   | {
@@ -129,6 +130,7 @@ type AppAction =
   | { type: "ADD_CONDENSE_ERROR"; errorMessage: string }
   | { type: "ADD_WARNING"; message: string }
   | { type: "SET_STATUS_OVERRIDE"; message: string | null }
+  | { type: "SET_RESTORING_SESSION"; restoring: boolean }
   | {
       type: "LOAD_SESSION";
       sessionId: string;
@@ -775,6 +777,7 @@ function reducer(state: AppState, action: AppAction): AppState {
             content: action.text,
             timestamp: Date.now(),
             blocks: [],
+            isSlashCommand: action.isSlashCommand,
           },
           {
             id: crypto.randomUUID(),
@@ -876,6 +879,10 @@ function reducer(state: AppState, action: AppAction): AppState {
       return { ...state, statusOverride: action.message };
     }
 
+    case "SET_RESTORING_SESSION": {
+      return { ...state, restoringSession: action.restoring };
+    }
+
     case "ADD_CONDENSE_ERROR": {
       const filtered = state.messages.filter(
         (m) => !(m.role === "condense" && m.condenseInfo?.condensing),
@@ -922,6 +929,7 @@ function reducer(state: AppState, action: AppAction): AppState {
         ...state,
         messages: msgs,
         streaming: false,
+        restoringSession: false,
         lastInputTokens: action.lastInputTokens ?? 0,
         lastOutputTokens: action.lastOutputTokens ?? 0,
         todos: [],
@@ -1019,6 +1027,7 @@ const initialState: AppState = {
   messageQueue: [],
   questionRequest: null,
   statusOverride: null,
+  restoringSession: false,
 };
 
 export interface Injection {
@@ -1034,6 +1043,7 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
   const [state, dispatch] = useReducer(reducer, initialState);
   const stateRef = useRef(state.chatState);
   stateRef.current = state.chatState;
+  const startupRestorePendingRef = useRef(true);
   const messageQueueRef = useRef(state.messageQueue);
   messageQueueRef.current = state.messageQueue;
   const thinkingEnabledRef = useRef(state.thinkingEnabled);
@@ -1187,6 +1197,13 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
         case "stateUpdate":
           streamingRef.current = Boolean(msg.state.streaming);
           dispatch({ type: "SET_STATE", state: msg.state });
+          break;
+        case "agentRestoreSessionStart":
+          dispatch({ type: "SET_RESTORING_SESSION", restoring: true });
+          break;
+        case "agentRestoreSessionDone":
+          startupRestorePendingRef.current = false;
+          dispatch({ type: "SET_RESTORING_SESSION", restoring: false });
           break;
         case "agentThinkingStart":
           if (dropIfNotStreaming()) break;
@@ -1423,6 +1440,10 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
           break;
 
         case "agentSessionLoaded":
+          if (msg.restored && !startupRestorePendingRef.current) {
+            break;
+          }
+          startupRestorePendingRef.current = false;
           dispatch({
             type: "LOAD_SESSION",
             sessionId: msg.sessionId,
@@ -1446,7 +1467,11 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
 
         case "agentInterjection":
           // User message injected mid-run between tool batches
-          dispatch({ type: "ADD_INTERJECTION", text: msg.text });
+          dispatch({
+            type: "ADD_INTERJECTION",
+            text: (msg.displayText as string | undefined) ?? msg.text,
+            isSlashCommand: Boolean(msg.displayText),
+          });
           dispatch({ type: "REMOVE_FROM_QUEUE", id: msg.queueId });
           messageQueueRef.current = messageQueueRef.current.filter(
             (q) => q.id !== msg.queueId,
@@ -1585,6 +1610,7 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
         vscodeApi.postMessage({
           command: "agentQueueMessage",
           text: fullTextForQueue ?? display,
+          displayText: fullTextForQueue ? display : undefined,
           queueId,
           sessionId: stateRef.current.sessionId,
         });
@@ -1677,6 +1703,8 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
   );
 
   const handleNewSession = useCallback(() => {
+    startupRestorePendingRef.current = false;
+    dispatch({ type: "SET_RESTORING_SESSION", restoring: false });
     dispatch({ type: "NEW_SESSION" });
     setBgSessions([]);
     vscodeApi.postMessage({
@@ -1690,8 +1718,12 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
       // If there's an active session, switch mode in-place without creating
       // a new session. Otherwise create a fresh session in the target mode.
       if (stateRef.current.sessionId) {
+        startupRestorePendingRef.current = false;
+        dispatch({ type: "SET_RESTORING_SESSION", restoring: false });
         vscodeApi.postMessage({ command: "agentSwitchMode", mode: slug });
       } else {
+        startupRestorePendingRef.current = false;
+        dispatch({ type: "SET_RESTORING_SESSION", restoring: false });
         dispatch({ type: "NEW_SESSION" });
         setBgSessions([]);
         vscodeApi.postMessage({ command: "agentNewSession", mode: slug });
@@ -1717,6 +1749,8 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
         provider.toLowerCase() === "openai"
       ) {
         vscodeApi.postMessage({ command: "agentCodexSignIn" });
+      } else if (provider.toLowerCase() === "anthropic") {
+        vscodeApi.postMessage({ command: "agentAnthropicSignIn" });
       }
     },
     [vscodeApi],
@@ -1736,6 +1770,8 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
     (name: string, args: string) => {
       switch (name) {
         case "new":
+          startupRestorePendingRef.current = false;
+          dispatch({ type: "SET_RESTORING_SESSION", restoring: false });
           dispatch({ type: "NEW_SESSION" });
           setBgSessions([]);
           vscodeApi.postMessage({
@@ -2041,10 +2077,23 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
           <button
             class="icon-button"
             onClick={handleNewSession}
-            title="New Session"
+            title={
+              state.restoringSession
+                ? "Start a new session without waiting for restore"
+                : "New Session"
+            }
           >
             <i class="codicon codicon-add" />
           </button>
+          {state.restoringSession && (
+            <div
+              class="session-restore-status"
+              title="Restoring the last session"
+            >
+              <i class="codicon codicon-loading codicon-modifier-spin" />
+              <span>Loading last session…</span>
+            </div>
+          )}
           <button
             class={`icon-button${showHistory ? " active" : ""}`}
             onClick={handleShowHistory}

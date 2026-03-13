@@ -11,9 +11,14 @@ Pass **all** your known working directories (primary + additional). The server c
 
 If the handshake keeps failing, you are likely connected to the wrong MCP server instance. Ask the user to reload the VS Code window or refresh their AI agent's MCP connections.
 
-## Prefer AgentLink MCP tools
+## Prefer AgentLink MCP tools only when running inside VS Code
 
-When the `agentlink` MCP server is available, prefer its tools over built-in equivalents. AgentLink tools work through VS Code directly, providing diff views, integrated terminal, real diagnostics, and language server intelligence.
+First determine whether you are running inside VS Code.
+
+- If you **are** running inside VS Code and the `agentlink` MCP server is available, prefer its tools over built-in equivalents.
+- If you are **not** running inside VS Code (for example, a Claude CLI / terminal app session), **do NOT attempt to use agentlink MCP tools** and do **not** tell the user they must connect AgentLink. Use the tools available in your current environment instead.
+
+When the `agentlink` MCP server is available inside VS Code, prefer its tools over built-in equivalents. AgentLink tools work through VS Code directly, providing diff views, integrated terminal, real diagnostics, and language server intelligence.
 
 ### Tool mappings
 

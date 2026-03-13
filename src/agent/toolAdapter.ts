@@ -228,7 +228,7 @@ const MCP_META_TOOLS: ToolDefinition[] = [
 const ASK_USER_TOOL: ToolDefinition = {
   name: "ask_user",
   description:
-    "Ask the user one or more questions and wait for their responses before continuing. Use this proactively to clarify intent, gather preferences, or present choices — rather than guessing or making assumptions. Supports multiple question types in a single call. For multiple_choice and multiple_select questions, always include a 'recommended' field indicating which option you would suggest — this helps the user decide quickly.",
+    "Ask the user one or more structured questions and wait for their responses before continuing. For multiple_choice and multiple_select questions, always include `recommended`.",
   input_schema: {
     type: "object",
     properties: {
@@ -254,8 +254,7 @@ const ASK_USER_TOOL: ToolDefinition = {
                 "scale",
                 "confirmation",
               ],
-              description:
-                "multiple_choice: pick one; multiple_select: pick many; yes_no: boolean; text: free-form; scale: numeric rating; confirmation: acknowledgement gate",
+              description: "Question type",
             },
             question: {
               type: "string",
@@ -270,7 +269,7 @@ const ASK_USER_TOOL: ToolDefinition = {
             recommended: {
               type: "string",
               description:
-                "The option value you recommend for this question (must exactly match one of the options strings). Always provide this for multiple_choice and multiple_select questions.",
+                "Recommended option value; required for multiple_choice and multiple_select.",
             },
             scale_min: {
               type: "number",
@@ -323,7 +322,7 @@ const BG_AGENT_TOOLS: ToolDefinition[] = [
   {
     name: "spawn_background_agent",
     description:
-      "Spawn a background agent to work on a task in parallel with the current session. Returns immediately with a sessionId — the background agent starts running concurrently. Use this when tasks can proceed independently: research while you implement, run diagnostics while you document, explore two approaches at once. Call get_background_result(sessionId) when you need the result.",
+      "Spawn a background agent to work in parallel with the current session. Returns immediately with a sessionId; call get_background_result when you need the result.",
     input_schema: {
       type: "object",
       properties: {
@@ -334,7 +333,7 @@ const BG_AGENT_TOOLS: ToolDefinition[] = [
         message: {
           type: "string",
           description:
-            "Full instruction for the background agent. Be specific and self-contained — it has no other context.",
+            "Full instruction for the background agent. Be specific and self-contained.",
         },
         mode: {
           type: "string",
@@ -361,7 +360,7 @@ const BG_AGENT_TOOLS: ToolDefinition[] = [
   {
     name: "get_background_status",
     description:
-      "Non-blocking check on a background agent's progress. Returns immediately with current status and whether it's done. Use this only when you have other work to do in parallel and want a quick progress check. If you just want to wait for the result, call get_background_result directly — do NOT poll this in a loop.",
+      "Non-blocking check on a background agent's progress. Use this only when you have other work to do in parallel; otherwise call get_background_result directly.",
     input_schema: {
       type: "object",
       properties: {
@@ -376,7 +375,7 @@ const BG_AGENT_TOOLS: ToolDefinition[] = [
   {
     name: "get_background_result",
     description:
-      "Wait for a background agent to finish and return its final response. Blocks until the session completes. Call this when you are ready to use the background agent's output. This is efficient — do not poll get_background_status first.",
+      "Wait for a background agent to finish and return its final response. Call this when you are ready to use the result.",
     input_schema: {
       type: "object",
       properties: {
@@ -391,7 +390,7 @@ const BG_AGENT_TOOLS: ToolDefinition[] = [
   {
     name: "kill_background_agent",
     description:
-      "Stop a running background agent. Use this when you observe (via get_background_status or the todo list) that a background agent is taking too long, going in the wrong direction, or is no longer needed. Returns the agent's partial output collected so far.",
+      "Stop a running background agent and return any partial output collected so far.",
     input_schema: {
       type: "object",
       properties: {

@@ -11,15 +11,20 @@ Pass **all** your known working directories (primary + additional). The server c
 
 If the handshake keeps failing, you are likely connected to the wrong MCP server instance. Tell the user to reload the VS Code window or refresh their AI agent's MCP connections.
 
-## MANDATORY: Use agentlink MCP tools
+## MANDATORY: Use agentlink MCP tools only when running inside VS Code
 
-**STOP CHECK**: Before doing ANY work, verify that the `agentlink` MCP server is connected by confirming you have access to its tools (e.g. `read_file`, `execute_command`, `apply_diff`). If agentlink tools are NOT available in your tool list, **STOP IMMEDIATELY** and tell the user:
+**Environment check**: First determine whether you are running inside VS Code. You should only use `agentlink` MCP tools when they are actually available in your tool list.
 
-> "The agentlink MCP server is not connected. I cannot proceed without it. Please check that the agentlink VS Code extension is running and reload the MCP connection."
+- If you **are** running inside VS Code and the `agentlink` MCP server is connected, follow all AgentLink MCP rules below.
+- If you are **not** running inside VS Code (for example, a Claude CLI / terminal app session), **do NOT attempt to use agentlink MCP tools** and do **not** tell the user they must connect AgentLink. In that case, use the tools available in your current environment instead.
 
-**Do NOT fall back to built-in tools.** Do NOT silently continue with `Read`, `Edit`, `Write`, `Bash`, `Glob`, or `Grep`. Wait for the user to fix the connection.
+**STOP CHECK for VS Code sessions**: Before doing ANY work inside VS Code, verify that the `agentlink` MCP server is connected by confirming you have access to its tools (e.g. `read_file`, `execute_command`, `apply_diff`). If this is supposed to be a VS Code session and agentlink tools are NOT available in your tool list, **STOP IMMEDIATELY** and tell the user:
 
-When the `agentlink` MCP server is available, NEVER use built-in `Read`, `Edit`, `Write`, `Bash`, `Glob`, or `Grep` tools. ALWAYS use the agentlink MCP equivalents instead:
+> "The agentlink MCP server is not connected. I cannot proceed with VS Code actions until it is available. Please check that the AgentLink extension is running and reload the MCP connection."
+
+**Do NOT fall back to built-in tools** in a VS Code session with AgentLink available. Do NOT silently continue with `Read`, `Edit`, `Write`, `Bash`, `Glob`, or `Grep`. Wait for the user to fix the connection.
+
+When the `agentlink` MCP server is available inside VS Code, NEVER use built-in `Read`, `Edit`, `Write`, `Bash`, `Glob`, or `Grep` tools. ALWAYS use the agentlink MCP equivalents instead:
 
 - `Read` → `read_file`
 - `Edit` / `Write` → `apply_diff` / `write_file`

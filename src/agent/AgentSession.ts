@@ -89,7 +89,11 @@ export class AgentSession {
 
   private abortController: AbortController | null = null;
   private _abortSignal: AbortSignal | undefined;
-  private _pendingInterjection: { text: string; queueId: string } | null = null;
+  private _pendingInterjection: {
+    text: string;
+    queueId: string;
+    displayText?: string;
+  } | null = null;
 
   /**
    * Turn-bound media attachments (images + PDFs).
@@ -354,16 +358,24 @@ export class AgentSession {
    * Returns true if the slot was free and the interjection was accepted,
    * false if the slot was already occupied (caller should fall back).
    */
-  setPendingInterjection(text: string, queueId: string): boolean {
+  setPendingInterjection(
+    text: string,
+    queueId: string,
+    displayText?: string,
+  ): boolean {
     // Only register the first queued item; subsequent items wait until done
     if (this._pendingInterjection === null) {
-      this._pendingInterjection = { text, queueId };
+      this._pendingInterjection = { text, queueId, displayText };
       return true;
     }
     return false;
   }
 
-  consumePendingInterjection(): { text: string; queueId: string } | null {
+  consumePendingInterjection(): {
+    text: string;
+    queueId: string;
+    displayText?: string;
+  } | null {
     const interjection = this._pendingInterjection;
     this._pendingInterjection = null;
     return interjection;
@@ -383,7 +395,7 @@ export class AgentSession {
    */
   clearPendingInterjectionIf(
     queueId: string,
-  ): { text: string; queueId: string } | null {
+  ): { text: string; queueId: string; displayText?: string } | null {
     if (this._pendingInterjection?.queueId === queueId) {
       const interjection = this._pendingInterjection;
       this._pendingInterjection = null;

@@ -12,6 +12,14 @@
 
 set -euo pipefail
 
+# Skip AgentLink enforcement for Claude Code CLI sessions.
+# Treat missing/unknown entrypoints as CLI to avoid over-enforcing outside IDE flows.
+entrypoint="${CLAUDE_CODE_ENTRYPOINT:-}"
+entrypoint_lower=$(printf '%s' "$entrypoint" | tr '[:upper:]' '[:lower:]')
+if [ -z "$entrypoint_lower" ] || [ "$entrypoint_lower" = "cli" ]; then
+  exit 0
+fi
+
 # Read hook input from stdin
 input=$(cat)
 tool_name=$(echo "$input" | jq -r '.tool_name')

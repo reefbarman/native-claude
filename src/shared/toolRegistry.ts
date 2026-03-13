@@ -55,12 +55,12 @@ export const TOOL_REGISTRY: Record<string, ToolMeta> = {
   apply_diff: {
     label: "Search/replace with diff review",
     description:
-      "Edit an existing file using search/replace blocks. Opens a diff view for user review. Each SEARCH block must match exactly one location. Supports multiple hunks in a single call \u2014 include multiple SEARCH/REPLACE blocks to make several edits at once. Format:\n<<<<<<< SEARCH\nexact content to find\n======= DIVIDER =======\nreplacement content\n>>>>>>> REPLACE",
+      "Edit an existing file with exact SEARCH/REPLACE blocks. Opens a diff view for review. Each SEARCH block must match exactly one location. Format:\n<<<<<<< SEARCH\nexact content to find\n======= DIVIDER =======\nreplacement content\n>>>>>>> REPLACE",
   },
   find_and_replace: {
     label: "Bulk find-and-replace across files",
     description:
-      "Bulk find-and-replace across MULTIPLE files using a glob pattern. Shows a preview of affected files for approval before applying. Supports literal strings and regex with capture groups. IMPORTANT: For single-file edits, prefer apply_diff instead \u2014 it provides better diff review and format-on-save. Only use find_and_replace for single files when making many identical replacements (e.g. renaming a variable throughout a file).",
+      "Bulk find-and-replace across one or more files. Shows a preview before applying and supports literal strings or regex with capture groups.",
   },
 
   // --- Diagnostics & language server ---
@@ -141,12 +141,12 @@ export const TOOL_REGISTRY: Record<string, ToolMeta> = {
   execute_command: {
     label: "Integrated terminal",
     description:
-      "Run a command in VS Code's integrated terminal. The terminal is visible to the user. Output is captured when shell integration is available.\n\nWorking directory: Commands run in the workspace root by default. Use 'cwd' to set the initial directory when creating a new terminal. The response includes a 'cwd' field showing the terminal's actual working directory after the command finished — this reflects any directory changes made by the command (e.g. `cd subdir && ...`). Do NOT run `pwd` — read the 'cwd' field from the response instead. Note: 'cwd' is omitted from the response when shell integration is unavailable.\n\nTerminal reuse: By default, reuses an existing idle terminal \u2014 do NOT pass terminal_name or terminal_id for normal commands. Only use terminal_name when you need a genuinely separate terminal for parallel execution (e.g. a background dev server running alongside normal commands). Do not create named terminals for one-off commands.\n\nTerminal splitting: Use split_from with a terminal_id or terminal_name to create a new terminal split alongside an existing one, forming a visual group in VS Code's terminal panel. Only affects new terminal creation \u2014 if the target terminal_name already exists and is idle, it is reused without re-splitting.\n\nBackground commands: Use background=true for long-running processes (dev servers, watch modes). Returns immediately with terminal_id. Use get_terminal_output with the terminal_id to check on progress, read accumulated output, and see if the command has finished. Background terminals are never auto-reused \u2014 always use terminal_name or terminal_id to target them.\n\nOutput is capped to the last 200 lines by default. If the response contains output_file, output was TRUNCATED and the full output is saved to that path — call read_file(output_file) to access it. NEVER re-run the command to see more output or to search it with different output_grep patterns; read the saved file instead. Use output_head, output_tail, or output_grep to customize filtering on the FIRST run. IMPORTANT: Commands that pipe through head, tail, or grep (e.g. `cmd | head -5`) will be automatically REJECTED. Use the output_head, output_tail, and output_grep parameters instead \u2014 they filter the output returned to you while keeping the full output visible to the user in the terminal. If a command is wrongly rejected, retry with force=true to bypass validation.\n\nInteractive commands: Commands that require interactive input (editors like vim/nano, REPLs without scripts, TUI apps like htop, bare database CLIs, interactive git flags like -i/-p, scaffolders without --yes) will be automatically REJECTED with a helpful suggestion. Always use non-interactive alternatives: pass -y/--yes flags, use -c/-e for inline execution, provide all arguments upfront, or use the appropriate agentlink tool (write_file, apply_diff) instead of editors.",
+      "Run a command in VS Code's integrated terminal. Use `background` for long-running processes and `timeout` for quick commands. If the response includes `output_file`, read that file instead of re-running the command. Piped `grep`/`head`/`tail` patterns are rejected; use `output_grep`, `output_head`, or `output_tail` instead. Interactive commands are rejected unless you switch to a non-interactive form.",
   },
   get_terminal_output: {
     label: "Read background terminal output",
     description:
-      "Get the output and status of a background or timed-out command running in a terminal. Use after execute_command with background=true, or after a foreground command that timed out (returns timed_out: true with terminal_id). Check on progress, read accumulated output, and see if the command has finished. Supports the same output filtering parameters as execute_command.\n\nUse kill=true to send Ctrl+C (SIGINT) to the running command and return captured output.",
+      "Read output from a background or timed-out terminal command. Supports the same filtering params as execute_command; use `kill` to send Ctrl+C.",
   },
   close_terminals: {
     label: "Clean up terminals",

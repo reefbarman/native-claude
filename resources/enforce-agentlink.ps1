@@ -10,6 +10,13 @@
 
 $ErrorActionPreference = "Stop"
 
+# Skip AgentLink enforcement for Claude Code CLI sessions.
+# Treat missing/unknown entrypoints as CLI to avoid over-enforcing outside IDE flows.
+$entrypoint = [Environment]::GetEnvironmentVariable("CLAUDE_CODE_ENTRYPOINT")
+if ([string]::IsNullOrWhiteSpace($entrypoint) -or $entrypoint.ToLowerInvariant() -eq "cli") {
+    exit 0
+}
+
 # Read hook input from stdin
 $inputText = [Console]::In.ReadToEnd()
 $input = $inputText | ConvertFrom-Json

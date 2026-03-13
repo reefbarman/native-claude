@@ -259,7 +259,7 @@ export const executeCommandSchema = {
     .string()
     .optional()
     .describe(
-      "Working directory (absolute or relative to workspace root). Only applies when creating a new terminal — ignored on reused terminals. The response 'cwd' field shows the terminal's actual directory after execution.",
+      "Working directory (absolute or relative to workspace root). Only applies when creating a new terminal.",
     ),
   terminal_id: z
     .string()
@@ -270,14 +270,12 @@ export const executeCommandSchema = {
   terminal_name: z
     .string()
     .optional()
-    .describe(
-      "Run in a named terminal (e.g. 'Server', 'Build', 'Tests'). Creates if it doesn't exist. Enables parallel execution in separate terminals.",
-    ),
+    .describe("Run in a named terminal, creating it if needed."),
   split_from: z
     .string()
     .optional()
     .describe(
-      "Split the new terminal alongside an existing terminal (by terminal_id or terminal_name), creating a visual group. Only takes effect when a new terminal is created — ignored if terminal_name matches an existing idle terminal. Example: start a backend server with terminal_name='Backend', then use split_from='Backend' with terminal_name='Frontend' to group them side-by-side.",
+      "Split a new terminal alongside an existing terminal or terminal group.",
     ),
   background: z
     .boolean()
@@ -289,7 +287,7 @@ export const executeCommandSchema = {
     .number()
     .optional()
     .describe(
-      "Timeout in seconds. If set, command output is returned when the timeout is reached, but the command may still be running in the terminal. If omitted, waits indefinitely for the command to finish. IMPORTANT: Always set a timeout for commands you expect to complete quickly (e.g. git, ls, cat, grep, npm test — use 10-30s). This prevents the session from hanging if a command unexpectedly blocks. Only omit timeout for long-running processes where you explicitly want to wait indefinitely.",
+      "Timeout in seconds. Always set one for quick commands; omit it only when you intentionally want to wait indefinitely.",
     ),
   output_head: z.coerce
     .number()
@@ -325,13 +323,13 @@ export const executeCommandSchema = {
     .boolean()
     .optional()
     .describe(
-      "Bypass command validation for direct file-reading commands (grep, cat, head, tail, sed on files). Only use when the rejection is a false positive — e.g. commands with shell expansion ($(), env vars) in arguments. Does NOT bypass pipe filtering rejections (cmd | grep/head/tail) — use output_grep/output_head/output_tail params instead.",
+      "Bypass command validation only for false-positive rejections of direct file-reading commands.",
     ),
   force_reason: z
     .string()
     .optional()
     .describe(
-      "Required when force=true. Explain why the rejection is a false positive (e.g. 'grep target is a $VAR path that read_file cannot resolve'). Commands with force=true but no force_reason will be rejected.",
+      "Required when force=true; explain why the rejection was a false positive.",
     ),
   reason: z
     .string()

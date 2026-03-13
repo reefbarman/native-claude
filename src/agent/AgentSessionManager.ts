@@ -698,8 +698,16 @@ export class AgentSessionManager {
     if (!this.store) return null;
     const sessions = this.store.list();
     if (sessions.length === 0) return null;
-    // list() is already sorted by lastActiveAt descending
-    return this.loadPersistedSession(sessions[0].id);
+    // Abort restore if the user started a foreground session while startup restore
+    // was still in flight. This keeps auto-restore from stealing focus back.
+    if (this.foregroundId) return null;
+    const targetSessionId = sessions[0].id;
+    const session = await this.loadPersistedSession(targetSessionId);
+    if (!session) return null;
+    if (this.foregroundId !== targetSessionId) {
+      return null;
+    }
+    return session;
   }
 
   deletePersistedSession(sessionId: string): boolean {
