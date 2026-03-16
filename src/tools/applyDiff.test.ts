@@ -142,6 +142,15 @@ describe("parseSearchReplaceBlocks", () => {
     expect(blocks).toHaveLength(1);
   });
 
+  it("handles leading indentation on marker lines", () => {
+    const input =
+      "  <<<<<<< SEARCH\nhello\n  ======= DIVIDER =======\nworld\n  >>>>>>> REPLACE";
+    const { blocks, malformedBlocks } = parseSearchReplaceBlocks(input);
+    expect(malformedBlocks).toBe(0);
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]).toEqual({ search: "hello", replace: "world", index: 0 });
+  });
+
   it("accepts trailing '>' on SEARCH marker (<<<<<<< SEARCH>)", () => {
     const input =
       "<<<<<<< SEARCH>\nhello\n======= DIVIDER =======\nworld\n>>>>>>> REPLACE";
@@ -193,12 +202,21 @@ describe("applyBlocks", () => {
   });
 
   it("applies partial blocks (some succeed, some fail)", () => {
-    const { result, failedBlocks } = applyBlocks("hello world", [
+    const { result, failedBlocks, blockResults } = applyBlocks("hello world", [
       { search: "hello", replace: "hi", index: 0 },
       { search: "missing", replace: "x", index: 1 },
     ]);
     expect(result).toBe("hi world");
     expect(failedBlocks).toEqual([1]);
+    expect(blockResults).toEqual([
+      { index: 0, status: "applied", matchType: "exact" },
+      {
+        index: 1,
+        status: "failed",
+        reason: "not_found",
+        exactOccurrences: 0,
+      },
+    ]);
   });
 
   it("handles multi-line content", () => {
@@ -213,11 +231,14 @@ describe("applyBlocks", () => {
 
   it("matches when file uses tabs but search uses spaces", () => {
     const content = "function foo() {\n\treturn 1;\n}";
-    const { result, failedBlocks } = applyBlocks(content, [
+    const { result, failedBlocks, blockResults } = applyBlocks(content, [
       { search: "    return 1;", replace: "    return 42;", index: 0 },
     ]);
     expect(result).toBe("function foo() {\n    return 42;\n}");
     expect(failedBlocks).toEqual([]);
+    expect(blockResults).toEqual([
+      { index: 0, status: "applied", matchType: "flexible" },
+    ]);
   });
 
   it("matches when file uses spaces but search uses tabs", () => {

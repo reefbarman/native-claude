@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import * as vscode from "vscode";
 import type { AgentConfig, SessionInfo } from "./types.js";
 import { hasPendingTodos, todoTool, type TodoItem } from "./todoTool.js";
 import { AgentSession } from "./AgentSession.js";
@@ -21,6 +22,10 @@ import {
 } from "./CheckpointManager.js";
 import { providerRegistry } from "./providers/index.js";
 import { resolveBackgroundRoute } from "./backgroundModelRouter.js";
+import {
+  getConfiguredBaseThresholdForModel,
+  getEffectiveAutoCondenseThreshold,
+} from "./modelCondenseThresholds.js";
 import type {
   SpawnBackgroundRequest,
   SpawnBackgroundResult,
@@ -147,6 +152,34 @@ export class AgentSessionManager {
     Object.assign(this.config, config);
   }
 
+  private getCondenseThresholdForModel(model: string): number {
+    try {
+      return getConfiguredBaseThresholdForModel(
+        vscode.workspace.getConfiguration("agentlink"),
+        model,
+      );
+    } catch (err) {
+      this.log?.(
+        `[agent] Failed to resolve configured condense threshold for ${model}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return getEffectiveAutoCondenseThreshold(model);
+    }
+  }
+
+  private buildConfigForModel(model: string): AgentConfig {
+    return {
+      ...this.config,
+      model,
+      autoCondenseThreshold: this.getCondenseThresholdForModel(model),
+    };
+  }
+
+  private applyThresholdToSession(session: AgentSession): void {
+    session.autoCondenseThreshold = this.getCondenseThresholdForModel(
+      session.model,
+    );
+  }
+
   getConfig(): AgentConfig {
     return this.config;
   }
@@ -155,12 +188,11 @@ export class AgentSessionManager {
     mode: string,
     opts?: { activeFilePath?: string },
   ): Promise<AgentSession> {
-    const providerId = providerRegistry.tryResolveProvider(
-      this.config.model,
-    )?.id;
+    const config = this.buildConfigForModel(this.config.model);
+    const providerId = providerRegistry.tryResolveProvider(config.model)?.id;
     const session = await AgentSession.create({
       mode,
-      config: this.config,
+      config,
       cwd: this.cwd,
       devMode: this.devMode,
       activeFilePath: opts?.activeFilePath,
@@ -189,16 +221,21 @@ export class AgentSessionManager {
    * provider-specific behavioral tuning takes effect.
    */
   async setModel(model: string): Promise<void> {
-    this.updateConfig({ model });
+    this.updateConfig({
+      model,
+      autoCondenseThreshold: this.getCondenseThresholdForModel(model),
+    });
     const fg = this.getForegroundSession();
     if (!fg) return;
 
     fg.model = model;
+    this.applyThresholdToSession(fg);
     const newProviderId = providerRegistry.tryResolveProvider(model)?.id;
     if (newProviderId !== fg.providerId) {
       fg.providerId = newProviderId;
       await fg.rebuildSystemPrompt({ devMode: this.devMode });
     }
+    await this.maybeAutoCondenseForegroundSession();
   }
 
   getSession(id: string): AgentSession | undefined {
@@ -329,6 +366,32 @@ export class AgentSessionManager {
 
         // Aborted — let ChatViewProvider handle the done notification
         if (session.isAborted) break;
+
+        const pendingModeResume =
+          naturalDone && autoContinueCount < MAX_AUTO_CONTINUE
+            ? session.consumePendingModeResume()
+            : null;
+        if (pendingModeResume) {
+          autoContinueCount++;
+          const reason = pendingModeResume.reason?.trim();
+          const followUp = pendingModeResume.followUp?.trim();
+          const details = [
+            `You just switched this session to ${pendingModeResume.mode} mode.`,
+            "Continue immediately in the new mode and start the next concrete implementation step now.",
+          ];
+          if (reason) {
+            details.push(`Switch reason: ${reason}`);
+          }
+          if (followUp) {
+            details.push(`User follow-up: ${followUp}`);
+          }
+          this.log?.(
+            `[agent] auto-continuing (${autoContinueCount}/${MAX_AUTO_CONTINUE}): resumed after switch to ${pendingModeResume.mode}`,
+          );
+          session.addUserMessage(details.join("\n"));
+          session.status = "streaming";
+          continue;
+        }
 
         // Check if we should auto-continue due to pending todos
         if (
@@ -495,20 +558,29 @@ export class AgentSessionManager {
     return session;
   }
 
+  queueModeSwitchResume(
+    sessionId: string,
+    mode: string,
+    opts?: { reason?: string; followUp?: string },
+  ): void {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.background) return;
+    session.queuePendingModeResume(mode, opts);
+  }
+
   /**
    * Manually condense the foreground session's context.
    * Emits condense or condense_error events via onEvent.
    */
-  async condenseCurrentSession(): Promise<void> {
-    const session = this.getForegroundSession();
-    if (!session) return;
-
-    const engine = this.getEngine();
+  private buildPreservedContext(session: AgentSession): {
+    toolNames: string[];
+    mcpServerNames: string[];
+  } {
     const mcpToolDefs = this.toolCtx?.mcpHub?.getToolDefs() ?? [];
     const rawTools = this.toolCtx
       ? [...getAgentTools(session.agentMode, mcpToolDefs, false), todoTool]
       : undefined;
-    const preservedContext = {
+    return {
       toolNames: rawTools?.map((t) => t.name) ?? [],
       mcpServerNames: [
         ...new Set(
@@ -521,19 +593,26 @@ export class AgentSessionManager {
         ),
       ],
     };
+  }
+
+  private async condenseSession(
+    session: AgentSession,
+    isAutomatic: boolean,
+  ): Promise<void> {
+    const engine = this.getEngine();
+    const preservedContext = this.buildPreservedContext(session);
     session.status = "streaming";
     this.onSessionsChanged?.();
 
     try {
       for await (const event of engine.condenseSession(
         session,
-        false,
+        isAutomatic,
         undefined,
         preservedContext,
       )) {
         this.onEvent?.(session.id, event);
       }
-      // Persist after condensing — message history has changed
       this.store?.save(session);
     } catch (err: unknown) {
       const error = err instanceof Error ? err.message : String(err);
@@ -542,6 +621,20 @@ export class AgentSessionManager {
       session.status = "idle";
       this.onSessionsChanged?.();
     }
+  }
+
+  async condenseCurrentSession(): Promise<void> {
+    const session = this.getForegroundSession();
+    if (!session) return;
+    await this.condenseSession(session, false);
+  }
+
+  async maybeAutoCondenseForegroundSession(): Promise<void> {
+    const session = this.getForegroundSession();
+    if (!session || session.background) return;
+    if (session.status !== "idle") return;
+    if (!this.getEngine().isOverCondenseThreshold(session)) return;
+    await this.condenseSession(session, true);
   }
 
   // ---------------------------------------------------------------------------
@@ -698,10 +791,7 @@ export class AgentSessionManager {
     const providerId = providerRegistry.tryResolveProvider(summary.model)?.id;
     const session = await AgentSession.create({
       mode: summary.mode,
-      config: {
-        ...this.config,
-        model: summary.model,
-      },
+      config: this.buildConfigForModel(summary.model),
       cwd: this.cwd,
       devMode: this.devMode,
       providerId,
@@ -1017,8 +1107,7 @@ export class AgentSessionManager {
     );
 
     const bgConfig: AgentConfig = {
-      ...this.config,
-      model: route.resolvedModel,
+      ...this.buildConfigForModel(route.resolvedModel),
       // Apply per-task-class thinking budget override
       ...(route.thinkingBudget !== undefined
         ? { thinkingBudget: route.thinkingBudget }
@@ -1160,11 +1249,14 @@ export class AgentSessionManager {
       void this.resumeParentAfterBackgroundCompletion(session.id, resultText);
 
       // Cleanup stored result after 5 minutes to prevent unbounded memory growth
-      setTimeout(() => {
-        this.bgFinalResults.delete(session.id);
-        this.bgParents.delete(session.id);
-        this.bgAutoResumed.delete(session.id);
-      }, 5 * 60 * 1000);
+      setTimeout(
+        () => {
+          this.bgFinalResults.delete(session.id);
+          this.bgParents.delete(session.id);
+          this.bgAutoResumed.delete(session.id);
+        },
+        5 * 60 * 1000,
+      );
     })();
 
     return {

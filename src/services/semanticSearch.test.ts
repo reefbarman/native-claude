@@ -1,9 +1,38 @@
-import { describe, it, expect } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("vscode", () => ({
+  workspace: {
+    getConfiguration: vi.fn(() => ({
+      get: vi.fn((key: string, fallback?: unknown) => {
+        if (key === "semanticSearchEnabled") return true;
+        if (key === "qdrantUrl") return "http://localhost:6333";
+        return fallback;
+      }),
+    })),
+    workspaceFolders: [{ uri: { fsPath: "/workspace" } }],
+  },
+}));
+
+const { resolveEmbeddingAuth, fetchMock } = vi.hoisted(() => ({
+  resolveEmbeddingAuth: vi.fn(),
+  fetchMock: vi.fn(),
+}));
+
+vi.mock("../agent/providers/index.js", () => ({
+  openAiCodexAuthManager: {
+    resolveEmbeddingAuth,
+  },
+}));
+
+global.fetch = fetchMock as typeof fetch;
+
 import {
   extractKeywords,
   expandQuery,
   rrfMerge,
   rerankResults,
+  semanticFileList,
+  semanticSearch,
 } from "./semanticSearch.js";
 
 // --- extractKeywords ---
@@ -59,7 +88,6 @@ describe("extractKeywords", () => {
     expect(result).toContain("DiffViewProvider");
     expect(result).toContain("Diff");
     expect(result).toContain("open");
-    // "diff" is deduplicated against "Diff" from CamelCase split (case-insensitive)
     expect(result).toContain("editor");
     expect(result).toContain("approval");
   });
@@ -108,7 +136,16 @@ describe("rrfMerge", () => {
     id: string,
     score: number,
     filePath = "test.ts",
-  ): { id: string; score: number; payload: { filePath: string; codeChunk: string; startLine: number; endLine: number } } => ({
+  ): {
+    id: string;
+    score: number;
+    payload: {
+      filePath: string;
+      codeChunk: string;
+      startLine: number;
+      endLine: number;
+    };
+  } => ({
     id,
     score,
     payload: { filePath, codeChunk: `code ${id}`, startLine: 1, endLine: 10 },
@@ -120,7 +157,6 @@ describe("rrfMerge", () => {
 
     const merged = rrfMerge(vectorResults, keywordResults, 10);
 
-    // "b" appears in both lists → should rank highest
     expect(merged[0].id).toBe("b");
   });
 
@@ -142,10 +178,7 @@ describe("rrfMerge", () => {
       makeResult("b", 0.8),
       makeResult("c", 0.7),
     ];
-    const keywordResults = [
-      makeResult("d", 0.6),
-      makeResult("e", 0.5),
-    ];
+    const keywordResults = [makeResult("d", 0.6), makeResult("e", 0.5)];
 
     const merged = rrfMerge(vectorResults, keywordResults, 3);
     expect(merged).toHaveLength(3);
@@ -176,7 +209,16 @@ describe("rerankResults", () => {
     score: number,
     filePath: string,
     codeChunk: string,
-  ): { id: string; score: number; payload: { filePath: string; codeChunk: string; startLine: number; endLine: number } } => ({
+  ): {
+    id: string;
+    score: number;
+    payload: {
+      filePath: string;
+      codeChunk: string;
+      startLine: number;
+      endLine: number;
+    };
+  } => ({
     id,
     score,
     payload: { filePath, codeChunk, startLine: 1, endLine: 10 },
@@ -190,8 +232,6 @@ describe("rerankResults", () => {
 
     const reranked = rerankResults(results, ["TerminalManager"]);
 
-    // "b" should be boosted above "a" despite lower vector score
-    // because it contains the keyword "TerminalManager"
     expect(reranked[0].id).toBe("b");
   });
 
@@ -203,7 +243,6 @@ describe("rerankResults", () => {
 
     const reranked = rerankResults(results, ["Terminal"]);
 
-    // "b" has the keyword in the file path — should get boosted
     expect(reranked[0].id).toBe("b");
   });
 
@@ -219,17 +258,144 @@ describe("rerankResults", () => {
     expect(reranked[1].id).toBe("b");
   });
 
+  it("filters .agentlink runtime artifact paths from semantic results", () => {
+    const results = [
+      makeResult(
+        "artifact",
+        0.99,
+        ".agentlink/history/session/messages.json",
+        "TerminalManager debug transcript",
+      ),
+      makeResult(
+        "source",
+        0.6,
+        "src/integrations/TerminalManager.ts",
+        "class TerminalManager {}",
+      ),
+    ];
+
+    const reranked = rerankResults(results, ["TerminalManager"]);
+
+    expect(reranked).toHaveLength(1);
+    expect(reranked[0].id).toBe("source");
+  });
+
+  it("filters caller-specified exclude globs from semantic results", () => {
+    const results = [
+      makeResult(
+        "dist-artifact",
+        0.97,
+        "dist/generated/TerminalManager.js",
+        "compiled output",
+      ),
+      makeResult(
+        "source",
+        0.6,
+        "src/integrations/TerminalManager.ts",
+        "class TerminalManager {}",
+      ),
+    ];
+
+    const reranked = rerankResults(
+      results,
+      ["TerminalManager"],
+      ["**/dist/**"],
+    );
+
+    expect(reranked).toHaveLength(1);
+    expect(reranked[0].id).toBe("source");
+  });
+
+  it("normalizes leading dot-slash before applying exclude globs", () => {
+    const results = [
+      makeResult(
+        "generated",
+        0.95,
+        "./src/generated/types.ts",
+        "generated types",
+      ),
+      makeResult(
+        "source",
+        0.6,
+        "src/integrations/TerminalManager.ts",
+        "class TerminalManager {}",
+      ),
+    ];
+
+    const reranked = rerankResults(
+      results,
+      ["TerminalManager"],
+      ["src/generated/**"],
+    );
+
+    expect(reranked).toHaveLength(1);
+    expect(reranked[0].id).toBe("source");
+  });
+
   it("combines all three signals", () => {
     const results = [
       makeResult("a", 0.9, "foo.ts", "unrelated stuff"),
-      makeResult("b", 0.5, "DiffViewProvider.ts", "class DiffViewProvider implements open diff"),
+      makeResult(
+        "b",
+        0.5,
+        "DiffViewProvider.ts",
+        "class DiffViewProvider implements open diff",
+      ),
     ];
 
-    // "b" has much lower vector score but keyword + path match
-    const reranked = rerankResults(results, ["DiffViewProvider", "diff", "open"]);
+    const reranked = rerankResults(results, [
+      "DiffViewProvider",
+      "diff",
+      "open",
+    ]);
 
-    // b: vector=0.5*0.6=0.3, keyword=3/3*0.25=0.25, path=1/3*0.15=0.05 = 0.6
-    // a: vector=0.9*0.6=0.54, keyword=0/3*0.25=0, path=0/3*0.15=0 = 0.54
     expect(reranked[0].id).toBe("b");
+  });
+});
+
+describe("semantic search auth", () => {
+  beforeEach(() => {
+    resolveEmbeddingAuth.mockReset();
+    fetchMock.mockReset();
+  });
+
+  it("returns a helpful error when no OpenAI auth is configured", async () => {
+    resolveEmbeddingAuth.mockResolvedValue(null);
+
+    const result = await semanticFileList("/workspace", "oauth test");
+
+    expect(result).toEqual({
+      files: [],
+      error:
+        "OpenAI authentication not configured. Run 'AgentLink: Sign In to OpenAI/Codex' to choose ChatGPT/Codex OAuth or an OpenAI API key, or set OPENAI_API_KEY in the environment. Either method enables semantic search and indexing.",
+    });
+  });
+
+  it("uses the resolved bearer token for embeddings", async () => {
+    resolveEmbeddingAuth.mockResolvedValue({
+      method: "oauth",
+      bearerToken: "oauth-token",
+      canRefresh: true,
+    });
+
+    fetchMock
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ data: [{ embedding: [0.1, 0.2] }] }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ result: [] }),
+      });
+
+    await semanticSearch("/workspace", "oauth embeddings", 5);
+
+    expect(fetchMock).toHaveBeenCalled();
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "https://api.openai.com/v1/embeddings",
+    );
+    expect(fetchMock.mock.calls[0][1]?.headers).toMatchObject({
+      Authorization: "Bearer oauth-token",
+    });
   });
 });

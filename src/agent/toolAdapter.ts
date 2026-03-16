@@ -521,6 +521,8 @@ export interface ToolDispatchContext {
   approvalPanel: ApprovalPanelProvider;
   sessionId: string;
   extensionUri: import("vscode").Uri;
+  trackerCtx?: import("../server/ToolCallTracker.js").TrackerContext;
+  toolCallTracker?: import("../server/ToolCallTracker.js").ToolCallTracker;
   mcpHub?: McpClientHub;
   /** Current agent mode slug (e.g. "architect", "code"). Used for mode-specific approval logic. */
   mode?: string;
@@ -566,6 +568,7 @@ export async function dispatchToolCall(
     extensionUri,
     mcpHub,
     onApprovalRequest,
+    trackerCtx,
   } = ctx;
 
   // Route MCP tools (prefixed with 'servername__') to the MCP hub
@@ -764,6 +767,7 @@ export async function dispatchToolCall(
         approvalManager,
         approvalPanel,
         sessionId,
+        trackerCtx,
       );
     case "get_terminal_output":
       return handleGetTerminalOutput(params);

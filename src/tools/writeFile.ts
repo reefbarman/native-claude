@@ -12,7 +12,12 @@ import type { ApprovalManager } from "../approvals/ApprovalManager.js";
 import type { ApprovalPanelProvider } from "../approvals/ApprovalPanelProvider.js";
 import { decisionToScope, saveWriteTrustRules } from "./writeApprovalUI.js";
 
-import { type ToolResult, type OnApprovalRequest } from "../shared/types.js";
+import {
+  type ToolResult,
+  type OnApprovalRequest,
+  errorResult,
+} from "../shared/types.js";
+import { handlePendingEditLockError } from "./pendingEditLock.js";
 
 export async function handleWriteFile(
   params: { path: string; content: string },
@@ -160,14 +165,11 @@ export async function handleWriteFile(
       content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
     };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify({ error: message, path: params.path }),
-        },
-      ],
-    };
+    return (
+      handlePendingEditLockError(err, params.path) ??
+      errorResult(err instanceof Error ? err.message : String(err), {
+        path: params.path,
+      })
+    );
   }
 }

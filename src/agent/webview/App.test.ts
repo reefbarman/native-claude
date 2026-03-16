@@ -213,6 +213,31 @@ describe("webview App reducer background agent launch blocks", () => {
     ]);
   });
 
+  it("clears slash-command metadata when an enqueued message is edited", () => {
+    let state = reducer(initialState, {
+      type: "ENQUEUE_MESSAGE",
+      id: "queue-1",
+      text: "/review",
+      fullText: "expanded prompt body",
+      isSlashCommand: true,
+    });
+
+    state = reducer(state, {
+      type: "EDIT_QUEUE_MESSAGE",
+      id: "queue-1",
+      text: "follow-up clarification",
+    });
+
+    expect(state.messageQueue).toEqual([
+      {
+        id: "queue-1",
+        text: "follow-up clarification",
+        fullText: "follow-up clarification",
+        isSlashCommand: false,
+      },
+    ]);
+  });
+
   it("restores persisted condense summaries even when they are stored as user messages", async () => {
     const { agentMessagesToChatMessages } = await import("./App");
 

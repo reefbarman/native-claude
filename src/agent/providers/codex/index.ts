@@ -8,3 +8,10 @@ export {
   codexOAuthManager,
   type CodexCredentials,
 } from "./CodexOAuthManager.js";
+export {
+  OpenAiCodexAuthManager,
+  openAiCodexAuthManager,
+  type OpenAiCodexAuthMethod,
+  type OpenAiCodexResolvedAuth,
+  type OpenAiApiKeyCredential,
+} from "./OpenAiCodexAuthManager.js";

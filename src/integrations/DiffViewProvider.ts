@@ -99,6 +99,15 @@ export async function showDiffMoreOptions(): Promise<void> {
 const pathLocks = new Map<string, Promise<void>>();
 const LOCK_TIMEOUT = 60_000; // 60 seconds
 
+export class FileLockTimeoutError extends Error {
+  readonly code = "pending_edit_lock";
+
+  constructor(filePath: string) {
+    super(`Lock timeout: another edit to ${filePath} is pending`);
+    this.name = "FileLockTimeoutError";
+  }
+}
+
 export async function withFileLock<T>(
   filePath: string,
   fn: () => Promise<T>,
@@ -133,7 +142,7 @@ export async function withFileLock<T>(
       if (pathLocks.get(lockKey) === lockPromise) {
         pathLocks.delete(lockKey);
       }
-      throw new Error(`Lock timeout: another edit to ${filePath} is pending`);
+      throw new FileLockTimeoutError(filePath);
     }
   }
 

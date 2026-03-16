@@ -30,11 +30,15 @@ import {
   setupAllInstructions,
   installHooks,
 } from "./setup.js";
-import { setSecretStorage } from "./services/semanticSearch.js";
+
 import { setStoredAnthropicApiKey } from "./agent/clientFactory.js";
 import { IndexerManager } from "./indexer/IndexerManager.js";
 import { ChatViewProvider } from "./agent/ChatViewProvider.js";
 import { AgentSessionManager } from "./agent/AgentSessionManager.js";
+import {
+  getConfiguredBaseThresholdForModel,
+  getMigratedModelCondenseThresholdMap,
+} from "./agent/modelCondenseThresholds.js";
 import { SessionStore } from "./agent/SessionStore.js";
 import type { AgentConfig } from "./agent/types.js";
 import { AgentCodeActionProvider } from "./agent/AgentCodeActionProvider.js";
@@ -42,7 +46,7 @@ import { AnthropicProvider } from "./agent/providers/anthropic/index.js";
 import {
   providerRegistry,
   CodexProvider,
-  codexOAuthManager,
+  openAiCodexAuthManager,
 } from "./agent/providers/index.js";
 
 export const DIFF_VIEW_URI_SCHEME = "agentlink-diff";
@@ -441,9 +445,6 @@ export function activate(context: vscode.ExtensionContext): void {
 
   initializeTerminalManager(context.extensionUri, log);
 
-  // Initialize secret storage for secure API key access
-  setSecretStorage(context.secrets);
-
   // Load stored Anthropic API key into memory so createAnthropicClient can use it synchronously.
   void context.secrets.get("anthropicApiKey").then((key) => {
     setStoredAnthropicApiKey(key || undefined);
@@ -512,13 +513,22 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   // Agent chat view
+  const agentConfiguration = vscode.workspace.getConfiguration("agentlink");
+  const configuredModel =
+    agentConfiguration.get<string>("agentModel") ?? "claude-sonnet-4-6";
+  const migratedThresholds = getMigratedModelCondenseThresholdMap(
+    agentConfiguration,
+    configuredModel,
+  );
   const agentConfig: AgentConfig = {
-    model: getConfig<string>("agentModel") ?? "claude-sonnet-4-6",
-    maxTokens: getConfig<number>("agentMaxTokens") ?? 8192,
-    thinkingBudget: getConfig<number>("thinkingBudget") ?? 10000,
-    showThinking: getConfig<boolean>("showThinking") ?? true,
-    autoCondense: getConfig<boolean>("autoCondense") ?? true,
-    autoCondenseThreshold: getConfig<number>("autoCondenseThreshold") ?? 0.9,
+    model: configuredModel,
+    maxTokens: agentConfiguration.get<number>("agentMaxTokens") ?? 8192,
+    thinkingBudget: agentConfiguration.get<number>("thinkingBudget") ?? 10000,
+    showThinking: agentConfiguration.get<boolean>("showThinking") ?? true,
+    autoCondense: agentConfiguration.get<boolean>("autoCondense") ?? true,
+    autoCondenseThreshold:
+      migratedThresholds[configuredModel] ??
+      getConfiguredBaseThresholdForModel(agentConfiguration, configuredModel),
   };
 
   const workspaceCwd =
@@ -534,12 +544,14 @@ export function activate(context: vscode.ExtensionContext): void {
   const agentLog = (msg: string) => chatViewProvider.log(msg);
   providerRegistry.register(new AnthropicProvider(undefined, agentLog));
 
-  // Register the Codex provider (OAuth-based, ChatGPT Plus/Pro subscription).
-  codexOAuthManager.initialize(context);
-  providerRegistry.register(new CodexProvider(codexOAuthManager, agentLog));
+  // Register the OpenAI/Codex provider with unified OAuth + API key auth.
+  openAiCodexAuthManager.initialize(context);
+  providerRegistry.register(
+    new CodexProvider(openAiCodexAuthManager, agentLog),
+  );
 
-  // Re-send model list to webview when Codex auth state changes (sign-in/out).
-  codexOAuthManager.onAuthStateChanged = () => {
+  // Re-send model list to webview when OpenAI/Codex auth state changes.
+  openAiCodexAuthManager.onAuthStateChanged = () => {
     chatViewProvider.refreshModels();
   };
   const sessionStore = new SessionStore(workspaceCwd);
@@ -593,6 +605,7 @@ export function activate(context: vscode.ExtensionContext): void {
       agentSessionManager.waitForBackground(sessionId),
     onKillBackground: (sessionId, reason) =>
       agentSessionManager.killBackground(sessionId, reason),
+    toolCallTracker,
   });
 
   chatViewProvider.setApprovalManager(approvalManager);
@@ -616,16 +629,21 @@ export function activate(context: vscode.ExtensionContext): void {
         e.affectsConfiguration("agentlink.thinkingBudget") ||
         e.affectsConfiguration("agentlink.showThinking") ||
         e.affectsConfiguration("agentlink.autoCondense") ||
-        e.affectsConfiguration("agentlink.autoCondenseThreshold")
+        e.affectsConfiguration("agentlink.autoCondenseThreshold") ||
+        e.affectsConfiguration("agentlink.modelCondenseThresholds")
       ) {
+        const config = vscode.workspace.getConfiguration("agentlink");
+        const model = config.get<string>("agentModel") ?? "claude-sonnet-4-6";
         agentSessionManager.updateConfig({
-          model: getConfig<string>("agentModel") ?? "claude-sonnet-4-6",
-          maxTokens: getConfig<number>("agentMaxTokens") ?? 8192,
-          thinkingBudget: getConfig<number>("thinkingBudget") ?? 10000,
-          showThinking: getConfig<boolean>("showThinking") ?? true,
-          autoCondense: getConfig<boolean>("autoCondense") ?? true,
-          autoCondenseThreshold:
-            getConfig<number>("autoCondenseThreshold") ?? 0.9,
+          model,
+          maxTokens: config.get<number>("agentMaxTokens") ?? 8192,
+          thinkingBudget: config.get<number>("thinkingBudget") ?? 10000,
+          showThinking: config.get<boolean>("showThinking") ?? true,
+          autoCondense: config.get<boolean>("autoCondense") ?? true,
+          autoCondenseThreshold: getConfiguredBaseThresholdForModel(
+            config,
+            model,
+          ),
         });
       }
     }),
@@ -665,14 +683,17 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("agentlink.setOpenaiApiKey", async () => {
       const key = await vscode.window.showInputBox({
         title: "OpenAI API Key",
-        prompt: "Enter your OpenAI API key for semantic search embeddings",
+        prompt:
+          "Enter your OpenAI API key to use OpenAI models, semantic search, and indexing. If you also sign in with ChatGPT/Codex, that OAuth session will be preferred.",
         password: true,
         ignoreFocusOut: true,
         validateInput: (v) => (v.trim() ? null : "API key cannot be empty"),
       });
       if (!key) return;
-      await context.secrets.store("openaiApiKey", key.trim());
-      vscode.window.showInformationMessage("OpenAI API key stored securely.");
+      await openAiCodexAuthManager.storeApiKey(key.trim());
+      vscode.window.showInformationMessage(
+        "OpenAI API key stored securely. It will be used for models, semantic search, and indexing when no ChatGPT/Codex OAuth session is available.",
+      );
     }),
     vscode.commands.registerCommand(
       "agentlink.setAnthropicApiKey",
@@ -740,14 +761,43 @@ export function activate(context: vscode.ExtensionContext): void {
       installHooks(context.extensionUri, log);
     }),
     vscode.commands.registerCommand("agentlink.codexSignIn", async () => {
+      const choice = await vscode.window.showQuickPick(
+        [
+          {
+            label: "Sign in with ChatGPT/Codex",
+            description:
+              "Use your ChatGPT/Codex OAuth session for models, semantic search, and indexing",
+            value: "oauth",
+          },
+          {
+            label: "Use OpenAI API key",
+            description:
+              "Use usage-based OpenAI Platform billing for models, semantic search, and indexing",
+            value: "apiKey",
+          },
+        ],
+        {
+          title: "OpenAI/Codex Authentication",
+          placeHolder:
+            "Choose an auth method for models, semantic search, and indexing. If both are configured, ChatGPT/Codex OAuth is preferred.",
+          ignoreFocusOut: true,
+        },
+      );
+      if (!choice) return;
+
+      if (choice.value === "apiKey") {
+        await vscode.commands.executeCommand("agentlink.setOpenaiApiKey");
+        return;
+      }
+
       try {
-        const authUrl = codexOAuthManager.startAuthorizationFlow();
+        const authUrl = openAiCodexAuthManager.startAuthorizationFlow();
         await vscode.env.openExternal(vscode.Uri.parse(authUrl));
         log("[codex] Opened browser for OAuth sign-in");
-        const creds = await codexOAuthManager.waitForCallback();
+        const creds = await openAiCodexAuthManager.waitForCallback();
         log(`[codex] Signed in as ${creds.email ?? "unknown"}`);
         vscode.window.showInformationMessage(
-          `Signed in to OpenAI Codex${creds.email ? ` as ${creds.email}` : ""}.`,
+          `Signed in with ChatGPT/Codex${creds.email ? ` as ${creds.email}` : ""}. This OAuth session will be used for models, semantic search, and indexing, and will be preferred over any stored OpenAI API key.`,
         );
       } catch (err) {
         log(`[codex] Sign-in failed: ${err}`);
@@ -757,12 +807,72 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }),
     vscode.commands.registerCommand("agentlink.codexSignOut", async () => {
-      const wasAuthed = await codexOAuthManager.isAuthenticated();
-      codexOAuthManager.clearCredentials();
-      if (wasAuthed) {
-        vscode.window.showInformationMessage("Signed out of OpenAI Codex.");
+      const hasOAuth = await openAiCodexAuthManager.hasOAuth();
+      const hasApiKey = await openAiCodexAuthManager.hasApiKey();
+
+      if (hasOAuth && hasApiKey) {
+        const choice = await vscode.window.showQuickPick(
+          [
+            {
+              label: "Remove ChatGPT/Codex sign-in",
+              description: "Removes the preferred OAuth session",
+              value: "oauth",
+            },
+            {
+              label: "Remove OpenAI API key",
+              description: "Keeps ChatGPT/Codex OAuth if present",
+              value: "apiKey",
+            },
+            {
+              label: "Remove both",
+              description: "Clears both OAuth and API-key auth",
+              value: "both",
+            },
+          ],
+          {
+            title: "Manage OpenAI/Codex Authentication",
+            placeHolder:
+              "Choose which auth method to remove. OAuth is preferred when both are present.",
+            ignoreFocusOut: true,
+          },
+        );
+        if (!choice) return;
+        if (choice.value === "oauth") {
+          await openAiCodexAuthManager.clearOAuth();
+        } else if (choice.value === "apiKey") {
+          await openAiCodexAuthManager.clearApiKey();
+        } else {
+          await openAiCodexAuthManager.clearAll();
+        }
+        vscode.window.showInformationMessage(
+          "Updated OpenAI/Codex authentication. If both methods remain configured, ChatGPT/Codex OAuth will be preferred for models, semantic search, and indexing.",
+        );
+        log(`[codex] Removed auth method: ${choice.value}`);
+        return;
       }
-      log("[codex] Signed out");
+
+      if (hasOAuth) {
+        await openAiCodexAuthManager.clearOAuth();
+        vscode.window.showInformationMessage(
+          "Removed ChatGPT/Codex sign-in. AgentLink will use your OpenAI API key for models, semantic search, and indexing instead if one is configured.",
+        );
+        log("[codex] Signed out OAuth session");
+        return;
+      }
+
+      if (hasApiKey) {
+        await openAiCodexAuthManager.clearApiKey();
+        vscode.window.showInformationMessage(
+          "Removed OpenAI API key. Sign in with ChatGPT/Codex to continue using models, semantic search, and indexing.",
+        );
+        log("[codex] Removed OpenAI API key");
+        return;
+      }
+
+      vscode.window.showInformationMessage(
+        "No OpenAI/Codex credentials are currently configured for models, semantic search, or indexing.",
+      );
+      log("[codex] Sign-out requested, but no credentials were configured");
     }),
     vscode.commands.registerCommand("agentlink.startServer", () =>
       startServer(context),
@@ -896,14 +1006,6 @@ export function activate(context: vscode.ExtensionContext): void {
       ),
       vscode.commands.registerCommand("agentlink.resumeIndex", () =>
         indexerManager?.startIndexing(false),
-      ),
-      // Internal command for IndexerManager to retrieve the OpenAI API key
-      vscode.commands.registerCommand(
-        "agentlink.getOpenAiApiKeyInternal",
-        async () => {
-          const key = await context.secrets.get("openaiApiKey");
-          return key || "";
-        },
       ),
     );
   }

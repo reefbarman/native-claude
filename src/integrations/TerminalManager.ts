@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 
 import { cleanTerminalOutput } from "../util/ansi.js";
+import { buildAgentExecutionEnv } from "../process/agentExecutionPolicy.js";
 
 let terminalIconPath: vscode.Uri | undefined;
 
@@ -78,6 +79,9 @@ export interface CommandResult {
   original_command?: string;
   follow_up?: string;
   timed_out?: boolean;
+  execution_mode?: "shell_integration" | "send_text";
+  verification_hint?: string;
+  command_sent?: boolean;
 }
 
 export interface ExecuteOptions {
@@ -204,7 +208,6 @@ export class TerminalManager {
         : options.command;
 
     const managed = await this.resolveTerminal(options);
-    managed.busy = true;
     options.onTerminalAssigned?.(managed.id);
 
     try {
@@ -244,7 +247,19 @@ export class TerminalManager {
     if (terminal_id) {
       const existing = this.terminals.find((t) => t.id === terminal_id);
       if (existing) {
-        return existing;
+        if (existing.busy || existing.backgroundRunning) {
+          throw new Error(
+            `Terminal ${terminal_id} is busy. Wait for the current command to finish or use get_terminal_output/kill for background commands.`,
+          );
+        }
+        existing.busy = true;
+        try {
+          await this.waitForCooldown(existing);
+          return existing;
+        } catch (err) {
+          existing.busy = false;
+          throw err;
+        }
       }
       // If not found, fall through to creation
     }
@@ -255,38 +270,61 @@ export class TerminalManager {
         (t) => t.name === terminal_name && !t.busy && !t.backgroundRunning,
       );
       if (existing) {
-        await this.waitForCooldown(existing);
-        return existing;
+        existing.busy = true;
+        try {
+          await this.waitForCooldown(existing);
+          return existing;
+        } catch (err) {
+          existing.busy = false;
+          throw err;
+        }
       }
       // Create with the specified name, optionally split from a parent
       const managed = this.createTerminal(cwd, terminal_name);
+      managed.busy = true;
+      try {
+        if (split_from) {
+          await this.splitTerminalBeside(managed, split_from);
+        }
+        return managed;
+      } catch (err) {
+        managed.busy = false;
+        throw err;
+      }
+    }
+
+    // Default: only reuse an idle unnamed terminal when its tracked cwd still
+    // matches the requested cwd. If cwd differs, create a fresh terminal so the
+    // command runs from the requested directory instead of inheriting stale state.
+    const cwdMatch = this.terminals.find(
+      (t) =>
+        !t.busy &&
+        !t.backgroundRunning &&
+        t.name === "AgentLink" &&
+        t.cwd === cwd,
+    );
+    if (cwdMatch) {
+      cwdMatch.busy = true;
+      try {
+        await this.waitForCooldown(cwdMatch);
+        return cwdMatch;
+      } catch (err) {
+        cwdMatch.busy = false;
+        throw err;
+      }
+    }
+
+    const managed = this.createTerminal(cwd, "AgentLink");
+    managed.busy = true;
+    try {
       if (split_from) {
         await this.splitTerminalBeside(managed, split_from);
       }
       return managed;
+    } catch (err) {
+      managed.busy = false;
+      throw err;
     }
-
-    // Default: reuse any idle default terminal.
-    // Prefer one with matching cwd, but fall back to any idle one
-    // (the stored cwd is just the creation cwd — after commands run it may differ).
-    const idleDefaults = this.terminals.filter(
-      (t) => !t.busy && !t.backgroundRunning && t.name === "AgentLink",
-    );
-    const cwdMatch = idleDefaults.find((t) => t.cwd === cwd);
-    if (cwdMatch) {
-      await this.waitForCooldown(cwdMatch);
-      return cwdMatch;
-    }
-    if (idleDefaults.length > 0) {
-      await this.waitForCooldown(idleDefaults[0]);
-      return idleDefaults[0];
-    }
-
-    const managed = this.createTerminal(cwd, "AgentLink");
-    if (split_from) {
-      await this.splitTerminalBeside(managed, split_from);
-    }
-    return managed;
   }
 
   /**
@@ -324,7 +362,10 @@ export class TerminalManager {
     // Small delay to ensure the parent terminal is focused
     await new Promise((r) => setTimeout(r, 150));
 
-    // Listen for the new terminal that the split command will create
+    // Listen for the new terminal that the split command will create.
+    // Split terminals inherit the parent shell environment, so this path must
+    // only be used with AgentLink-managed parent terminals that were created
+    // with buildAgentExecutionEnv().
     const splitTerminal = await new Promise<vscode.Terminal>((resolve) => {
       const disposable = vscode.window.onDidOpenTerminal((t) => {
         disposable.dispose();
@@ -354,25 +395,7 @@ export class TerminalManager {
       name,
       cwd,
       iconPath: terminalIconPath ?? new vscode.ThemeIcon("terminal"),
-      env: {
-        // Disable pagers so commands like `git log` don't become interactive
-        PAGER: process.platform === "win32" ? "" : "cat",
-        GIT_PAGER: process.platform === "win32" ? "" : "cat",
-        // Prevent git from prompting for credentials interactively
-        GIT_TERMINAL_PROMPT: "0",
-        // Disable VTE to prevent prompt command interference
-        VTE_VERSION: "0",
-        // Clear ZSH EOL mark to prevent output artifacts
-        PROMPT_EOL_MARK: "",
-        // Auto-answer npm/npx prompts with yes
-        npm_config_yes: "true",
-        // Prevent apt/dpkg from prompting for configuration
-        DEBIAN_FRONTEND: "noninteractive",
-        // Disable man pager
-        MANPAGER: process.platform === "win32" ? "" : "cat",
-        // Disable systemd pager
-        SYSTEMD_PAGER: "",
-      },
+      env: buildAgentExecutionEnv(),
     });
 
     const id = `term_${nextTerminalId++}`;
@@ -731,6 +754,8 @@ export class TerminalManager {
       ...(actualCwd && { cwd: actualCwd }),
       output_captured: true,
       terminal_id: managed.id,
+      execution_mode: "shell_integration",
+      command_sent: true,
     };
 
     if (timedOut) {
@@ -752,10 +777,14 @@ export class TerminalManager {
     return {
       exit_code: null,
       output:
-        "Command sent to terminal. Output capture unavailable — shell integration is not active. " +
-        "Check VS Code terminal settings to enable shell integration.",
+        "Command was sent to the terminal, but output capture is unavailable because shell integration is not active.",
       output_captured: false,
       terminal_id: managed.id,
+      execution_mode: "send_text",
+      command_sent: true,
+      verification_hint:
+        `The command may still be running or may have already finished in terminal_id "${managed.id}". ` +
+        "Do not re-run it just to verify. Inspect the visible terminal, or use get_terminal_output with this terminal_id if shell integration later becomes available.",
     };
   }
 
@@ -986,6 +1015,15 @@ export class TerminalManager {
       output: `Background command started in terminal "${managed.name}". Use terminal_id "${managed.id}" with get_terminal_output to check on progress.`,
       output_captured: false,
       terminal_id: managed.id,
+      execution_mode: shellIntegration ? "shell_integration" : "send_text",
+      command_sent: true,
+      ...(shellIntegration
+        ? {}
+        : {
+            verification_hint:
+              `Background command was started in terminal_id "${managed.id}", but shell integration was not active so live output capture is unavailable. ` +
+              "Use the visible terminal to verify progress rather than re-running the command.",
+          }),
     };
   }
 

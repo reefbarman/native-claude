@@ -27,17 +27,46 @@ import type {
   ToolDefinition,
 } from "../types.js";
 
-// Context window sizes for supported models (tokens)
-const CONTEXT_WINDOWS: Record<string, number> = {
-  "claude-opus-4-6": 200_000,
-  "claude-sonnet-4-6": 200_000,
-  "claude-haiku-4-5-20251001": 200_000,
-  "claude-haiku-4-5": 200_000,
+type AnthropicModelCapabilities = ModelCapabilities & {
+  supportsThinking: boolean;
 };
 
-const DEFAULT_CONTEXT_WINDOW = 200_000;
+const ANTHROPIC_MODEL_CAPABILITIES: Record<string, AnthropicModelCapabilities> =
+  {
+    "claude-opus-4-6": {
+      supportsThinking: true,
+      supportsCaching: true,
+      supportsImages: true,
+      supportsToolUse: true,
+      contextWindow: 1_000_000,
+      maxOutputTokens: 128_000,
+    },
+    "claude-sonnet-4-6": {
+      supportsThinking: true,
+      supportsCaching: true,
+      supportsImages: true,
+      supportsToolUse: true,
+      contextWindow: 1_000_000,
+      maxOutputTokens: 128_000,
+    },
+    "claude-haiku-4-5-20251001": {
+      supportsThinking: false,
+      supportsCaching: true,
+      supportsImages: true,
+      supportsToolUse: true,
+      contextWindow: 200_000,
+      maxOutputTokens: 128_000,
+    },
+  };
 
-const THINKING_MODELS = new Set(["claude-opus-4-6", "claude-sonnet-4-6"]);
+const DEFAULT_CAPABILITIES: AnthropicModelCapabilities = {
+  supportsThinking: false,
+  supportsCaching: true,
+  supportsImages: true,
+  supportsToolUse: true,
+  contextWindow: 200_000,
+  maxOutputTokens: 128_000,
+};
 
 /** The preferred cheap/fast model for condensing. */
 export const ANTHROPIC_CONDENSE_MODEL = "claude-haiku-4-5-20251001";
@@ -63,15 +92,7 @@ export class AnthropicProvider implements ModelProvider {
   }
 
   getCapabilities(model: string): ModelCapabilities {
-    const contextWindow = CONTEXT_WINDOWS[model] ?? DEFAULT_CONTEXT_WINDOW;
-    return {
-      supportsThinking: THINKING_MODELS.has(model),
-      supportsCaching: true,
-      supportsImages: true,
-      supportsToolUse: true,
-      contextWindow,
-      maxOutputTokens: contextWindow === 200_000 ? 128_000 : 8_192,
-    };
+    return ANTHROPIC_MODEL_CAPABILITIES[model] ?? DEFAULT_CAPABILITIES;
   }
 
   listModels(): ModelInfo[] {

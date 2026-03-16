@@ -105,6 +105,9 @@ export async function handleGetTerminalOutput(params: {
   } else if (!state.output_captured) {
     result.output =
       "Output capture unavailable — shell integration was not active when the background command started.";
+    result.verification_hint =
+      `The command was started in terminal_id "${params.terminal_id}" without shell integration capture. ` +
+      "Use the visible terminal to inspect progress or completion rather than re-running it.";
   } else {
     result.output = "";
   }

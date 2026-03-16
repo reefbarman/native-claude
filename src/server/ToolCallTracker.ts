@@ -255,22 +255,26 @@ export class ToolCallTracker extends EventEmitter {
 
   /**
    * Register an agent tool call so it appears in the sidebar's active tools list.
-   * Unlike wrapHandler (used for MCP calls), this doesn't wrap execution — the
-   * caller is responsible for calling completeAgentCall when done.
+   * Unlike wrapHandler (used for MCP calls), the caller owns the actual tool
+   * execution and passes a forceResolve hook that can be triggered from the
+   * sidebar's Complete/Cancel buttons.
    */
   registerAgentCall(
     toolCallId: string,
     toolName: string,
     displayArgs: string,
     sessionId: string,
-  ): void {
+    forceResolve: (result: ToolResult) => void,
+    params?: string,
+  ): TrackerContext {
     const tracked: TrackedCall = {
       id: toolCallId,
       toolName,
       displayArgs,
+      params,
       sessionId,
       startedAt: Date.now(),
-      forceResolve: () => {}, // Agent calls don't use force-resolve
+      forceResolve,
       source: "agent",
     };
     this.activeCalls.set(toolCallId, tracked);
@@ -278,6 +282,11 @@ export class ToolCallTracker extends EventEmitter {
       `AGENT_START ${toolName} (${toolCallId.slice(0, 8)}), active=${this.activeCalls.size}`,
     );
     this.emit("change");
+    return {
+      toolCallId,
+      setApprovalId: (approvalId) => this.setApprovalId(toolCallId, approvalId),
+      setTerminalId: (terminalId) => this.setTerminalId(toolCallId, terminalId),
+    };
   }
 
   /**
@@ -469,12 +478,40 @@ export class ToolCallTracker extends EventEmitter {
       return;
     }
 
-    // Agent calls are handled by stopping the agent session
     if (call.source === "agent") {
-      this.log(
-        `CANCEL_AGENT ${call.toolName} (${id.slice(0, 8)}), session=${call.sessionId.slice(0, 8)}`,
+      this.log(`CANCEL_AGENT ${call.toolName} (${id.slice(0, 8)})`);
+      if (call.terminalId) {
+        this.log(`CANCEL_INTERRUPT terminal ${call.terminalId}`);
+        import("../integrations/TerminalManager.js").then(
+          ({ getTerminalManager }) => {
+            getTerminalManager().interruptTerminal(call.terminalId!);
+          },
+          (err) => {
+            this.log(`CANCEL_INTERRUPT import failed: ${err}`);
+          },
+        );
+      }
+      if (call.approvalId) {
+        this.log(
+          `CANCEL_APPROVAL ${call.toolName} (${id.slice(0, 8)}), approvalId=${call.approvalId.slice(0, 8)}`,
+        );
+        approvalPanel.cancelApproval(call.approvalId);
+      }
+      import("../integrations/DiffViewProvider.js").then(
+        ({ resolveCurrentDiff }) => {
+          resolveCurrentDiff("reject");
+        },
+        (err) => {
+          this.log(`CANCEL_DIFF import failed: ${err}`);
+        },
       );
-      this.emit("agentCancel", call.sessionId);
+      call.forceResolve(
+        makeToolResult({
+          status: "cancelled",
+          tool: call.toolName,
+          message: "Cancelled by user from VS Code",
+        }),
+      );
       return;
     }
 
@@ -533,14 +570,8 @@ export class ToolCallTracker extends EventEmitter {
       return;
     }
 
-    // Agent calls: stop the session (same as cancel — individual tool
-    // force-resolve isn't supported for the built-in agent)
     if (call.source === "agent") {
-      this.log(
-        `COMPLETE_AGENT ${call.toolName} (${id.slice(0, 8)}), session=${call.sessionId.slice(0, 8)}`,
-      );
-      this.emit("agentCancel", call.sessionId);
-      return;
+      this.log(`COMPLETE_AGENT ${call.toolName} (${id.slice(0, 8)})`);
     }
 
     this.log(`COMPLETE ${call.toolName} (${id.slice(0, 8)})`);
@@ -658,6 +689,12 @@ export class ToolCallTracker extends EventEmitter {
         output: output || "[No output captured]",
         status: "force-completed",
         message: "Output returned immediately — wait was interrupted by user.",
+        ...(!state.output_captured &&
+          !output && {
+            verification_hint:
+              `Terminal_id "${terminalId}" did not have shell integration capture available. ` +
+              "Use the visible terminal to verify command state rather than re-running it.",
+          }),
       }),
     );
   }

@@ -1,4 +1,10 @@
-import { useState, useRef, useCallback, useEffect } from "preact/hooks";
+import {
+  useState,
+  useRef,
+  useCallback,
+  useEffect,
+  useMemo,
+} from "preact/hooks";
 import { FilePicker } from "./FilePicker";
 import {
   AttachmentChip,
@@ -11,6 +17,12 @@ import { ModelSelector } from "./ModelSelector";
 import { WriteApprovalSelector } from "./WriteApprovalSelector";
 import type { Injection } from "../App";
 import type { SlashCommandInfo, ModeInfo, WebviewModelInfo } from "../types";
+import {
+  getSlashCommandSelectionState,
+  parseMatchedSlashCommand,
+  shouldOpenSlashPopup,
+  wrapTextInBackticks,
+} from "../slashCommandInput";
 
 /** A pasted image or PDF held in webview state before sending. */
 export interface MediaAttachment {
@@ -58,8 +70,10 @@ interface InputAreaProps {
   currentMode?: string;
   onSwitchMode?: (slug: string) => void;
   currentModel?: string;
+  currentCondenseThreshold?: number;
   availableModels?: WebviewModelInfo[];
   onSelectModel?: (modelId: string) => void;
+  onSetCondenseThreshold?: (threshold: number) => void;
   onSignIn?: (provider: string) => void;
   agentWriteApproval?: string;
   onSetAgentWriteApproval?: (mode: string) => void;
@@ -82,8 +96,10 @@ export function InputArea({
   currentMode = "code",
   onSwitchMode,
   currentModel = "claude-sonnet-4-6",
+  currentCondenseThreshold,
   availableModels = [],
   onSelectModel,
+  onSetCondenseThreshold,
   onSignIn,
   agentWriteApproval = "prompt",
   onSetAgentWriteApproval,
@@ -106,39 +122,12 @@ export function InputArea({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const inputWrapperRef = useRef<HTMLDivElement>(null);
 
-  const handleSubmit = useCallback(() => {
-    const trimmed = text.trim();
-    if (!trimmed && attachments.length === 0 && mediaAttachments.length === 0)
-      return;
-
-    // Intercept slash commands typed manually (e.g. /mode architect)
-    if (
-      !attachments.length &&
-      !mediaAttachments.length &&
-      trimmed.startsWith("/") &&
-      !trimmed.startsWith("//")
-    ) {
-      const space = trimmed.indexOf(" ");
-      const name = space > 0 ? trimmed.slice(1, space) : trimmed.slice(1);
-      const args = space > 0 ? trimmed.slice(space + 1).trim() : "";
-      const cmd = slashCommands.find((c) => c.name === name);
-      if (cmd) {
-        setText("");
-        if (textareaRef.current) textareaRef.current.style.height = "auto";
-        if (cmd.builtin) {
-          onExecuteBuiltinCommand?.(name, args);
-        } else if (cmd.body) {
-          // File command — treat args as additional context prepended to body
-          const finalText = args ? args + "\n\n" + cmd.body : cmd.body;
-          const display = args ? `/${name} ${args}` : `/${name}`;
-          onSend(finalText, [], display);
-        }
-        return;
-      }
-    }
-
-    // Strip data URL prefix to get raw base64 for each media attachment
-    const media =
+  const matchedSlashCommand = useMemo(
+    () => parseMatchedSlashCommand(text, slashCommands),
+    [text, slashCommands],
+  );
+  const pendingMedia = useMemo(
+    () =>
       mediaAttachments.length > 0
         ? mediaAttachments.map((m) => {
             const commaIdx = m.dataUrl.indexOf(",");
@@ -151,9 +140,53 @@ export function InputArea({
               kind: m.kind,
             };
           })
-        : undefined;
+        : undefined,
+    [mediaAttachments],
+  );
+  const matchedExecutableSlashCommand = useMemo(() => {
+    if (!matchedSlashCommand) {
+      return null;
+    }
+    if (
+      matchedSlashCommand.command.builtin &&
+      (attachments.length > 0 || mediaAttachments.length > 0)
+    ) {
+      return null;
+    }
+    return matchedSlashCommand;
+  }, [matchedSlashCommand, attachments.length, mediaAttachments.length]);
 
-    onSend(trimmed, attachments, undefined, media);
+  const closeSlash = useCallback(() => {
+    setSlashOpen(false);
+    setSlashQuery("");
+    setSlashStart(-1);
+    setSlashSelectedIdx(0);
+    setSlashView("main");
+  }, []);
+
+  const handleSubmit = useCallback(() => {
+    const trimmed = text.trim();
+    if (!trimmed && attachments.length === 0 && mediaAttachments.length === 0)
+      return;
+
+    if (matchedExecutableSlashCommand) {
+      setText("");
+      setAttachments([]);
+      setMediaAttachments([]);
+      closeSlash();
+      if (textareaRef.current) textareaRef.current.style.height = "auto";
+
+      const { command, args, displayText } = matchedExecutableSlashCommand;
+      if (command.builtin) {
+        onExecuteBuiltinCommand?.(command.name, args);
+      } else if (command.body) {
+        const finalText = args ? args + "\n\n" + command.body : command.body;
+        onSend(finalText, attachments, displayText, pendingMedia);
+      }
+      return;
+    }
+
+    onSend(trimmed, attachments, undefined, pendingMedia);
     setText("");
     setAttachments([]);
     setMediaAttachments([]);
@@ -166,8 +199,10 @@ export function InputArea({
     mediaAttachments,
     streaming,
     onSend,
-    slashCommands,
+    matchedExecutableSlashCommand,
     onExecuteBuiltinCommand,
+    closeSlash,
+    pendingMedia,
   ]);
 
   // Build model list from dynamic provider data, with a fallback for
@@ -176,14 +211,6 @@ export function InputArea({
     availableModels.length > 0
       ? availableModels.map((m) => ({ id: m.id, label: m.displayName }))
       : [{ id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" }];
-
-  const closeSlash = useCallback(() => {
-    setSlashOpen(false);
-    setSlashQuery("");
-    setSlashStart(-1);
-    setSlashSelectedIdx(0);
-    setSlashView("main");
-  }, []);
 
   const filteredSlashCommands: SlashCommandInfo[] = (() => {
     // Sub-view: mode picker
@@ -269,8 +296,12 @@ export function InputArea({
 
   const handleSlashSelect = useCallback(
     (cmd: SlashCommandInfo) => {
-      // Always strip the slash text from the input on any selection
       const before = slashStart >= 0 ? text.slice(0, slashStart) : "";
+      const selectionState = getSlashCommandSelectionState(
+        text,
+        slashStart,
+        cmd.name,
+      );
 
       // Virtual sub-picker selections (prefixed with __)
       if (cmd.name.startsWith("__mcp:")) {
@@ -307,34 +338,62 @@ export function InputArea({
       closeSlash();
 
       if (cmd.builtin) {
-        if (ZERO_ARG_BUILTINS.has(cmd.name)) {
+        if (
+          ZERO_ARG_BUILTINS.has(cmd.name) &&
+          !selectionState.args &&
+          attachments.length === 0 &&
+          mediaAttachments.length === 0
+        ) {
           setText(before);
           onExecuteBuiltinCommand?.(cmd.name, "");
         } else {
-          // Fill input with "/name " for manual arg entry
-          const newText = before + "/" + cmd.name + " ";
-          setText(newText);
+          setText(selectionState.replacementText);
           requestAnimationFrame(() => {
             if (textareaRef.current) {
               textareaRef.current.focus();
-              textareaRef.current.selectionStart = newText.length;
-              textareaRef.current.selectionEnd = newText.length;
+              textareaRef.current.selectionStart =
+                selectionState.replacementText.length;
+              textareaRef.current.selectionEnd =
+                selectionState.replacementText.length;
             }
           });
         }
       } else if (cmd.body) {
-        // Send directly to agent; show only the command name in the chat
-        setText(before);
-        onSend(cmd.body, [], `/${cmd.name}`);
+        if (selectionState.args) {
+          setText(selectionState.replacementText);
+          requestAnimationFrame(() => {
+            if (textareaRef.current) {
+              textareaRef.current.focus();
+              textareaRef.current.selectionStart =
+                selectionState.replacementText.length;
+              textareaRef.current.selectionEnd =
+                selectionState.replacementText.length;
+            }
+          });
+        } else {
+          setText(before);
+          onSend(cmd.body, [], `/${cmd.name}`);
+        }
       }
     },
-    [text, slashStart, closeSlash, onExecuteBuiltinCommand, onSwitchMode],
+    [
+      text,
+      slashStart,
+      closeSlash,
+      onExecuteBuiltinCommand,
+      onSwitchMode,
+      onSend,
+    ],
   );
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent) => {
       // Handle slash popup navigation
-      if (slashOpen && filteredSlashCommands.length > 0) {
+      if (
+        slashOpen &&
+        filteredSlashCommands.length > 0 &&
+        !matchedSlashCommand
+      ) {
         if (e.key === "ArrowDown") {
           e.preventDefault();
           setSlashSelectedIdx((i) => (i + 1) % filteredSlashCommands.length);
@@ -348,24 +407,31 @@ export function InputArea({
           return;
         }
         if (e.key === "Enter" && !e.shiftKey) {
-          e.preventDefault();
-          const cmd = filteredSlashCommands[slashSelectedIdx];
-          if (cmd) handleSlashSelect(cmd);
-          return;
+          if (!matchedSlashCommand) {
+            e.preventDefault();
+            const cmd = filteredSlashCommands[slashSelectedIdx];
+            if (cmd) handleSlashSelect(cmd);
+            return;
+          }
         }
         if (e.key === "Tab") {
           e.preventDefault();
           const cmd = filteredSlashCommands[slashSelectedIdx];
           if (cmd && !cmd.name.startsWith("__")) {
-            const before = slashStart >= 0 ? text.slice(0, slashStart) : "";
-            const newText = before + "/" + cmd.name + " ";
-            setText(newText);
+            const selectionState = getSlashCommandSelectionState(
+              text,
+              slashStart,
+              cmd.name,
+            );
+            setText(selectionState.replacementText);
             closeSlash();
             requestAnimationFrame(() => {
               if (textareaRef.current) {
                 textareaRef.current.focus();
-                textareaRef.current.selectionStart = newText.length;
-                textareaRef.current.selectionEnd = newText.length;
+                textareaRef.current.selectionStart =
+                  selectionState.replacementText.length;
+                textareaRef.current.selectionEnd =
+                  selectionState.replacementText.length;
               }
             });
           }
@@ -405,6 +471,7 @@ export function InputArea({
       slashSelectedIdx,
       handleSlashSelect,
       closeSlash,
+      matchedSlashCommand,
     ],
   );
 
@@ -561,9 +628,7 @@ export function InputArea({
         // Check if user just typed / at start or after whitespace
         if (
           value[cursor - 1] === "/" &&
-          (cursor === 1 ||
-            value[cursor - 2] === "\n" ||
-            value[cursor - 2] === " ")
+          shouldOpenSlashPopup(value, cursor - 1)
         ) {
           setSlashStart(cursor - 1);
           setSlashQuery("");
@@ -756,8 +821,10 @@ export function InputArea({
         {availableModels.length > 0 && onSelectModel && (
           <ModelSelector
             currentModel={currentModel}
+            currentCondenseThreshold={currentCondenseThreshold}
             models={availableModels}
             onSelect={onSelectModel}
+            onSetCondenseThreshold={onSetCondenseThreshold}
             onSignIn={onSignIn}
           />
         )}
@@ -840,36 +907,75 @@ export function InputArea({
           vscodeApi={vscodeApi}
         />
       )}
-      {slashOpen && filteredSlashCommands.length > 0 && (
-        <SlashCommandPopup
-          commands={filteredSlashCommands}
-          selectedIndex={slashSelectedIdx}
-          anchor={getPickerAnchor()}
-          onSelect={handleSlashSelect}
-          onClose={closeSlash}
-          isSubView={slashView !== "main"}
-          subViewTitle={
-            slashView === "mode"
-              ? "Switch Mode"
-              : slashView === "model"
-                ? "Switch Model"
-                : slashView === "mcp"
-                  ? "Open MCP Config"
-                  : undefined
-          }
-          onBack={() => {
-            setSlashView("main");
-            setSlashSelectedIdx(0);
-          }}
-        />
-      )}
+      {slashOpen &&
+        filteredSlashCommands.length > 0 &&
+        !matchedSlashCommand && (
+          <SlashCommandPopup
+            commands={filteredSlashCommands}
+            selectedIndex={slashSelectedIdx}
+            anchor={getPickerAnchor()}
+            onSelect={handleSlashSelect}
+            onClose={closeSlash}
+            isSubView={slashView !== "main"}
+            subViewTitle={
+              slashView === "mode"
+                ? "Switch Mode"
+                : slashView === "model"
+                  ? "Switch Model"
+                  : slashView === "mcp"
+                    ? "Open MCP Config"
+                    : undefined
+            }
+            onBack={() => {
+              setSlashView("main");
+              setSlashSelectedIdx(0);
+            }}
+          />
+        )}
       <div
-        class={`input-wrapper ${dragOver ? "drag-over" : ""} ${pickerOpen ? "picker-active" : ""}`}
+        class={`input-wrapper ${dragOver ? "drag-over" : ""} ${pickerOpen ? "picker-active" : ""} ${matchedExecutableSlashCommand ? "slash-match-active" : ""}`}
         ref={inputWrapperRef}
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
       >
+        {matchedExecutableSlashCommand && (
+          <div class="slash-match-pill-row">
+            <div
+              class="slash-match-pill"
+              title={matchedExecutableSlashCommand.command.description}
+            >
+              <i
+                class={`codicon codicon-${matchedExecutableSlashCommand.command.icon ?? (matchedExecutableSlashCommand.command.builtin ? "symbol-event" : "file")}`}
+              />
+              <span class="slash-match-pill-name">
+                /{matchedExecutableSlashCommand.command.name}
+              </span>
+              <span class="slash-match-pill-desc">
+                {matchedExecutableSlashCommand.command.description}
+              </span>
+            </div>
+            <button
+              class="slash-match-escape"
+              type="button"
+              title="Wrap in backticks to send this slash command as raw text"
+              onClick={() => {
+                const escaped = wrapTextInBackticks(text);
+                setText(escaped);
+                closeSlash();
+                requestAnimationFrame(() => {
+                  if (textareaRef.current) {
+                    textareaRef.current.focus();
+                    textareaRef.current.selectionStart = escaped.length;
+                    textareaRef.current.selectionEnd = escaped.length;
+                  }
+                });
+              }}
+            >
+              <code>`raw`</code>
+            </button>
+          </div>
+        )}
         <textarea
           ref={textareaRef}
           class="chat-input"

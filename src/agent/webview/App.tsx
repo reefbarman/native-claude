@@ -135,7 +135,7 @@ type AppAction =
   | { type: "EDIT_QUEUE_MESSAGE"; id: string; text: string }
   | { type: "REMOVE_FROM_QUEUE"; id: string }
   | { type: "CLEAR_QUEUE" }
-  | { type: "ADD_INTERJECTION"; text: string; isSlashCommand?: boolean }
+  | { type: "ADD_INTERJECTION"; text: string }
   | { type: "SET_QUESTION"; id: string; questions: Question[] }
   | { type: "CLEAR_QUESTION" }
   | {
@@ -845,6 +845,7 @@ export function reducer(state: AppState, action: AppAction): AppState {
                 ...q,
                 text: action.text,
                 fullText: action.text,
+                isSlashCommand: false,
               }
             : q,
         ),
@@ -871,7 +872,6 @@ export function reducer(state: AppState, action: AppAction): AppState {
             content: action.text,
             timestamp: Date.now(),
             blocks: [],
-            isSlashCommand: action.isSlashCommand,
           },
           {
             id: crypto.randomUUID(),
@@ -1426,8 +1426,6 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
               dispatch({
                 type: "ADD_USER_MESSAGE",
                 text: displayCombined,
-                isSlashCommand:
-                  queue.length === 1 && Boolean(queue[0].isSlashCommand),
               });
               vscodeApi.postMessage({
                 command: "agentSend",
@@ -1587,7 +1585,6 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
           dispatch({
             type: "ADD_INTERJECTION",
             text: (msg.displayText as string | undefined) ?? msg.text,
-            isSlashCommand: Boolean(msg.displayText),
           });
           dispatch({ type: "REMOVE_FROM_QUEUE", id: msg.queueId });
           messageQueueRef.current = messageQueueRef.current.filter(
@@ -1863,6 +1860,16 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
     [vscodeApi],
   );
 
+  const handleSetCondenseThreshold = useCallback(
+    (threshold: number) => {
+      vscodeApi.postMessage({
+        command: "agentSetCondenseThreshold",
+        threshold,
+      });
+    },
+    [vscodeApi],
+  );
+
   const handleSignIn = useCallback(
     (provider: string) => {
       if (
@@ -1997,9 +2004,12 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
     [vscodeApi],
   );
 
-  const handleOpenMermaidPanel = useCallback(
-    (source: string) => {
-      vscodeApi.postMessage({ command: "agentOpenMermaidPanel", source });
+  const handleOpenSpecialBlockPanel = useCallback(
+    (block: { kind: "mermaid" | "vega" | "vega-lite"; source: string }) => {
+      vscodeApi.postMessage({
+        command: "agentOpenSpecialBlockPanel",
+        ...block,
+      });
     },
     [vscodeApi],
   );
@@ -2246,7 +2256,7 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
           streaming={state.streaming}
           sessionId={state.chatState.sessionId}
           onOpenFile={handleOpenFile}
-          onOpenMermaidPanel={handleOpenMermaidPanel}
+          onOpenSpecialBlockPanel={handleOpenSpecialBlockPanel}
           onRevertCheckpoint={handleRevertCheckpoint}
           onViewCheckpointDiff={handleViewCheckpointDiff}
           onRetry={handleRetry}
@@ -2578,8 +2588,10 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
           modes={state.modes}
           currentMode={state.chatState.mode}
           currentModel={state.chatState.model}
+          currentCondenseThreshold={state.chatState.condenseThreshold}
           availableModels={state.availableModels}
           onSelectModel={handleSelectModel}
+          onSetCondenseThreshold={handleSetCondenseThreshold}
           onSignIn={handleSignIn}
           onSwitchMode={handleSwitchMode}
           agentWriteApproval={state.chatState.agentWriteApproval ?? "prompt"}

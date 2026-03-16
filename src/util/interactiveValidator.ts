@@ -50,7 +50,7 @@ const INTERACTIVE_TUI = new Set([
   "nethogs",
   "bmon",
   "ncdu",
-  "mc",      // midnight commander
+  "mc", // midnight commander
   "ranger",
   "nnn",
   "vifm",
@@ -63,23 +63,24 @@ const INTERACTIVE_TUI = new Set([
 const DATABASE_CLIS: Record<string, { flags: string[]; suggestion: string }> = {
   mysql: {
     flags: ["-e", "--execute"],
-    suggestion: "Use: mysql -e \"SELECT ...\" or mysql < script.sql",
+    suggestion: 'Use: mysql -e "SELECT ..." or mysql < script.sql',
   },
   psql: {
     flags: ["-c", "--command", "-f", "--file"],
-    suggestion: "Use: psql -c \"SELECT ...\" or psql -f script.sql",
+    suggestion: 'Use: psql -c "SELECT ..." or psql -f script.sql',
   },
   mongosh: {
     flags: ["--eval"],
-    suggestion: "Use: mongosh --eval \"db.collection.find()\"",
+    suggestion: 'Use: mongosh --eval "db.collection.find()"',
   },
   mongo: {
     flags: ["--eval"],
-    suggestion: "Use: mongo --eval \"db.collection.find()\"",
+    suggestion: 'Use: mongo --eval "db.collection.find()"',
   },
   sqlite3: {
     flags: [], // sqlite3 with a filename + no stdin is fine, but bare sqlite3 is interactive
-    suggestion: "Use: sqlite3 db.sqlite \"SELECT ...\" or sqlite3 db.sqlite < script.sql",
+    suggestion:
+      'Use: sqlite3 db.sqlite "SELECT ..." or sqlite3 db.sqlite < script.sql',
   },
   "redis-cli": {
     flags: ["--pipe", "--eval"],
@@ -88,17 +89,20 @@ const DATABASE_CLIS: Record<string, { flags: string[]; suggestion: string }> = {
   // Windows
   sqlcmd: {
     flags: ["-Q", "-i", "-q"],
-    suggestion: "Use: sqlcmd -Q \"SELECT ...\" or sqlcmd -i script.sql",
+    suggestion: 'Use: sqlcmd -Q "SELECT ..." or sqlcmd -i script.sql',
   },
   "sqlcmd.exe": {
     flags: ["-Q", "-i", "-q"],
-    suggestion: "Use: sqlcmd -Q \"SELECT ...\" or sqlcmd -i script.sql",
+    suggestion: 'Use: sqlcmd -Q "SELECT ..." or sqlcmd -i script.sql',
   },
 };
 
 // ── REPLs (no arguments = interactive) ──────────────────────────────
 
-const REPL_COMMANDS: Record<string, { nonInteractiveFlags: string[]; suggestion: string }> = {
+const REPL_COMMANDS: Record<
+  string,
+  { nonInteractiveFlags: string[]; suggestion: string }
+> = {
   python: {
     nonInteractiveFlags: ["-c", "-m", "-"],
     suggestion: "Use: python -c \"print('hello')\" or python script.py",
@@ -117,7 +121,7 @@ const REPL_COMMANDS: Record<string, { nonInteractiveFlags: string[]; suggestion:
   },
   irb: {
     nonInteractiveFlags: [],
-    suggestion: "Use: ruby -e \"...\" instead of irb",
+    suggestion: 'Use: ruby -e "..." instead of irb',
   },
   php: {
     nonInteractiveFlags: ["-r", "-f"],
@@ -135,10 +139,14 @@ const REPL_COMMANDS: Record<string, { nonInteractiveFlags: string[]; suggestion:
 
 // ── Git interactive flags ───────────────────────────────────────────
 
-const GIT_INTERACTIVE_FLAGS: Record<string, { flags: string[]; suggestion: string }> = {
+const GIT_INTERACTIVE_FLAGS: Record<
+  string,
+  { flags: string[]; suggestion: string }
+> = {
   rebase: {
     flags: ["-i", "--interactive"],
-    suggestion: "Interactive rebase requires manual input. Consider using non-interactive rebase or specific git commands instead.",
+    suggestion:
+      "Interactive rebase requires manual input. Consider using non-interactive rebase or specific git commands instead.",
   },
   add: {
     flags: ["-i", "--interactive", "-p", "--patch"],
@@ -146,19 +154,23 @@ const GIT_INTERACTIVE_FLAGS: Record<string, { flags: string[]; suggestion: strin
   },
   checkout: {
     flags: ["-p", "--patch"],
-    suggestion: "Use: git checkout <specific-files> instead of interactive patch mode.",
+    suggestion:
+      "Use: git checkout <specific-files> instead of interactive patch mode.",
   },
   stash: {
     flags: ["-p", "--patch"],
-    suggestion: "Use: git stash or git stash push <specific-files> instead of interactive patch mode.",
+    suggestion:
+      "Use: git stash or git stash push <specific-files> instead of interactive patch mode.",
   },
   reset: {
     flags: ["-p", "--patch"],
-    suggestion: "Use: git reset <specific-files> instead of interactive patch mode.",
+    suggestion:
+      "Use: git reset <specific-files> instead of interactive patch mode.",
   },
   commit: {
     flags: ["-p", "--patch"],
-    suggestion: "Use: git add <files> && git commit -m \"message\" instead of interactive patch mode.",
+    suggestion:
+      'Use: git add <files> && git commit -m "message" instead of interactive patch mode.',
   },
 };
 
@@ -196,21 +208,35 @@ const SHELL_COMMANDS = new Set([
 
 // ── Scaffolding commands that often prompt ───────────────────────────
 
-const SCAFFOLDING_PREFIXES: Array<{ prefix: string; yesFlags: string[]; suggestion: string }> = [
+const SCAFFOLDING_PREFIXES: Array<{
+  prefix: string;
+  yesFlags: string[];
+  suggestion: string;
+}> = [
   {
     prefix: "npx create-",
-    yesFlags: ["--yes", "-y", "--use-npm", "--use-yarn", "--use-pnpm", "--use-bun"],
-    suggestion: "Pass all configuration flags upfront to avoid interactive prompts. For create-next-app, use: npx create-next-app@latest myapp --typescript --tailwind --eslint --app --src-dir --use-npm",
+    yesFlags: [
+      "--yes",
+      "-y",
+      "--use-npm",
+      "--use-yarn",
+      "--use-pnpm",
+      "--use-bun",
+    ],
+    suggestion:
+      "Pass all configuration flags upfront to avoid interactive prompts. For create-next-app, use: npx create-next-app@latest myapp --typescript --tailwind --eslint --app --src-dir --use-npm",
   },
   {
     prefix: "npm create ",
     yesFlags: ["--yes", "-y", "--"],
-    suggestion: "Use -- to pass flags to the underlying scaffolder, or use npx with explicit flags.",
+    suggestion:
+      "Use -- to pass flags to the underlying scaffolder, or use npx with explicit flags.",
   },
   {
     prefix: "npm init",
     yesFlags: ["-y", "--yes", "-w", "--workspace"],
-    suggestion: "Use: npm init -y for default package.json, or npm init -y -w packages/name for workspaces.",
+    suggestion:
+      "Use: npm init -y for default package.json, or npm init -y -w packages/name for workspaces.",
   },
   {
     prefix: "yarn create ",
@@ -226,11 +252,7 @@ const SCAFFOLDING_PREFIXES: Array<{ prefix: string; yesFlags: string[]; suggesti
 
 // ── Password / credential prompts ────────────────────────────────────
 
-const PASSWORD_COMMANDS = new Set([
-  "passwd",
-  "chpasswd",
-  "su",
-]);
+const PASSWORD_COMMANDS = new Set(["passwd", "chpasswd", "su"]);
 
 /**
  * Validate a command for known interactive patterns.
@@ -318,7 +340,10 @@ function checkSingleCommand(command: string): InteractiveViolation | null {
     const hasNonInteractiveFlag = dbInfo.flags.some((f) => args.includes(f));
     // sqlite3 with at least a filename and a query arg is fine
     if (cmd === "sqlite3" && args.length >= 2) return null;
-    if (!hasNonInteractiveFlag && !(cmd === "redis-cli" && args.length > 0 && !args[0].startsWith("-"))) {
+    if (
+      !hasNonInteractiveFlag &&
+      !(cmd === "redis-cli" && args.length > 0 && !args[0].startsWith("-"))
+    ) {
       return {
         command: cmd,
         reason: `"${cmd}" without a command flag opens an interactive session.`,
@@ -343,7 +368,7 @@ function checkSingleCommand(command: string): InteractiveViolation | null {
     }
   }
 
-  // ── Check git interactive flags ───────────────────────────────
+  // ── Check git interactive flags and editor-opening flows ──────
   if (cmd === "git" && args.length > 0) {
     const gitSubCmd = args[0];
     const gitInfo = GIT_INTERACTIVE_FLAGS[gitSubCmd];
@@ -357,6 +382,56 @@ function checkSingleCommand(command: string): InteractiveViolation | null {
           suggestion: gitInfo.suggestion,
         };
       }
+    }
+
+    const gitArgs = args.slice(1);
+    if (gitSubCmd === "commit" && opensGitEditorWithoutMessage(gitArgs)) {
+      return {
+        command: "git commit",
+        reason:
+          '"git commit" without -m/-F/--no-edit may open an editor for the commit message.',
+        suggestion:
+          'Use: git commit -m "message" or git commit -F message.txt. For amend flows, use --no-edit when appropriate.',
+      };
+    }
+
+    if (gitSubCmd === "tag" && opensAnnotatedTagEditor(gitArgs)) {
+      return {
+        command: "git tag",
+        reason:
+          'Annotated "git tag" without -m/-F may open an editor for the tag message.',
+        suggestion:
+          'Use: git tag -a <tag> -m "message" or git tag -a <tag> -F message.txt.',
+      };
+    }
+
+    if (gitSubCmd === "revert" && opensGitEditorWithoutNoEdit(gitArgs)) {
+      return {
+        command: "git revert",
+        reason:
+          '"git revert" without --no-edit may open an editor for the revert message.',
+        suggestion:
+          "Use: git revert --no-edit <commit> when the default message is acceptable.",
+      };
+    }
+
+    if (gitSubCmd === "cherry-pick" && opensGitEditorWithoutNoEdit(gitArgs)) {
+      return {
+        command: "git cherry-pick",
+        reason:
+          '"git cherry-pick" without --no-edit may open an editor for the commit message.',
+        suggestion:
+          "Use: git cherry-pick --no-edit <commit> when the default message is acceptable.",
+      };
+    }
+
+    if (gitSubCmd === "notes" && gitArgs[0] === "edit") {
+      return {
+        command: "git notes edit",
+        reason: '"git notes edit" opens an editor for note content.',
+        suggestion:
+          'Use: git notes add -m "note" <object> or git notes append -m "note" <object> instead.',
+      };
     }
   }
 
@@ -385,7 +460,10 @@ function checkSingleCommand(command: string): InteractiveViolation | null {
   // ── Check scaffolding commands ────────────────────────────────
   const fullCmd = tokens.slice(cmdIndex).join(" ");
   for (const scaffold of SCAFFOLDING_PREFIXES) {
-    if (fullCmd.startsWith(scaffold.prefix) || fullCmd.startsWith(scaffold.prefix.trimEnd())) {
+    if (
+      fullCmd.startsWith(scaffold.prefix) ||
+      fullCmd.startsWith(scaffold.prefix.trimEnd())
+    ) {
       // Check if any yes/non-interactive flag is present
       const hasYesFlag = scaffold.yesFlags.some((f) => args.includes(f));
       if (!hasYesFlag) {
@@ -471,6 +549,26 @@ function splitOnCompoundOperators(command: string): string[] {
 
   segments.push(current);
   return segments;
+}
+
+function opensGitEditorWithoutMessage(args: string[]): boolean {
+  const hasMessageFlag = args.some((arg) =>
+    ["-m", "--message", "-F", "--file", "--fixup", "--squash"].includes(arg),
+  );
+  const hasNoEdit = args.includes("--no-edit");
+  const isAmend = args.includes("--amend");
+  return !hasMessageFlag && !(isAmend && hasNoEdit);
+}
+
+function opensAnnotatedTagEditor(args: string[]): boolean {
+  const isAnnotated =
+    args.includes("-a") || args.includes("-s") || args.includes("-u");
+  if (!isAnnotated) return false;
+  return !args.some((arg) => ["-m", "--message", "-F", "--file"].includes(arg));
+}
+
+function opensGitEditorWithoutNoEdit(args: string[]): boolean {
+  return !args.includes("--no-edit");
 }
 
 /**

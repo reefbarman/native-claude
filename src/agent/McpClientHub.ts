@@ -12,6 +12,10 @@ import type { ToolDefinition, JsonSchema } from "./providers/types.js";
 import type { McpServerConfig } from "./mcpConfig.js";
 import type { ToolResult } from "../shared/types.js";
 import { McpOAuthProvider } from "./McpOAuthProvider.js";
+import {
+  buildAgentExecutionEnv,
+  inheritProcessEnv,
+} from "../process/agentExecutionPolicy.js";
 
 export type McpServerStatus =
   | "connecting"
@@ -354,7 +358,11 @@ export class McpClientHub {
       return new StdioClientTransport({
         command: cfg.command,
         args: cfg.args ?? [],
-        env: cfg.env as Record<string, string> | undefined,
+        env: {
+          ...inheritProcessEnv(),
+          ...buildAgentExecutionEnv(),
+          ...cfg.env,
+        },
       });
     }
 

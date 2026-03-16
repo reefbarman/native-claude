@@ -12,6 +12,7 @@ export interface WebviewModelInfo {
   provider: string;
   contextWindow: number;
   authenticated: boolean;
+  condenseThreshold?: number;
 }
 
 /** A slash command available for autocomplete */

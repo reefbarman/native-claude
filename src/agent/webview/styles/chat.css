@@ -295,7 +295,11 @@ body {
   align-items: center;
   gap: 6px;
   padding: 5px 12px;
-  background: color-mix(in srgb, var(--vscode-sideBar-background) 85%, var(--vscode-foreground) 15%);
+  background: color-mix(
+    in srgb,
+    var(--vscode-sideBar-background) 85%,
+    var(--vscode-foreground) 15%
+  );
   border-bottom: 1px solid var(--vscode-panel-border);
   cursor: pointer;
   flex-shrink: 0;
@@ -318,7 +322,7 @@ body {
 .prompt-preview .codicon {
   font-size: 12px;
   flex-shrink: 0;
-  color: #4EC9B0;
+  color: #4ec9b0;
 }
 
 .prompt-preview-text {
@@ -406,7 +410,8 @@ body {
   align-items: center;
   gap: 4px;
   background: color-mix(in srgb, var(--vscode-foreground) 8%, transparent);
-  border: 1px solid color-mix(in srgb, var(--vscode-foreground) 12%, transparent);
+  border: 1px solid
+    color-mix(in srgb, var(--vscode-foreground) 12%, transparent);
   border-radius: 4px;
   padding: 2px 8px 2px 5px;
   font-size: 11px;
@@ -600,35 +605,38 @@ body {
   font-weight: 600;
 }
 
-/* ── Mermaid Diagrams ── */
+/* ── Mermaid / Vega Blocks ── */
 
-.mermaid-container {
+.special-block-container {
   margin: 8px 0;
   border: 1px solid var(--vscode-panel-border);
   border-radius: 6px;
   overflow: hidden;
 }
 
-.mermaid-diagram {
+.special-block-render {
   padding: 12px;
   display: flex;
   justify-content: center;
-  overflow-x: auto;
+  overflow: auto;
+  background: var(--vscode-editor-background);
 }
 
-.mermaid-diagram svg {
+.special-block-render svg,
+.special-block-render canvas {
+  display: block;
   max-width: 100%;
   height: auto;
 }
 
-.mermaid-actions {
+.special-block-actions {
   display: flex;
   gap: 6px;
   padding: 0 8px 6px;
 }
 
-.mermaid-toggle-code,
-.mermaid-popout {
+.special-block-toggle-code,
+.special-block-popout {
   background: none;
   border: 1px solid var(--vscode-panel-border);
   border-radius: 4px;
@@ -639,13 +647,13 @@ body {
   font-size: 11px;
 }
 
-.mermaid-toggle-code:hover,
-.mermaid-popout:hover {
+.special-block-toggle-code:hover,
+.special-block-popout:hover {
   background: var(--vscode-toolbar-hoverBackground);
   color: var(--vscode-foreground);
 }
 
-.mermaid-source {
+.special-block-source {
   margin: 0;
   padding: 8px 12px;
   border-top: 1px solid var(--vscode-panel-border);
@@ -654,15 +662,27 @@ body {
   overflow-x: auto;
 }
 
-.mermaid-source code {
+.special-block-source code {
   font-family: var(--vscode-editor-font-family);
   font-size: 12px;
 }
 
-.mermaid-error {
+.special-block-error {
   color: var(--vscode-errorForeground);
   font-size: 12px;
   font-style: italic;
+}
+
+.special-block-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 /* ── Thinking Block ── */
@@ -2011,6 +2031,64 @@ body {
   flex-shrink: 0;
 }
 
+.model-selector-trigger {
+  gap: 6px;
+}
+
+.model-selector-threshold-badge,
+.model-selector-option-threshold {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, #4ec9b0 18%, transparent);
+  color: #5ee0c4;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.model-selector-option-threshold.interactive {
+  cursor: pointer;
+  transition:
+    background-color 120ms ease,
+    color 120ms ease,
+    transform 120ms ease;
+}
+
+.model-selector-option-threshold.interactive:hover {
+  background: color-mix(in srgb, #4ec9b0 28%, transparent);
+  color: #88f5df;
+  transform: translateY(-1px);
+}
+
+.model-selector-option-wrap {
+  display: block;
+}
+
+.model-selector-dropdown {
+  min-width: 220px;
+}
+
+.model-selector-slider-panel {
+  padding: 0 10px 8px;
+}
+
+.model-selector-slider-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 2px 0 4px;
+  font-size: 10px;
+  color: var(--vscode-descriptionForeground);
+}
+
+.model-selector-slider {
+  width: 100%;
+}
+
 .input-wrapper {
   position: relative;
   background: var(--vscode-input-background);
@@ -2019,6 +2097,10 @@ body {
   padding: 4px 4px 4px 10px;
   max-height: 216px;
   overflow-y: auto;
+}
+
+.input-wrapper.slash-match-active {
+  border-color: color-mix(in srgb, #4ec9b0 60%, var(--vscode-focusBorder));
 }
 
 .input-wrapper.picker-active,
@@ -2051,6 +2133,70 @@ body {
   padding: 4px 36px 4px 0;
   line-height: 1.4;
   overflow: hidden;
+}
+
+.slash-match-pill-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 4px 2px 0;
+}
+
+.slash-match-pill {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, #4ec9b0 18%, var(--vscode-badge-background));
+  color: var(--vscode-badge-foreground);
+  border: 1px solid color-mix(in srgb, #4ec9b0 50%, transparent);
+  font-size: 11px;
+}
+
+.slash-match-pill .codicon {
+  color: #4ec9b0;
+  font-size: 12px;
+}
+
+.slash-match-pill-name {
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.slash-match-pill-desc {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.8;
+}
+
+.slash-match-escape {
+  flex-shrink: 0;
+  border: 1px solid
+    var(--vscode-inputOption-activeBorder, var(--vscode-panel-border));
+  background: transparent;
+  color: var(--vscode-descriptionForeground);
+  border-radius: 6px;
+  padding: 2px 6px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+}
+
+.slash-match-escape:hover {
+  background: var(--vscode-toolbar-hoverBackground);
+  color: var(--vscode-foreground);
+}
+
+.slash-match-escape code {
+  background: none;
+  padding: 0;
+  font-size: inherit;
 }
 
 .input-wrapper::-webkit-scrollbar {
@@ -2282,7 +2428,10 @@ body {
 }
 
 .copy-button:hover {
-  background: var(--vscode-button-secondaryBackground, var(--vscode-sideBar-background));
+  background: var(
+    --vscode-button-secondaryBackground,
+    var(--vscode-sideBar-background)
+  );
   border-color: var(--vscode-focusBorder);
 }
 
@@ -2436,7 +2585,10 @@ body {
 
 .checkpoint-popover-btn-danger {
   background: var(--vscode-inputValidation-errorBackground, #5a1d1d);
-  color: var(--vscode-inputValidation-errorForeground, var(--vscode-errorForeground, #f48771));
+  color: var(
+    --vscode-inputValidation-errorForeground,
+    var(--vscode-errorForeground, #f48771)
+  );
   border-color: var(--vscode-inputValidation-errorBorder, #f48771);
 }
 
@@ -3257,7 +3409,10 @@ body {
 }
 .approval-panel-embed .btn-danger {
   background: var(--vscode-inputValidation-errorBackground, #5a1d1d);
-  color: var(--vscode-inputValidation-errorForeground, var(--vscode-errorForeground, #f48771));
+  color: var(
+    --vscode-inputValidation-errorForeground,
+    var(--vscode-errorForeground, #f48771)
+  );
   border-color: var(--vscode-inputValidation-errorBorder, #be1100);
 }
 .approval-panel-embed .btn-danger:hover {
@@ -3714,8 +3869,12 @@ body {
 }
 
 @keyframes bgSessionFadeOut {
-  from { opacity: 0.6; }
-  to { opacity: 0; }
+  from {
+    opacity: 0.6;
+  }
+  to {
+    opacity: 0;
+  }
 }
 
 /* ── Background Agent Block & Result (reuse tool-call-block styles) ── */
@@ -3772,7 +3931,8 @@ body {
   margin: 6px 10px;
   padding: 4px 8px;
   background: none;
-  border: 1px solid color-mix(in srgb, var(--vscode-foreground) 20%, transparent);
+  border: 1px solid
+    color-mix(in srgb, var(--vscode-foreground) 20%, transparent);
   border-radius: 4px;
   color: var(--vscode-textLink-foreground);
   font-size: 11px;
@@ -3924,7 +4084,11 @@ body {
   align-items: center;
   gap: 6px;
   padding: 5px 12px;
-  background: color-mix(in srgb, #4ec9b0 10%, var(--vscode-textCodeBlock-background));
+  background: color-mix(
+    in srgb,
+    #4ec9b0 10%,
+    var(--vscode-textCodeBlock-background)
+  );
   color: #4ec9b0;
   font-weight: 600;
   font-size: 11px;

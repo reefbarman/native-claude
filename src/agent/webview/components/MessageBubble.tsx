@@ -40,7 +40,10 @@ interface MessageBubbleProps {
   message: ChatMessage;
   streaming: boolean;
   onOpenFile?: (path: string, line?: number) => void;
-  onOpenMermaidPanel?: (source: string) => void;
+  onOpenSpecialBlockPanel?: (block: {
+    kind: "mermaid" | "vega" | "vega-lite";
+    source: string;
+  }) => void;
   onRetry?: () => void;
   onSignIn?: () => void;
   bgSessions?: BgSessionInfoProps[];
@@ -52,7 +55,7 @@ export function MessageBubble({
   message,
   streaming,
   onOpenFile,
-  onOpenMermaidPanel,
+  onOpenSpecialBlockPanel,
   onRetry,
   onSignIn,
   bgSessions,
@@ -152,7 +155,7 @@ export function MessageBubble({
                   streaming={isActiveStream}
                   showCopy={!isActiveStream}
                   onOpenFile={onOpenFile}
-                  onOpenMermaidPanel={onOpenMermaidPanel}
+                  onOpenSpecialBlockPanel={onOpenSpecialBlockPanel}
                   onRevealStart={
                     isActiveStream ? () => setTextRevealed(true) : undefined
                   }
@@ -376,14 +379,17 @@ function TextBlock({
   streaming,
   showCopy,
   onOpenFile,
-  onOpenMermaidPanel,
+  onOpenSpecialBlockPanel,
   onRevealStart: onRevealStartProp,
 }: {
   text: string;
   streaming: boolean;
   showCopy: boolean;
   onOpenFile?: (path: string, line?: number) => void;
-  onOpenMermaidPanel?: (source: string) => void;
+  onOpenSpecialBlockPanel?: (block: {
+    kind: "mermaid" | "vega" | "vega-lite";
+    source: string;
+  }) => void;
   onRevealStart?: () => void;
 }) {
   const [revealed, setRevealed] = useState(false);
@@ -403,7 +409,7 @@ function TextBlock({
         streaming={streaming}
         onRevealStart={handleRevealStart}
         onOpenFile={onOpenFile}
-        onOpenMermaidPanel={onOpenMermaidPanel}
+        onOpenSpecialBlockPanel={onOpenSpecialBlockPanel}
       />
       {showCopy && <CopyButton text={text} />}
     </div>

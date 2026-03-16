@@ -12,6 +12,7 @@ import {
 } from "./toolAdapter.js";
 import { handleToolError } from "../shared/types.js";
 import type { ToolResult } from "../shared/types.js";
+import type { TrackerContext } from "../server/ToolCallTracker.js";
 import {
   TODO_TOOL_NAME,
   todoTool,
@@ -70,6 +71,39 @@ function isRetryableError(msg: string): boolean {
   );
 }
 
+function extractAgentDisplayArgs(
+  toolName: string,
+  input: Record<string, unknown>,
+): string {
+  switch (toolName) {
+    case "execute_command":
+      return String(input.command ?? "").slice(0, 80);
+    case "get_terminal_output":
+      return String(input.terminal_id ?? "");
+    case "close_terminals":
+      return Array.isArray(input.names)
+        ? (input.names as string[]).join(", ")
+        : "all";
+    case "read_file":
+    case "list_files":
+    case "get_diagnostics":
+    case "open_file":
+    case "write_file":
+    case "apply_diff":
+      return String(input.path ?? "");
+    case "search_files":
+      return String(input.regex ?? "").slice(0, 60);
+    case "show_notification":
+      return String(input.message ?? "").slice(0, 60);
+    case "rename_symbol":
+      return String(input.new_name ?? "");
+    case "find_and_replace":
+      return `${String(input.find ?? "").slice(0, 30)} → ${String(input.replace ?? "").slice(0, 30)}`;
+    default:
+      return "";
+  }
+}
+
 /** Custom error for auth failures, so the outer catch can mark them specially. */
 class AuthenticationError extends Error {
   constructor(message: string) {
@@ -90,6 +124,39 @@ function isAuthError(msg: string): boolean {
 
 function getContextWindow(model: string, provider: ModelProvider): number {
   return provider.getCapabilities(model).contextWindow;
+}
+
+function isOverCondenseThresholdInternal(
+  session: AgentSession,
+  provider: ModelProvider,
+  toolResults?: ToolCallResult[],
+): boolean {
+  if (!session.autoCondense || session.lastInputTokens === 0) return false;
+  const contextWindow = getContextWindow(session.model, provider);
+  const usableWindow = contextWindow - session.maxTokens;
+  if (usableWindow <= 0) return false;
+
+  const estimatedResultTokens = toolResults
+    ? Math.ceil(
+        toolResults.reduce(
+          (n, tr) =>
+            n +
+            JSON.stringify(
+              toolResultToContent(tr.result, undefined, tr.toolName),
+            ).length,
+          0,
+        ) / 4,
+      )
+    : 0;
+  const used =
+    session.lastInputTokens + session.lastOutputTokens + estimatedResultTokens;
+  const usedFraction = used / usableWindow;
+  const cacheHitRatio = session.lastCacheReadTokens / session.lastInputTokens;
+  const effectiveThreshold = Math.min(
+    session.autoCondenseThreshold + cacheHitRatio * 0.1,
+    0.95,
+  );
+  return usedFraction >= effectiveThreshold;
 }
 
 function hasUnansweredUserTurn(session: AgentSession): boolean {
@@ -778,7 +845,12 @@ export class AgentEngine {
 
         const dispatchResults =
           dispatchBlocks.length > 0
-            ? await this.executeToolCalls(dispatchBlocks, signal, sessionCtx)
+            ? await this.executeToolCalls(
+                dispatchBlocks,
+                signal,
+                sessionCtx,
+                session,
+              )
             : [];
 
         // Merge results back in original order
@@ -904,53 +976,94 @@ export class AgentEngine {
    * token cost (used for the post-batch check, where results have been appended
    * to history but lastInputTokens still reflects pre-result counts).
    */
-  private isOverCondenseThreshold(
+  isOverCondenseThreshold(
     session: AgentSession,
     toolResults?: ToolCallResult[],
     provider?: ModelProvider,
   ): boolean {
-    if (!session.autoCondense || session.lastInputTokens === 0) return false;
-    const contextWindow = provider
-      ? getContextWindow(session.model, provider)
-      : 200_000;
-    const usableWindow = contextWindow - session.maxTokens;
-    // Estimate additional tokens from tool results: chars ÷ 4 is a rough but
-    // sufficient approximation for detecting large spikes before the next API call.
-    // Use the same truncated representation that is actually persisted into
-    // conversation history so projected usage matches what will be sent next turn.
-    const estimatedResultTokens = toolResults
-      ? Math.ceil(
-          toolResults.reduce(
-            (n, tr) =>
-              n +
-              JSON.stringify(
-                toolResultToContent(tr.result, undefined, tr.toolName),
-              ).length,
-            0,
-          ) / 4,
-        )
-      : 0;
-    const used =
-      session.lastInputTokens +
-      session.lastOutputTokens +
-      estimatedResultTokens;
-    const usedFraction = used / usableWindow;
-    const cacheHitRatio = session.lastCacheReadTokens / session.lastInputTokens;
-    const effectiveThreshold = Math.min(
-      session.autoCondenseThreshold + cacheHitRatio * 0.1,
-      0.95,
+    const resolvedProvider =
+      provider ?? this.registry.tryResolveProvider(session.model);
+    if (!resolvedProvider) return false;
+    return isOverCondenseThresholdInternal(
+      session,
+      resolvedProvider,
+      toolResults,
     );
-    return usedFraction >= effectiveThreshold;
   }
 
   private async executeToolCalls(
     calls: ToolUseBlock[],
     signal: AbortSignal,
     ctx: ToolDispatchContext,
+    session: AgentSession,
   ): Promise<Array<ToolCallResult>> {
     const resultSlots = Array.from<ToolCallResult | null>({
       length: calls.length,
     }).fill(null);
+
+    const runTrackedToolCall = async (
+      call: ToolUseBlock,
+      start: number,
+    ): Promise<ToolCallResult> => {
+      const tracker = ctx.toolCallTracker;
+
+      let trackerCtx: TrackerContext | undefined;
+      let forceResolve: ((result: ToolResult) => void) | undefined;
+      let forcePromise: Promise<ToolResult> | undefined;
+
+      if (tracker) {
+        forcePromise = new Promise<ToolResult>((resolve) => {
+          forceResolve = resolve;
+        });
+        trackerCtx = tracker.registerAgentCall(
+          call.id,
+          call.name,
+          extractAgentDisplayArgs(
+            call.name,
+            call.input as Record<string, unknown>,
+          ),
+          session.id,
+          forceResolve!,
+          JSON.stringify(call.input, null, 2),
+        );
+      }
+
+      try {
+        const result = await (forcePromise
+          ? Promise.race([
+              dispatchToolCall(
+                call.name,
+                call.input as Record<string, unknown>,
+                {
+                  ...ctx,
+                  sessionId: session.id,
+                  trackerCtx,
+                },
+              ),
+              forcePromise,
+            ])
+          : dispatchToolCall(call.name, call.input as Record<string, unknown>, {
+              ...ctx,
+              sessionId: session.id,
+              trackerCtx,
+            }));
+        return {
+          tool_use_id: call.id,
+          toolName: call.name,
+          result,
+          durationMs: Date.now() - start,
+        };
+      } catch (err) {
+        return {
+          tool_use_id: call.id,
+          toolName: call.name,
+          result: handleToolError(err),
+          durationMs: Date.now() - start,
+        };
+      } finally {
+        tracker?.completeAgentCall(call.id);
+      }
+    };
 
     // Partition into read-only (parallel) and write (sequential)
     const readOnlyIndices: number[] = [];
@@ -970,17 +1083,7 @@ export class AgentEngine {
         const call = calls[i];
         const start = Date.now();
         try {
-          const result = await dispatchToolCall(
-            call.name,
-            call.input as Record<string, unknown>,
-            ctx,
-          );
-          resultSlots[i] = {
-            tool_use_id: call.id,
-            toolName: call.name,
-            result,
-            durationMs: Date.now() - start,
-          };
+          resultSlots[i] = await runTrackedToolCall(call, start);
         } catch (err) {
           resultSlots[i] = {
             tool_use_id: call.id,
@@ -998,17 +1101,7 @@ export class AgentEngine {
       const call = calls[i];
       const start = Date.now();
       try {
-        const result = await dispatchToolCall(
-          call.name,
-          call.input as Record<string, unknown>,
-          ctx,
-        );
-        resultSlots[i] = {
-          tool_use_id: call.id,
-          toolName: call.name,
-          result,
-          durationMs: Date.now() - start,
-        };
+        resultSlots[i] = await runTrackedToolCall(call, start);
       } catch (err) {
         resultSlots[i] = {
           tool_use_id: call.id,

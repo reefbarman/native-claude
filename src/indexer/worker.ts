@@ -85,6 +85,13 @@ const FILE_BATCH_SIZE = 50;
 // --- State ---
 
 let aborted = false;
+const pendingEmbeddingAuthRefreshRequests = new Map<
+  string,
+  {
+    resolve: (token: string) => void;
+    reject: (error: Error) => void;
+  }
+>();
 
 // --- IPC helpers ---
 
@@ -109,6 +116,30 @@ function sendError(message: string, fatal: boolean): void {
   send({ type: "error", message, fatal });
 }
 
+async function requestEmbeddingAuthRefresh(): Promise<string> {
+  const requestId = randomUUID();
+  return new Promise<string>((resolve, reject) => {
+    pendingEmbeddingAuthRefreshRequests.set(requestId, { resolve, reject });
+    send({ type: "embeddingAuthRefreshRequest", requestId });
+    const timeout = setTimeout(() => {
+      pendingEmbeddingAuthRefreshRequests.delete(requestId);
+      reject(new Error("Timed out waiting for refreshed embedding auth token"));
+    }, 30_000);
+    const originalResolve = resolve;
+    const originalReject = reject;
+    pendingEmbeddingAuthRefreshRequests.set(requestId, {
+      resolve: (token: string) => {
+        clearTimeout(timeout);
+        originalResolve(token);
+      },
+      reject: (error: Error) => {
+        clearTimeout(timeout);
+        originalReject(error);
+      },
+    });
+  });
+}
+
 /** Count total chunks (points) across all cached files */
 function countCachedChunks(cache: IndexCache): number {
   let total = 0;
@@ -131,6 +162,19 @@ process.on("message", (msg: ExtensionToWorkerMessage) => {
     case "cancel":
       aborted = true;
       break;
+    case "embeddingAuthRefreshResponse": {
+      const pending = pendingEmbeddingAuthRefreshRequests.get(msg.requestId);
+      if (!pending) break;
+      pendingEmbeddingAuthRefreshRequests.delete(msg.requestId);
+      if (msg.bearerToken) {
+        pending.resolve(msg.bearerToken);
+      } else {
+        pending.reject(
+          new Error("Extension returned no refreshed embedding auth token"),
+        );
+      }
+      break;
+    }
     case "incrementalUpdate":
       aborted = false;
       handleIncrementalUpdate(msg).catch((err) => {
@@ -153,7 +197,7 @@ const treeSitterReady = initTreeSitter(wasmDir).catch((err) => {
 interface BatchConfig {
   qdrantUrl: string;
   collectionName: string;
-  openAiApiKey: string;
+  embeddingBearerToken: string;
   cachePath: string;
   granularity: ChunkGranularity;
 }
@@ -226,7 +270,7 @@ async function processFileBatch(
   // 2. Embed all chunks from this batch
   const embeddings = await batchEmbed(
     allChunks.map((c) => c.chunk.embeddingContent ?? c.chunk.content),
-    config.openAiApiKey,
+    config.embeddingBearerToken,
     errors,
   );
 
@@ -406,7 +450,7 @@ async function handleStart(msg: StartIndexMessage): Promise<void> {
     const batchConfig: BatchConfig = {
       qdrantUrl: msg.qdrantUrl,
       collectionName: msg.collectionName,
-      openAiApiKey: msg.openAiApiKey,
+      embeddingBearerToken: msg.embeddingBearerToken,
       cachePath: msg.cachePath,
       granularity: msg.granularity,
     };
@@ -552,7 +596,7 @@ async function handleIncrementalUpdate(
       const batchConfig: BatchConfig = {
         qdrantUrl: msg.qdrantUrl,
         collectionName: msg.collectionName,
-        openAiApiKey: msg.openAiApiKey,
+        embeddingBearerToken: msg.embeddingBearerToken,
         cachePath: msg.cachePath,
         granularity: msg.granularity,
       };
@@ -625,7 +669,7 @@ function buildTokenAwareBatches(
 
 async function batchEmbed(
   texts: string[],
-  apiKey: string,
+  bearerToken: string,
   errors: string[],
   onProgress?: (done: number, total: number) => void,
 ): Promise<(number[] | null)[]> {
@@ -650,7 +694,7 @@ async function batchEmbed(
     cursor = lastBatch.startIdx + lastBatch.batch.length;
 
     const promises = concurrentBatches.map(({ startIdx, batch }) =>
-      embedBatchWithRetry(batch, apiKey)
+      embedBatchWithRetry(batch, bearerToken)
         .then((vectors) => {
           for (let k = 0; k < vectors.length; k++) {
             results[startIdx + k] = vectors[k];
@@ -675,7 +719,7 @@ async function batchEmbed(
 
 async function embedBatchWithRetry(
   texts: string[],
-  apiKey: string,
+  bearerToken: string,
   retries = MAX_RETRIES,
 ): Promise<number[][]> {
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -683,7 +727,7 @@ async function embedBatchWithRetry(
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
+        Authorization: `Bearer ${bearerToken}`,
       },
       body: JSON.stringify({
         model: EMBEDDING_MODEL,
@@ -707,12 +751,17 @@ async function embedBatchWithRetry(
       continue;
     }
 
+    if (response.status === 401 && attempt < retries) {
+      bearerToken = await requestEmbeddingAuthRefresh();
+      continue;
+    }
+
     // Token limit / bad request — bisect and retry each half
     if (response.status === 400 && texts.length > 1) {
       const mid = Math.ceil(texts.length / 2);
       const [left, right] = await Promise.all([
-        embedBatchWithRetry(texts.slice(0, mid), apiKey, retries),
-        embedBatchWithRetry(texts.slice(mid), apiKey, retries),
+        embedBatchWithRetry(texts.slice(0, mid), bearerToken, retries),
+        embedBatchWithRetry(texts.slice(mid), bearerToken, retries),
       ]);
       return [...left, ...right];
     }

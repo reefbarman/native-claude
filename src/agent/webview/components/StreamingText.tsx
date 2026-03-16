@@ -2,6 +2,12 @@ import { useRef, useEffect, useMemo, useState } from "preact/hooks";
 import { Marked } from "marked";
 import DOMPurify from "dompurify";
 import mermaid from "mermaid";
+import embed, { type VisualizationSpec } from "vega-embed";
+
+type SpecialBlock =
+  | { kind: "mermaid"; source: string }
+  | { kind: "vega"; source: string }
+  | { kind: "vega-lite"; source: string };
 
 let mermaidInitialized = false;
 function ensureMermaidInit() {
@@ -16,39 +22,34 @@ function ensureMermaidInit() {
       // AgentLink brand teal
       primaryColor: "#2a5e58",
       primaryTextColor: "#e0e0e0",
-      primaryBorderColor: "#4ECDC4",
+      primaryBorderColor: "#4EC9B0",
       secondaryColor: "#1e3a36",
       secondaryTextColor: "#e0e0e0",
       secondaryBorderColor: "#3ba89f",
       tertiaryColor: "#163330",
       tertiaryTextColor: "#e0e0e0",
       tertiaryBorderColor: "#2d7a72",
-      // Lines and text
-      lineColor: "#4ECDC4",
+      lineColor: "#4EC9B0",
       textColor: "#e0e0e0",
-      // Background
       mainBkg: "#2a5e58",
-      nodeBorder: "#4ECDC4",
-      // Notes and labels
+      nodeBorder: "#4EC9B0",
       noteBkgColor: "#1e3a36",
       noteTextColor: "#e0e0e0",
-      noteBorderColor: "#4ECDC4",
-      // Sequence diagram
+      noteBorderColor: "#4EC9B0",
       actorBkg: "#2a5e58",
-      actorBorder: "#4ECDC4",
+      actorBorder: "#4EC9B0",
       actorTextColor: "#e0e0e0",
-      actorLineColor: "#4ECDC4",
+      actorLineColor: "#4EC9B0",
       signalColor: "#e0e0e0",
       signalTextColor: "#e0e0e0",
       labelBoxBkgColor: "#1e3a36",
-      labelBoxBorderColor: "#4ECDC4",
+      labelBoxBorderColor: "#4EC9B0",
       labelTextColor: "#e0e0e0",
       loopTextColor: "#e0e0e0",
-      activationBorderColor: "#4ECDC4",
+      activationBorderColor: "#4EC9B0",
       activationBkgColor: "#1e3a36",
       sequenceNumberColor: "#1a1a2e",
-      // Pie chart
-      pie1: "#4ECDC4",
+      pie1: "#4EC9B0",
       pie2: "#3ba89f",
       pie3: "#2d7a72",
       pie4: "#1e5c56",
@@ -57,8 +58,7 @@ function ensureMermaidInit() {
       pie7: "#082e2a",
       pieTitleTextColor: "#e0e0e0",
       pieSectionTextColor: "#1a1a2e",
-      // Git graph
-      git0: "#4ECDC4",
+      git0: "#4EC9B0",
       git1: "#3ba89f",
       git2: "#2d7a72",
       git3: "#1e5c56",
@@ -66,51 +66,52 @@ function ensureMermaidInit() {
       gitBranchLabel1: "#1a1a2e",
       gitBranchLabel2: "#e0e0e0",
       gitBranchLabel3: "#e0e0e0",
-      // ER diagram
-      entityBorder: "#4ECDC4",
+      entityBorder: "#4EC9B0",
       entityBkg: "#2a5e58",
       entityTextColor: "#e0e0e0",
-      relationColor: "#4ECDC4",
+      relationColor: "#4EC9B0",
       attributeBackgroundColorEven: "#1e3a36",
       attributeBackgroundColorOdd: "#2a5e58",
     },
   });
 }
 
-/**
- * Closed mermaid fences only (must include terminating ```) to avoid
- * rendering partial diagrams while text is still streaming.
- */
-const MERMAID_FENCE_RE = /```mermaid[^\r\n]*\r?\n([\s\S]*?)\r?\n```/g;
+const SPECIAL_FENCE_RE =
+  /```(mermaid|vega-lite|vega)[^\r\n]*\r?\n([\s\S]*?)\r?\n```/g;
 
-function renderMermaidContainer(idx: number, source: string): string {
-  const escapedCode = source
+function escapeHtml(text: string): string {
+  return text
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
-  return `<div class="mermaid-container" data-mermaid-idx="${idx}"><div class="mermaid-diagram"><pre><code>${escapedCode}</code></pre></div><div class="mermaid-actions"><button type="button" class="mermaid-toggle-code">Show Code</button><button type="button" class="mermaid-popout">Pop Out</button></div><pre class="mermaid-source" style="display:none"><code>${escapedCode}</code></pre></div>`;
+}
+
+function renderSpecialBlockContainer(idx: number, block: SpecialBlock): string {
+  const escapedCode = escapeHtml(block.source);
+  const blockClass = block.kind === "mermaid" ? "mermaid" : "vega";
+  const title =
+    block.kind === "mermaid"
+      ? "Diagram"
+      : block.kind === "vega-lite"
+        ? "Vega-Lite Chart"
+        : "Vega Chart";
+  return `<div class="special-block-container ${blockClass}-container" data-special-idx="${idx}" data-special-kind="${block.kind}"><div class="special-block-render ${blockClass}-render"><pre><code>${escapedCode}</code></pre></div><div class="special-block-actions ${blockClass}-actions"><button type="button" class="special-block-toggle-code">Show Code</button><button type="button" class="special-block-popout">Pop Out</button></div><pre class="special-block-source ${blockClass}-source" style="display:none"><code>${escapedCode}</code></pre><div class="special-block-sr-only">${title}</div></div>`;
 }
 
 function parseMarkdown(text: string): {
   html: string;
-  mermaidSources: string[];
+  specialBlocks: SpecialBlock[];
 } {
-  const mermaidSources: string[] = [];
+  const specialBlocks: SpecialBlock[] = [];
 
   const localMarked = new Marked({
     renderer: {
       html({ text }: { text: string }) {
-        return text
-          .replace(/&/g, "&amp;")
-          .replace(/</g, "&lt;")
-          .replace(/>/g, "&gt;");
+        return escapeHtml(text);
       },
       code({ text, lang }: { text: string; lang?: string }) {
         const langClass = lang ? ` class="language-${lang}"` : "";
-        return `<pre><code${langClass}>${text
-          .replace(/&/g, "&amp;")
-          .replace(/</g, "&lt;")
-          .replace(/>/g, "&gt;")}</code></pre>`;
+        return `<pre><code${langClass}>${escapeHtml(text)}</code></pre>`;
       },
     },
   });
@@ -119,18 +120,18 @@ function parseMarkdown(text: string): {
   let lastIndex = 0;
   let match: RegExpExecArray | null;
 
-  MERMAID_FENCE_RE.lastIndex = 0;
-  while ((match = MERMAID_FENCE_RE.exec(text)) !== null) {
-    const [fullMatch, source] = match;
+  SPECIAL_FENCE_RE.lastIndex = 0;
+  while ((match = SPECIAL_FENCE_RE.exec(text)) !== null) {
+    const [fullMatch, kind, source] = match;
     const start = match.index;
     if (start > lastIndex) {
       raw += localMarked.parse(text.slice(lastIndex, start), {
         async: false,
       }) as string;
     }
-    const idx = mermaidSources.length;
-    mermaidSources.push(source);
-    raw += renderMermaidContainer(idx, source);
+    const idx = specialBlocks.length;
+    specialBlocks.push({ kind: kind as SpecialBlock["kind"], source });
+    raw += renderSpecialBlockContainer(idx, specialBlocks[idx]!);
     lastIndex = start + fullMatch.length;
   }
 
@@ -140,10 +141,10 @@ function parseMarkdown(text: string): {
 
   const html = DOMPurify.sanitize(raw, {
     ALLOWED_URI_REGEXP: /^(?:https?|vscode):/i,
-    ADD_ATTR: ["data-mermaid-idx"],
+    ADD_ATTR: ["data-special-idx", "data-special-kind"],
   });
 
-  return { html, mermaidSources };
+  return { html, specialBlocks };
 }
 
 // Matches file paths like `src/foo/bar.ts`, `/abs/path.ts`, `src/foo.ts:42`
@@ -215,7 +216,7 @@ interface StreamingTextProps {
   text: string;
   streaming: boolean;
   onRevealStart?: () => void;
-  onOpenMermaidPanel?: (source: string) => void;
+  onOpenSpecialBlockPanel?: (block: SpecialBlock) => void;
   onOpenFile?: (path: string, line?: number) => void;
 }
 
@@ -232,7 +233,7 @@ export function StreamingText({
   text,
   streaming,
   onRevealStart,
-  onOpenMermaidPanel,
+  onOpenSpecialBlockPanel,
   onOpenFile,
 }: StreamingTextProps) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -291,24 +292,24 @@ export function StreamingText({
     return () => cancelAnimationFrame(rafRef.current);
   }, [streaming]);
 
-  // Parse the FULL text to get stable mermaid sources (not affected by reveal animation)
+  // Parse the FULL text to get stable special block sources (not affected by reveal animation)
   const fullParsed = useMemo(() => parseMarkdown(text), [text]);
-  const mermaidSourcesRef = useRef<string[]>([]);
-  mermaidSourcesRef.current = fullParsed.mermaidSources;
+  const specialBlocksRef = useRef<SpecialBlock[]>([]);
+  specialBlocksRef.current = fullParsed.specialBlocks;
 
-  // Parse the revealed portion for display (mermaid sources from this are ignored)
+  // Parse the revealed portion for display
   const displayText = streaming ? text.slice(0, revealedLen) : text;
   const parsed = useMemo(() => parseMarkdown(displayText), [displayText]);
 
-  // Track which mermaid indices have been rendered (survives across re-renders)
-  const renderedMermaidRef = useRef<Set<number>>(new Set());
+  // Track which special block indices have been rendered (survives across re-renders)
+  const renderedSpecialBlocksRef = useRef<Set<number>>(new Set());
   // Track in-flight renders to avoid duplicates
-  const renderingMermaidRef = useRef<Set<number>>(new Set());
+  const renderingSpecialBlocksRef = useRef<Set<number>>(new Set());
 
   // Reset when the underlying text changes (new message)
   useEffect(() => {
-    renderedMermaidRef.current.clear();
-    renderingMermaidRef.current.clear();
+    renderedSpecialBlocksRef.current.clear();
+    renderingSpecialBlocksRef.current.clear();
   }, [text]);
 
   // Update DOM
@@ -324,25 +325,26 @@ export function StreamingText({
     // Re-stamp already-rendered diagrams — their SVGs were lost when innerHTML was reset
     // We cache rendered SVGs so we can restore them instantly
     containerRef.current
-      .querySelectorAll(".mermaid-container[data-mermaid-idx]")
+      .querySelectorAll(".special-block-container[data-special-idx]")
       .forEach((el) => {
-        const idx = parseInt(el.getAttribute("data-mermaid-idx") ?? "", 10);
-        const cached = mermaidSvgCache.current.get(idx);
+        const idx = parseInt(el.getAttribute("data-special-idx") ?? "", 10);
+        const cached = specialBlockHtmlCache.current.get(idx);
         if (cached !== undefined) {
-          const diagramEl = el.querySelector(".mermaid-diagram") as HTMLElement;
-          if (diagramEl) diagramEl.innerHTML = cached;
+          const renderEl = el.querySelector(
+            ".special-block-render",
+          ) as HTMLElement;
+          if (renderEl) renderEl.innerHTML = cached;
         }
       });
 
-    // Wire up toggle buttons
     containerRef.current
-      .querySelectorAll(".mermaid-toggle-code")
+      .querySelectorAll(".special-block-toggle-code")
       .forEach((btn) => {
         btn.addEventListener("click", () => {
-          const container = btn.closest(".mermaid-container");
+          const container = btn.closest(".special-block-container");
           if (!container) return;
           const sourceEl = container.querySelector(
-            ".mermaid-source",
+            ".special-block-source",
           ) as HTMLElement;
           if (!sourceEl) return;
           const hidden = sourceEl.style.display === "none";
@@ -351,93 +353,103 @@ export function StreamingText({
         });
       });
 
-    containerRef.current.querySelectorAll(".mermaid-popout").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const container = btn.closest(".mermaid-container");
-        if (!container) return;
-        const idx = parseInt(
-          container.getAttribute("data-mermaid-idx") ?? "",
-          10,
-        );
-        const source = Number.isFinite(idx)
-          ? mermaidSourcesRef.current[idx]
-          : "";
-        if (!source) return;
-        onOpenMermaidPanel?.(source);
+    containerRef.current
+      .querySelectorAll(".special-block-popout")
+      .forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const container = btn.closest(".special-block-container");
+          if (!container) return;
+          const idx = parseInt(
+            container.getAttribute("data-special-idx") ?? "",
+            10,
+          );
+          const block = Number.isFinite(idx)
+            ? specialBlocksRef.current[idx]
+            : null;
+          if (!block) return;
+          onOpenSpecialBlockPanel?.(block);
+        });
       });
-    });
-  }, [parsed.html, onOpenMermaidPanel, onOpenFile]);
+  }, [parsed.html, onOpenSpecialBlockPanel, onOpenFile]);
 
-  // Cache for rendered SVGs — survives innerHTML resets
-  const mermaidSvgCache = useRef<Map<number, string>>(new Map());
+  // Cache for rendered output — survives innerHTML resets
+  const specialBlockHtmlCache = useRef<Map<number, string>>(new Map());
 
   // Reset cache when text changes
   useEffect(() => {
-    mermaidSvgCache.current.clear();
+    specialBlockHtmlCache.current.clear();
   }, [text]);
 
-  // Render new mermaid diagrams as their code blocks complete
+  // Render special blocks as their code fences complete
   useEffect(() => {
     if (!containerRef.current) return;
-    if (parsed.mermaidSources.length === 0) return;
+    if (parsed.specialBlocks.length === 0) return;
 
     const containers = containerRef.current.querySelectorAll(
-      ".mermaid-container[data-mermaid-idx]",
+      ".special-block-container[data-special-idx]",
     );
     if (containers.length === 0) return;
 
     const currentContainer = containerRef.current;
 
     containers.forEach(async (el) => {
-      const idx = parseInt(el.getAttribute("data-mermaid-idx") ?? "", 10);
-      // Skip already rendered or in-flight
-      if (renderedMermaidRef.current.has(idx)) return;
-      if (renderingMermaidRef.current.has(idx)) return;
+      const idx = parseInt(el.getAttribute("data-special-idx") ?? "", 10);
+      if (renderedSpecialBlocksRef.current.has(idx)) return;
+      if (renderingSpecialBlocksRef.current.has(idx)) return;
 
-      const source = mermaidSourcesRef.current[idx];
-      // Only render if this index also exists in the revealed parse
-      // (meaning the full code block has been revealed)
-      const revealedSource = parsed.mermaidSources[idx];
-      if (!source || revealedSource === undefined) return;
+      const block = specialBlocksRef.current[idx];
+      const revealedBlock = parsed.specialBlocks[idx];
+      if (!block || revealedBlock === undefined) return;
 
-      renderingMermaidRef.current.add(idx);
-      ensureMermaidInit();
+      renderingSpecialBlocksRef.current.add(idx);
 
-      const diagramEl = el.querySelector(".mermaid-diagram") as HTMLElement;
-      if (!diagramEl) return;
+      const renderEl = el.querySelector(".special-block-render") as HTMLElement;
+      if (!renderEl) return;
 
       try {
-        const id = `mermaid-${Date.now()}-${idx}`;
-        const { svg } = await mermaid.render(id, source);
-        renderedMermaidRef.current.add(idx);
-        renderingMermaidRef.current.delete(idx);
-        mermaidSvgCache.current.set(idx, svg);
-        // Only update if DOM hasn't been replaced
+        let renderedHtml: string;
+        if (block.kind === "mermaid") {
+          ensureMermaidInit();
+          const id = `mermaid-${Date.now()}-${idx}`;
+          const { svg } = await mermaid.render(id, block.source);
+          renderedHtml = svg;
+        } else {
+          const spec = JSON.parse(block.source) as VisualizationSpec;
+          const tmp = document.createElement("div");
+          await embed(tmp, spec, {
+            actions: false,
+            renderer: "svg",
+            mode: block.kind,
+            theme: "dark",
+          });
+          renderedHtml = tmp.innerHTML;
+        }
+
+        renderedSpecialBlocksRef.current.add(idx);
+        renderingSpecialBlocksRef.current.delete(idx);
+        specialBlockHtmlCache.current.set(idx, renderedHtml);
         if (currentContainer === containerRef.current) {
-          diagramEl.innerHTML = svg;
+          renderEl.innerHTML = renderedHtml;
         }
       } catch (err) {
-        renderedMermaidRef.current.add(idx);
-        renderingMermaidRef.current.delete(idx);
+        renderedSpecialBlocksRef.current.add(idx);
+        renderingSpecialBlocksRef.current.delete(idx);
         const errMsg =
           err instanceof Error
             ? err.message
             : typeof err === "string"
               ? err
               : "Unknown error";
-        console.error(`[mermaid] Failed to render diagram ${idx}:`, err);
-        const escapedMsg = errMsg
-          .replace(/&/g, "&amp;")
-          .replace(/</g, "&lt;")
-          .replace(/>/g, "&gt;");
-        const errorHtml = `<span class="mermaid-error">Failed to render diagram: ${escapedMsg}</span>`;
-        mermaidSvgCache.current.set(idx, errorHtml);
+        const label = block.kind === "mermaid" ? "diagram" : "chart";
+        console.error(`[${block.kind}] Failed to render ${label} ${idx}:`, err);
+        const errorHtml = `<span class="special-block-error">Failed to render ${label}: ${escapeHtml(errMsg)}</span>`;
+        specialBlockHtmlCache.current.set(idx, errorHtml);
         if (currentContainer === containerRef.current) {
-          diagramEl.innerHTML = errorHtml;
+          renderEl.innerHTML = errorHtml;
         }
       }
     });
-  }, [parsed.html]);
+  }, [parsed.html, parsed.specialBlocks]);
 
   return <div ref={containerRef} class="markdown-body" />;
 }

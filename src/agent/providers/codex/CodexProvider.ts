@@ -1,9 +1,11 @@
 /**
- * CodexProvider — implements ModelProvider for the OpenAI Codex Responses API.
+ * CodexProvider — implements ModelProvider for the OpenAI/Codex Responses API.
  *
- * Authenticates via OAuth (ChatGPT Plus/Pro subscription). Requests route to
- * `chatgpt.com/backend-api/codex/responses`. Uses raw `fetch()` + SSE parsing
- * rather than the OpenAI SDK to avoid an extra dependency.
+ * Supports two auth paths behind one provider surface:
+ * - OAuth (ChatGPT/Codex subscription) via `chatgpt.com/backend-api/codex/responses`
+ * - OpenAI API key via `api.openai.com/v1/responses`
+ *
+ * Uses raw `fetch()` + SSE parsing rather than adding an OpenAI SDK dependency.
  */
 
 import * as os from "os";
@@ -23,13 +25,15 @@ import type {
   ThinkingBlock,
 } from "../types.js";
 import {
-  codexOAuthManager,
-  type CodexOAuthManager,
-} from "./CodexOAuthManager.js";
+  openAiCodexAuthManager,
+  type OpenAiCodexAuthManager,
+  type OpenAiCodexResolvedAuth,
+} from "./OpenAiCodexAuthManager.js";
 
 // ── Constants ──
 
 const CODEX_API_BASE_URL = "https://chatgpt.com/backend-api/codex";
+const OPENAI_API_BASE_URL = "https://api.openai.com/v1";
 const OPENAI_CALL_ID_MAX_LENGTH = 64;
 
 /** The preferred cheap/fast model for condensing on Codex. */
@@ -350,18 +354,21 @@ export class CodexProvider implements ModelProvider {
   readonly displayName = "OpenAI Codex";
   readonly condenseModel = CODEX_CONDENSE_MODEL;
 
-  private oauthManager: CodexOAuthManager;
+  private authManager: OpenAiCodexAuthManager;
   private sessionId: string;
   private log: (msg: string) => void;
 
-  constructor(oauthManager?: CodexOAuthManager, log?: (msg: string) => void) {
-    this.oauthManager = oauthManager ?? codexOAuthManager;
+  constructor(
+    authManager?: OpenAiCodexAuthManager,
+    log?: (msg: string) => void,
+  ) {
+    this.authManager = authManager ?? openAiCodexAuthManager;
     this.sessionId = randomUUID();
     this.log = log ?? (() => {});
   }
 
   async isAuthenticated(): Promise<boolean> {
-    return this.oauthManager.isAuthenticated();
+    return this.authManager.isAuthenticated();
   }
 
   getCapabilities(model: string): ModelCapabilities {
@@ -396,7 +403,6 @@ export class CodexProvider implements ModelProvider {
       signal,
     } = request;
 
-    const accessToken = await this.getTokenOrThrow();
     const codexInput = translateMessages(messages);
     const codexTools = tools ? translateTools(tools) : undefined;
 
@@ -418,33 +424,34 @@ export class CodexProvider implements ModelProvider {
       ...(codexTools && codexTools.length > 0 ? { tools: codexTools } : {}),
     };
 
-    // Attempt → 401 → force-refresh → retry once
     for (let attempt = 0; attempt < 2; attempt++) {
-      const token =
+      const auth =
         attempt === 0
-          ? accessToken
-          : await this.oauthManager.forceRefreshAccessToken();
-      if (!token) {
+          ? await this.getModelAuthOrThrow()
+          : await this.authManager.forceRefreshModelAuth("oauth");
+      if (!auth) {
         throw new Error(
-          "Not authenticated with OpenAI Codex. Please sign in first.",
+          "OpenAI/Codex authentication is required. Sign in with ChatGPT/Codex or configure an OpenAI API key to use models, semantic search, and indexing.",
         );
       }
 
       try {
-        yield* this.executeStream(requestBody, token, model, signal);
+        yield* this.executeStream(requestBody, auth, model, signal);
         return;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         const isAuth = /unauthorized|invalid token|401|authentication/i.test(
           msg,
         );
-        if (attempt === 0 && isAuth) {
+        if (attempt === 0 && isAuth && auth.canRefresh) {
           this.log("[codex] Auth failure, attempting token refresh...");
           continue;
         }
         throw err;
       }
     }
+
+    throw new Error("Codex stream() failed unexpectedly");
   }
 
   async complete(request: CompleteRequest): Promise<CompleteResult> {
@@ -455,7 +462,6 @@ export class CodexProvider implements ModelProvider {
       maxTokens: _maxTokens,
       temperature: _temperature,
     } = request;
-    const accessToken = await this.getTokenOrThrow();
     const codexInput = translateMessages(messages);
 
     const requestBody: Record<string, unknown> = {
@@ -466,17 +472,16 @@ export class CodexProvider implements ModelProvider {
       store: false,
     };
 
-    // Keep Codex complete() intentionally minimal. The ChatGPT-account backend
-    // has already rejected `stream: false` and `temperature`; avoid forwarding
-    // optional parameters here unless they are confirmed supported.
+    // Keep complete() intentionally minimal. The OAuth-backed Codex endpoint
+    // requires SSE even for non-interactive calls, and we aggregate the stream.
     for (let attempt = 0; attempt < 2; attempt++) {
-      const token =
+      const auth =
         attempt === 0
-          ? accessToken
-          : await this.oauthManager.forceRefreshAccessToken();
-      if (!token) {
+          ? await this.getModelAuthOrThrow()
+          : await this.authManager.forceRefreshModelAuth("oauth");
+      if (!auth) {
         throw new Error(
-          "Not authenticated with OpenAI Codex. Please sign in first.",
+          "OpenAI/Codex authentication is required. Sign in with ChatGPT/Codex or configure an OpenAI API key to use models, semantic search, and indexing.",
         );
       }
 
@@ -485,11 +490,9 @@ export class CodexProvider implements ModelProvider {
       let outputTokens = 0;
 
       try {
-        // The ChatGPT-account Codex backend requires SSE even for
-        // non-interactive calls. Aggregate the stream into a final result.
         for await (const event of this.executeStream(
           requestBody,
-          token,
+          auth,
           model,
         )) {
           if (event.type === "text_delta") {
@@ -509,7 +512,7 @@ export class CodexProvider implements ModelProvider {
         const isAuth = /unauthorized|invalid token|401|authentication/i.test(
           msg,
         );
-        if (attempt === 0 && isAuth) {
+        if (attempt === 0 && isAuth && auth.canRefresh) {
           this.log(
             "[codex] complete() auth failure, attempting token refresh...",
           );
@@ -524,37 +527,39 @@ export class CodexProvider implements ModelProvider {
 
   // ── Internal ──
 
-  private async getTokenOrThrow(): Promise<string> {
-    const token = await this.oauthManager.getAccessToken();
-    if (!token) {
+  private async getModelAuthOrThrow(): Promise<OpenAiCodexResolvedAuth> {
+    const auth = await this.authManager.resolveModelAuth();
+    if (!auth) {
       throw new Error(
-        "Not authenticated with OpenAI Codex. Please sign in first.",
+        "OpenAI/Codex authentication is required. Sign in with ChatGPT/Codex or configure an OpenAI API key to use models, semantic search, and indexing.",
       );
     }
-    return token;
+    return auth;
   }
 
   private async makeRequest(
     body: Record<string, unknown>,
-    accessToken: string,
+    auth: OpenAiCodexResolvedAuth,
     stream: boolean,
     signal?: AbortSignal,
   ): Promise<Response> {
-    const accountId = await this.oauthManager.getAccountId();
-
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${accessToken}`,
-      originator: "agentlink",
-      session_id: this.sessionId,
+      Authorization: `Bearer ${auth.bearerToken}`,
       "User-Agent": `agentlink/1.0 (${os.platform()} ${os.release()}; ${os.arch()}) node/${process.version.slice(1)}`,
     };
 
-    if (accountId) {
-      headers["ChatGPT-Account-Id"] = accountId;
+    let url = `${OPENAI_API_BASE_URL}/responses`;
+    if (auth.method === "oauth") {
+      url = `${CODEX_API_BASE_URL}/responses`;
+      headers.originator = "agentlink";
+      headers.session_id = this.sessionId;
+      if (auth.accountId) {
+        headers["ChatGPT-Account-Id"] = auth.accountId;
+      }
     }
 
-    const response = await fetch(`${CODEX_API_BASE_URL}/responses`, {
+    const response = await fetch(url, {
       method: "POST",
       headers,
       body: JSON.stringify(body),
@@ -589,16 +594,11 @@ export class CodexProvider implements ModelProvider {
 
   private async *executeStream(
     requestBody: Record<string, unknown>,
-    accessToken: string,
+    auth: OpenAiCodexResolvedAuth,
     model: string,
     signal?: AbortSignal,
   ): AsyncGenerator<ProviderStreamEvent> {
-    const response = await this.makeRequest(
-      requestBody,
-      accessToken,
-      true,
-      signal,
-    );
+    const response = await this.makeRequest(requestBody, auth, true, signal);
 
     // Accumulators for content blocks
     const contentBlocks: ContentBlock[] = [];

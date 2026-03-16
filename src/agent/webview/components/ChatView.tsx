@@ -11,7 +11,10 @@ interface ChatViewProps {
   streaming: boolean;
   sessionId: string | null;
   onOpenFile?: (path: string, line?: number) => void;
-  onOpenMermaidPanel?: (source: string) => void;
+  onOpenSpecialBlockPanel?: (block: {
+    kind: "mermaid" | "vega" | "vega-lite";
+    source: string;
+  }) => void;
   onRevertCheckpoint?: (sessionId: string, checkpointId: string) => void;
   onViewCheckpointDiff?: (
     sessionId: string,
@@ -30,7 +33,7 @@ export function ChatView({
   streaming,
   sessionId,
   onOpenFile,
-  onOpenMermaidPanel,
+  onOpenSpecialBlockPanel,
   onRevertCheckpoint,
   onViewCheckpointDiff,
   onRetry,
@@ -181,7 +184,7 @@ export function ChatView({
                   msg.role === "assistant"
                 }
                 onOpenFile={onOpenFile}
-                onOpenMermaidPanel={onOpenMermaidPanel}
+                onOpenSpecialBlockPanel={onOpenSpecialBlockPanel}
                 onRetry={
                   msg === messages[messages.length - 1] && msg.error
                     ? onRetry

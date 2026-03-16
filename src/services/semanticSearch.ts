@@ -1,18 +1,12 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import { createHash } from "crypto";
+import picomatch from "picomatch";
 
+import { openAiCodexAuthManager } from "../agent/providers/index.js";
 import { tryGetFirstWorkspaceRoot } from "../util/paths.js";
 
 import { type ToolResult } from "../shared/types.js";
-
-const SECRET_KEY = "openaiApiKey";
-
-let secretStorage: vscode.SecretStorage | undefined;
-
-export function setSecretStorage(storage: vscode.SecretStorage): void {
-  secretStorage = storage;
-}
 
 // --- Configuration helpers (exported for IndexerManager) ---
 
@@ -22,10 +16,9 @@ export function getQdrantUrl(): string {
     .get<string>("qdrantUrl", "http://localhost:6333");
 }
 
-export async function getOpenAiApiKey(): Promise<string> {
-  const fromSecrets = await secretStorage?.get(SECRET_KEY);
-  if (fromSecrets) return fromSecrets;
-  return process.env.OPENAI_API_KEY || "";
+export async function getEmbeddingAuthToken(): Promise<string> {
+  const auth = await openAiCodexAuthManager.resolveEmbeddingAuth();
+  return auth?.bearerToken || "";
 }
 
 function isSemanticSearchEnabled(): boolean {
@@ -46,13 +39,13 @@ export function getAlCollectionName(workspacePath: string): string {
 
 async function generateEmbedding(
   text: string,
-  apiKey: string,
+  bearerToken: string,
 ): Promise<number[]> {
   const response = await fetch("https://api.openai.com/v1/embeddings", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
+      Authorization: `Bearer ${bearerToken}`,
     },
     body: JSON.stringify({
       model: "text-embedding-3-small",
@@ -371,13 +364,58 @@ export function rrfMerge(
 /**
  * Rescore results using multiple signals: vector similarity, keyword overlap, path relevance.
  */
+function normalizeSemanticResultPath(filePath: string): string {
+  const normalized = filePath.replace(/\\/g, "/");
+  return normalized.startsWith("./") ? normalized.slice(2) : normalized;
+}
+
+function isExcludedSemanticResultPath(filePath: string): boolean {
+  const normalized = normalizeSemanticResultPath(filePath).toLowerCase();
+  const withLeadingSlash = normalized.startsWith("/")
+    ? normalized
+    : `/${normalized}`;
+  return (
+    withLeadingSlash.includes("/.agentlink/history/") ||
+    withLeadingSlash.includes("/.agentlink/debug/") ||
+    withLeadingSlash.includes("/.agentlink/transcripts/") ||
+    withLeadingSlash.includes("/.agentlink/checkpoints/")
+  );
+}
+
+function applySemanticResultExcludes(
+  results: QdrantSearchResult[],
+  excludeGlobs?: string[],
+): QdrantSearchResult[] {
+  if (!excludeGlobs || excludeGlobs.length === 0) {
+    return results;
+  }
+
+  const matchers = excludeGlobs.map((pattern) =>
+    picomatch(pattern, { dot: true }),
+  );
+  return results.filter((result) => {
+    const filePath = result.payload?.filePath;
+    if (!filePath) return true;
+    const normalized = normalizeSemanticResultPath(filePath);
+    return !matchers.some((matcher) => matcher(normalized));
+  });
+}
+
 export function rerankResults(
   results: QdrantSearchResult[],
   queryKeywords: string[],
+  excludeGlobs?: string[],
 ): QdrantSearchResult[] {
-  if (queryKeywords.length === 0) return results;
+  const filtered = applySemanticResultExcludes(
+    results.filter(
+      (r) => !isExcludedSemanticResultPath(r.payload?.filePath ?? ""),
+    ),
+    excludeGlobs,
+  );
 
-  return results
+  if (queryKeywords.length === 0) return filtered;
+
+  return filtered
     .map((r) => {
       const chunk = (r.payload?.codeChunk ?? "").toLowerCase();
       const filePath = (r.payload?.filePath ?? "").toLowerCase();
@@ -563,6 +601,7 @@ async function queryQdrant(
   queryText: string,
   directoryPrefix?: string,
   limit: number = 10,
+  excludeGlobs?: string[],
 ): Promise<QdrantSearchResult[]> {
   const keywords = extractKeywords(queryText);
   const fetchLimit = Math.max(limit * 3, 20);
@@ -595,7 +634,7 @@ async function queryQdrant(
       : vectorResults;
 
   // Rerank with multi-signal scoring
-  const reranked = rerankResults(merged, keywords);
+  const reranked = rerankResults(merged, keywords, excludeGlobs);
 
   return reranked.slice(0, limit);
 }
@@ -612,7 +651,11 @@ interface FormattedResult {
 
 function formatResults(results: QdrantSearchResult[]): FormattedResult[] {
   return results
-    .filter((r) => r.payload?.filePath)
+    .filter(
+      (r) =>
+        r.payload?.filePath &&
+        !isExcludedSemanticResultPath(r.payload.filePath ?? ""),
+    )
     .map((r) => ({
       file: r.payload!.filePath,
       score: r.score,
@@ -650,8 +693,8 @@ export async function semanticFileQuery(
 ): Promise<{ startLine: number; endLine: number } | null> {
   if (!isSemanticSearchEnabled()) return null;
 
-  const apiKey = await getOpenAiApiKey();
-  if (!apiKey) return null;
+  const bearerToken = await getEmbeddingAuthToken();
+  if (!bearerToken) return null;
 
   const qdrantUrl = getQdrantUrl();
   const workspacePath = tryGetFirstWorkspaceRoot();
@@ -663,7 +706,7 @@ export async function semanticFileQuery(
   const normalizedPath = relFilePath.replace(/\\/g, "/");
 
   const expandedQuery = expandQuery(query);
-  const queryVector = await generateEmbedding(expandedQuery, apiKey);
+  const queryVector = await generateEmbedding(expandedQuery, bearerToken);
 
   // Build filter: must match this exact file
   const filter: Record<string, unknown> = {
@@ -728,9 +771,13 @@ export async function semanticFileList(
     };
   }
 
-  const apiKey = await getOpenAiApiKey();
-  if (!apiKey) {
-    return { files: [], error: "OpenAI API key not configured." };
+  const bearerToken = await getEmbeddingAuthToken();
+  if (!bearerToken) {
+    return {
+      files: [],
+      error:
+        "OpenAI authentication not configured. Run 'AgentLink: Sign In to OpenAI/Codex' to choose ChatGPT/Codex OAuth or an OpenAI API key, or set OPENAI_API_KEY in the environment. Either method enables semantic search and indexing.",
+    };
   }
 
   const qdrantUrl = getQdrantUrl();
@@ -744,7 +791,7 @@ export async function semanticFileList(
   const directoryPrefix = relativeDir === "" ? undefined : relativeDir;
 
   const expandedQuery = expandQuery(query);
-  const queryVector = await generateEmbedding(expandedQuery, apiKey);
+  const queryVector = await generateEmbedding(expandedQuery, bearerToken);
 
   // Fetch more chunks than limit since multiple chunks map to the same file
   const fetchLimit = limit * 5;
@@ -789,6 +836,7 @@ export async function semanticSearch(
   dirPath: string,
   query: string,
   limit?: number,
+  excludeGlobs?: string[],
 ): Promise<ToolResult> {
   if (!isSemanticSearchEnabled()) {
     return {
@@ -804,15 +852,15 @@ export async function semanticSearch(
     };
   }
 
-  const apiKey = await getOpenAiApiKey();
-  if (!apiKey) {
+  const bearerToken = await getEmbeddingAuthToken();
+  if (!bearerToken) {
     return {
       content: [
         {
           type: "text",
           text: JSON.stringify({
             error:
-              "OpenAI API key not configured. Run 'AgentLink: Set OpenAI API Key' from the command palette, or set the OPENAI_API_KEY env var.",
+              "OpenAI authentication not configured. Run 'AgentLink: Sign In to OpenAI/Codex' to choose ChatGPT/Codex OAuth or an OpenAI API key, or set OPENAI_API_KEY in the environment. Either method enables semantic search and indexing.",
           }),
         },
       ],
@@ -842,7 +890,7 @@ export async function semanticSearch(
 
   // Expand query for better embedding recall, then embed
   const expandedQuery = expandQuery(query);
-  const queryVector = await generateEmbedding(expandedQuery, apiKey);
+  const queryVector = await generateEmbedding(expandedQuery, bearerToken);
   const effectiveLimit = limit ?? 10;
 
   try {
@@ -853,6 +901,7 @@ export async function semanticSearch(
       query,
       directoryPrefix,
       effectiveLimit,
+      excludeGlobs,
     );
     return buildOutput(query, formatResults(results));
   } catch (err) {

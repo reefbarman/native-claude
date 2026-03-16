@@ -42,6 +42,18 @@ export const window = {
     dispose: () => {},
   }),
   showQuickPick: async () => undefined,
+  createTerminal: ({ name, cwd }: { name?: string; cwd?: string } = {}) => ({
+    name: name ?? "Terminal",
+    shellIntegration: cwd ? { cwd: { fsPath: cwd } } : undefined,
+    show: () => {},
+    sendText: () => {},
+    dispose: () => {},
+  }),
+  onDidCloseTerminal: () => ({ dispose: () => {} }),
+  onDidChangeTerminalShellIntegration: () => ({ dispose: () => {} }),
+  onDidStartTerminalShellExecution: () => ({ dispose: () => {} }),
+  onDidEndTerminalShellExecution: () => ({ dispose: () => {} }),
+  onDidOpenTerminal: () => ({ dispose: () => {} }),
   tabGroups: { all: [] },
 };
 
@@ -64,6 +76,10 @@ export const Uri = {
   parse: (uri: string) => ({ fsPath: uri, scheme: "file", path: uri }),
 };
 
+export const ThemeIcon = class {
+  constructor(public id: string) {}
+};
+
 export const DiagnosticSeverity = {
   Error: 0,
   Warning: 1,
@@ -78,32 +94,81 @@ export const EventEmitter = class {
 };
 
 export const SymbolKind = {
-  File: 0, Module: 1, Namespace: 2, Package: 3, Class: 4,
-  Method: 5, Property: 6, Field: 7, Constructor: 8, Enum: 9,
-  Interface: 10, Function: 11, Variable: 12, Constant: 13, String: 14,
-  Number: 15, Boolean: 16, Array: 17, Object: 18, Key: 19,
-  Null: 20, EnumMember: 21, Struct: 22, Event: 23, Operator: 24,
+  File: 0,
+  Module: 1,
+  Namespace: 2,
+  Package: 3,
+  Class: 4,
+  Method: 5,
+  Property: 6,
+  Field: 7,
+  Constructor: 8,
+  Enum: 9,
+  Interface: 10,
+  Function: 11,
+  Variable: 12,
+  Constant: 13,
+  String: 14,
+  Number: 15,
+  Boolean: 16,
+  Array: 17,
+  Object: 18,
+  Key: 19,
+  Null: 20,
+  EnumMember: 21,
+  Struct: 22,
+  Event: 23,
+  Operator: 24,
   TypeParameter: 25,
 };
 
 export const CompletionItemKind = {
-  Text: 0, Method: 1, Function: 2, Constructor: 3, Field: 4,
-  Variable: 5, Class: 6, Interface: 7, Module: 8, Property: 9,
-  Unit: 10, Value: 11, Enum: 12, Keyword: 13, Snippet: 14,
-  Color: 15, File: 16, Reference: 17, Folder: 18, EnumMember: 19,
-  Constant: 20, Struct: 21, Event: 22, Operator: 23, TypeParameter: 24,
+  Text: 0,
+  Method: 1,
+  Function: 2,
+  Constructor: 3,
+  Field: 4,
+  Variable: 5,
+  Class: 6,
+  Interface: 7,
+  Module: 8,
+  Property: 9,
+  Unit: 10,
+  Value: 11,
+  Enum: 12,
+  Keyword: 13,
+  Snippet: 14,
+  Color: 15,
+  File: 16,
+  Reference: 17,
+  Folder: 18,
+  EnumMember: 19,
+  Constant: 20,
+  Struct: 21,
+  Event: 22,
+  Operator: 23,
+  TypeParameter: 24,
 };
 
 export const Location = class {
-  constructor(public uri: unknown, public range: unknown) {}
+  constructor(
+    public uri: unknown,
+    public range: unknown,
+  ) {}
 };
 
 export const Position = class {
-  constructor(public line: number, public character: number) {}
+  constructor(
+    public line: number,
+    public character: number,
+  ) {}
 };
 
 export const Range = class {
-  constructor(public start: unknown, public end: unknown) {}
+  constructor(
+    public start: unknown,
+    public end: unknown,
+  ) {}
 };
 
 export const InlayHintKind = {
@@ -138,10 +203,16 @@ export const WorkspaceEdit = class {
   replace() {}
   insert() {}
   delete() {}
-  has() { return false; }
+  has() {
+    return false;
+  }
   set() {}
-  get size() { return 0; }
-  entries() { return []; }
+  get size() {
+    return 0;
+  }
+  entries() {
+    return [];
+  }
 };
 
 export const TabInputTextDiff = class {};

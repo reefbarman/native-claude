@@ -84,19 +84,17 @@ export function ActiveToolCalls({ calls, postCommand }: Props) {
             </div>
           )}
           <div class="tool-call-actions">
-            {c.source === "mcp" && (
-              <button
-                class="btn btn-complete"
-                onClick={() => postCommand("completeToolCall", { id: c.id })}
-              >
-                Complete
-              </button>
-            )}
+            <button
+              class="btn btn-complete"
+              onClick={() => postCommand("completeToolCall", { id: c.id })}
+            >
+              Complete
+            </button>
             <button
               class="btn btn-cancel"
               onClick={() => postCommand("cancelToolCall", { id: c.id })}
             >
-              {c.source === "agent" ? "Stop Agent" : "Cancel"}
+              Cancel
             </button>
           </div>
         </div>

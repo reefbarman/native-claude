@@ -35,7 +35,12 @@ export {
   CODEX_CONDENSE_MODEL_FALLBACKS,
   CodexOAuthManager,
   codexOAuthManager,
+  OpenAiCodexAuthManager,
+  openAiCodexAuthManager,
   type CodexCredentials,
+  type OpenAiCodexAuthMethod,
+  type OpenAiCodexResolvedAuth,
+  type OpenAiApiKeyCredential,
 } from "./codex/index.js";
 
 import type { ModelProvider, ModelInfo } from "./types.js";

@@ -25,15 +25,22 @@ interface SessionState {
   lastActivity: number;
 }
 
+interface PersistedApprovalSessions {
+  version: 1;
+  sessions: Record<string, SessionState>;
+}
+
 const SESSION_TTL = 24 * 60 * 60_000; // 24 hours
 const PRUNE_INTERVAL = 60 * 60_000; // 1 hour
+const APPROVAL_SESSIONS_KEY = "approvalSessions";
 
 export class ApprovalManager {
   private pruneTimer: ReturnType<typeof setInterval>;
   private _onDidChange = new vscode.EventEmitter<void>();
   readonly onDidChange = this._onDidChange.event;
 
-  // Sessions are now in-memory only (ephemeral, tied to MCP transport sessions)
+  // Session-scoped approvals, keyed by chat session ID.
+  // Persisted so restored chat sessions keep their session-level approvals.
   private sessions = new Map<string, SessionState>();
 
   // Per-session MCP tool approvals: key is "sessionId:toolName" or "sessionId:server:*"
@@ -44,6 +51,7 @@ export class ApprovalManager {
     private globalState: vscode.Memento, // kept for migration
     private configStore: ConfigStore,
   ) {
+    this.loadPersistedSessions();
     this.pruneExpiredSessions();
     this.pruneTimer = setInterval(
       () => this.pruneExpiredSessions(),
@@ -134,7 +142,6 @@ export class ApprovalManager {
       await this.globalState.update("globalWriteApproved", undefined);
       await this.globalState.update("globalPathRules", undefined);
       await this.globalState.update("globalWriteRules", undefined);
-      await this.globalState.update("approvalSessions", undefined);
     }
 
     await this.globalState.update("configMigrated", true);
@@ -146,18 +153,27 @@ export class ApprovalManager {
     const session = this.sessions.get(sessionId) ?? this.newSession();
     session.lastActivity = Date.now();
     this.sessions.set(sessionId, session);
+    this.persistSessions();
   }
 
   clearSession(sessionId: string): void {
     this.sessions.delete(sessionId);
+    this.clearMcpApprovalsForSession(sessionId);
+    this.persistSessions();
   }
 
   pruneExpiredSessions(): void {
     const now = Date.now();
+    let changed = false;
     for (const [id, session] of this.sessions) {
       if (now - session.lastActivity > SESSION_TTL) {
         this.sessions.delete(id);
+        this.clearMcpApprovalsForSession(id);
+        changed = true;
       }
+    }
+    if (changed) {
+      this.persistSessions();
     }
   }
 
@@ -201,6 +217,7 @@ export class ApprovalManager {
       session.writeApproved = true;
       session.lastActivity = Date.now();
       this.sessions.set(sessionId, session);
+      this.persistSessions();
     }
     this._onDidChange.fire();
   }
@@ -225,6 +242,7 @@ export class ApprovalManager {
     for (const session of this.sessions.values()) {
       session.writeApproved = false;
     }
+    this.persistSessions();
     this._onDidChange.fire();
   }
 
@@ -285,6 +303,7 @@ export class ApprovalManager {
       session.agentWriteApproved = true;
       session.lastActivity = Date.now();
       this.sessions.set(sessionId, session);
+      this.persistSessions();
     }
     this._onDidChange.fire();
   }
@@ -299,6 +318,7 @@ export class ApprovalManager {
     if (!source) return;
     this.sessions.set(toId, { ...source, lastActivity: Date.now() });
     this.sessions.delete(fromId);
+    this.persistSessions();
     this._onDidChange.fire();
   }
 
@@ -307,6 +327,7 @@ export class ApprovalManager {
     const session = this.sessions.get(sessionId);
     if (session?.agentWriteApproved) {
       session.agentWriteApproved = false;
+      this.persistSessions();
       this._onDidChange.fire();
     }
   }
@@ -329,6 +350,7 @@ export class ApprovalManager {
     for (const session of this.sessions.values()) {
       session.agentWriteApproved = false;
     }
+    this.persistSessions();
     this._onDidChange.fire();
   }
 
@@ -416,6 +438,7 @@ export class ApprovalManager {
         session.pathRules = pathRules;
         session.lastActivity = Date.now();
         this.sessions.set(sessionId, session);
+        this.persistSessions();
       }
     }
     this._onDidChange.fire();
@@ -438,6 +461,7 @@ export class ApprovalManager {
         session.pathRules = (session.pathRules ?? []).filter(
           (r) => r.pattern !== pattern,
         );
+        this.persistSessions();
       }
     }
     this._onDidChange.fire();
@@ -468,7 +492,10 @@ export class ApprovalManager {
       if (session) {
         const pathRules = session.pathRules ?? [];
         const idx = pathRules.findIndex((r) => r.pattern === oldPattern);
-        if (idx !== -1) pathRules[idx] = newRule;
+        if (idx !== -1) {
+          pathRules[idx] = newRule;
+          this.persistSessions();
+        }
       }
     }
     this._onDidChange.fire();
@@ -577,6 +604,7 @@ export class ApprovalManager {
         session.writeRules = writeRules;
         session.lastActivity = Date.now();
         this.sessions.set(sessionId, session);
+        this.persistSessions();
       }
     }
     this._onDidChange.fire();
@@ -603,6 +631,7 @@ export class ApprovalManager {
         session.writeRules = (session.writeRules ?? []).filter(
           (r) => r.pattern !== pattern,
         );
+        this.persistSessions();
       }
     }
     this._onDidChange.fire();
@@ -633,7 +662,10 @@ export class ApprovalManager {
       if (session) {
         const writeRules = session.writeRules ?? [];
         const idx = writeRules.findIndex((r) => r.pattern === oldPattern);
-        if (idx !== -1) writeRules[idx] = newRule;
+        if (idx !== -1) {
+          writeRules[idx] = newRule;
+          this.persistSessions();
+        }
       }
     }
     this._onDidChange.fire();
@@ -730,6 +762,7 @@ export class ApprovalManager {
         session.commandRules.push(rule);
         session.lastActivity = Date.now();
         this.sessions.set(sessionId, session);
+        this.persistSessions();
       }
     }
     this._onDidChange.fire();
@@ -761,7 +794,10 @@ export class ApprovalManager {
         const idx = session.commandRules.findIndex(
           (r) => r.pattern === oldPattern,
         );
-        if (idx !== -1) session.commandRules[idx] = newRule;
+        if (idx !== -1) {
+          session.commandRules[idx] = newRule;
+          this.persistSessions();
+        }
       }
     }
     this._onDidChange.fire();
@@ -792,6 +828,7 @@ export class ApprovalManager {
         session.commandRules = session.commandRules.filter(
           (r) => r.pattern !== pattern,
         );
+        this.persistSessions();
       }
     }
     this._onDidChange.fire();
@@ -815,6 +852,7 @@ export class ApprovalManager {
     const session = this.sessions.get(sessionId);
     if (session) {
       session.commandRules = [];
+      this.persistSessions();
     }
     this._onDidChange.fire();
   }
@@ -875,6 +913,49 @@ export class ApprovalManager {
   /** Get session state for reading. Returns an empty session if none exists (no side effect). */
   private getSession(sessionId: string): Readonly<SessionState> {
     return this.sessions.get(sessionId) ?? this.emptySession;
+  }
+
+  private clearMcpApprovalsForSession(sessionId: string): void {
+    const prefix = `${sessionId}:`;
+    for (const key of this.mcpApprovals) {
+      if (key.startsWith(prefix)) {
+        this.mcpApprovals.delete(key);
+      }
+    }
+  }
+
+  private loadPersistedSessions(): void {
+    const persisted = this.globalState.get<
+      PersistedApprovalSessions | SessionState[] | undefined
+    >(APPROVAL_SESSIONS_KEY);
+    if (!persisted) return;
+
+    if (Array.isArray(persisted)) {
+      return;
+    }
+
+    if (persisted.version !== 1 || !persisted.sessions) {
+      return;
+    }
+
+    for (const [sessionId, session] of Object.entries(persisted.sessions)) {
+      this.sessions.set(sessionId, {
+        writeApproved: !!session.writeApproved,
+        agentWriteApproved: !!session.agentWriteApproved,
+        commandRules: [...(session.commandRules ?? [])],
+        pathRules: [...(session.pathRules ?? [])],
+        writeRules: [...(session.writeRules ?? [])],
+        lastActivity: session.lastActivity || Date.now(),
+      });
+    }
+  }
+
+  private persistSessions(): void {
+    const sessions = Object.fromEntries(this.sessions.entries());
+    void this.globalState.update(APPROVAL_SESSIONS_KEY, {
+      version: 1,
+      sessions,
+    } satisfies PersistedApprovalSessions);
   }
 
   private readonly emptySession: Readonly<SessionState> = Object.freeze({

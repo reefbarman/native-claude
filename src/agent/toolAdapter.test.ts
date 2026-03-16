@@ -381,6 +381,7 @@ describe("dispatchToolCall", () => {
       mockCtx.approvalManager,
       mockCtx.approvalPanel,
       mockCtx.sessionId,
+      mockCtx.trackerCtx,
     );
     expect(result.content[0]).toMatchObject({ type: "text", text: "output" });
   });

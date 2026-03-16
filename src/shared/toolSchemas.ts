@@ -88,7 +88,7 @@ export const searchFilesSchema = {
     .boolean()
     .optional()
     .describe(
-      "Use semantic/vector search instead of regex. Requires codebase index and OpenAI API key. Default: false",
+      "Use semantic/vector search instead of regex. Requires a codebase index and OpenAI/Codex authentication (ChatGPT/Codex OAuth or an OpenAI API key). Default: false",
     ),
   context: z.coerce
     .number()
@@ -259,7 +259,7 @@ export const executeCommandSchema = {
     .string()
     .optional()
     .describe(
-      "Working directory (absolute or relative to workspace root). Only applies when creating a new terminal.",
+      "Working directory (absolute or relative to workspace root). Reused unnamed terminals are only selected when their current tracked cwd matches this value; otherwise a new terminal is created.",
     ),
   terminal_id: z
     .string()
@@ -525,6 +525,12 @@ export const codebaseSearchSchema = {
     .optional()
     .describe(
       "Maximum number of results to return (default: 10). Higher values return more results but increase context size.",
+    ),
+  exclude_globs: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Glob patterns to exclude from semantic results after retrieval (e.g. ['**/.agentlink/**', '**/dist/**']). Useful for suppressing noisy indexed paths without rebuilding the index.",
     ),
 };
 

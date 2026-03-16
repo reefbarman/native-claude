@@ -22,7 +22,12 @@ export function registerSearchTools(ctx: ToolRegistrationContext): void {
         const dirPath = params.path
           ? resolveAndValidatePath(String(params.path)).absolutePath
           : (tryGetFirstWorkspaceRoot() ?? ".");
-        return semanticSearch(dirPath, String(params.query), params.limit);
+        return semanticSearch(
+          dirPath,
+          String(params.query),
+          params.limit,
+          params.exclude_globs,
+        );
       },
       (p) => String(p.query ?? "").slice(0, 60),
       sid,

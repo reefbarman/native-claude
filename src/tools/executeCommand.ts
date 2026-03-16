@@ -207,6 +207,9 @@ export async function handleExecuteCommand(
       }
 
       result.output = filtered;
+    } else if (!result.output_captured && !result.output) {
+      result.output =
+        "Command execution was sent to the terminal, but no output was captured.";
     }
 
     // If the user edited the command, include modification info

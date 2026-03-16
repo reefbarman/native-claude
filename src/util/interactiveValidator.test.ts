@@ -69,11 +69,15 @@ describe("validateInteractiveCommand", () => {
     });
 
     it("allows mysql -e", () => {
-      expect(validateInteractiveCommand('mysql -u root mydb -e "SELECT 1"')).toBeNull();
+      expect(
+        validateInteractiveCommand('mysql -u root mydb -e "SELECT 1"'),
+      ).toBeNull();
     });
 
     it("allows mysql --execute", () => {
-      expect(validateInteractiveCommand('mysql --execute "SHOW TABLES"')).toBeNull();
+      expect(
+        validateInteractiveCommand('mysql --execute "SHOW TABLES"'),
+      ).toBeNull();
     });
 
     it("rejects bare psql", () => {
@@ -93,7 +97,9 @@ describe("validateInteractiveCommand", () => {
     });
 
     it("allows mongosh --eval", () => {
-      expect(validateInteractiveCommand('mongosh --eval "db.test.find()"')).toBeNull();
+      expect(
+        validateInteractiveCommand('mongosh --eval "db.test.find()"'),
+      ).toBeNull();
     });
   });
 
@@ -165,7 +171,9 @@ describe("validateInteractiveCommand", () => {
     });
 
     it("rejects git rebase --interactive", () => {
-      expect(validateInteractiveCommand("git rebase --interactive main")).not.toBeNull();
+      expect(
+        validateInteractiveCommand("git rebase --interactive main"),
+      ).not.toBeNull();
     });
 
     it("rejects git add -i", () => {
@@ -188,11 +196,74 @@ describe("validateInteractiveCommand", () => {
       expect(validateInteractiveCommand("git rebase main")).toBeNull();
     });
 
+    it("rejects git commit without message", () => {
+      const result = validateInteractiveCommand("git commit");
+      expect(result).not.toBeNull();
+      expect(result!.message).toContain("may open an editor");
+    });
+
+    it("rejects git commit --amend without --no-edit", () => {
+      const result = validateInteractiveCommand("git commit --amend");
+      expect(result).not.toBeNull();
+      expect(result!.message).toContain("may open an editor");
+    });
+
+    it("allows git commit --amend --no-edit", () => {
+      expect(
+        validateInteractiveCommand("git commit --amend --no-edit"),
+      ).toBeNull();
+    });
+
+    it("rejects annotated git tag without message", () => {
+      const result = validateInteractiveCommand("git tag -a v1.2.3");
+      expect(result).not.toBeNull();
+      expect(result!.message).toContain('Annotated "git tag"');
+    });
+
+    it("rejects git revert without --no-edit", () => {
+      const result = validateInteractiveCommand("git revert HEAD~1");
+      expect(result).not.toBeNull();
+      expect(result!.message).toContain("git revert");
+    });
+
+    it("allows git revert --no-edit", () => {
+      expect(
+        validateInteractiveCommand("git revert --no-edit HEAD~1"),
+      ).toBeNull();
+    });
+
+    it("rejects git revert -m 1 without --no-edit", () => {
+      const result = validateInteractiveCommand("git revert -m 1 HEAD~1");
+      expect(result).not.toBeNull();
+      expect(result!.message).toContain("git revert");
+    });
+
+    it("rejects git cherry-pick without --no-edit", () => {
+      const result = validateInteractiveCommand("git cherry-pick abc1234");
+      expect(result).not.toBeNull();
+      expect(result!.message).toContain("git cherry-pick");
+    });
+
+    it("rejects git cherry-pick -m 1 without --no-edit", () => {
+      const result = validateInteractiveCommand("git cherry-pick -m 1 abc1234");
+      expect(result).not.toBeNull();
+      expect(result!.message).toContain("git cherry-pick");
+    });
+
+    it("rejects git notes edit", () => {
+      const result = validateInteractiveCommand("git notes edit HEAD");
+      expect(result).not.toBeNull();
+      expect(result!.message).toContain("git notes edit");
+    });
+
     it("allows normal git commands", () => {
       expect(validateInteractiveCommand("git status")).toBeNull();
       expect(validateInteractiveCommand("git commit -m 'msg'")).toBeNull();
       expect(validateInteractiveCommand("git push origin main")).toBeNull();
       expect(validateInteractiveCommand("git log --oneline")).toBeNull();
+      expect(
+        validateInteractiveCommand("git tag -a v1.2.3 -m 'release'"),
+      ).toBeNull();
     });
   });
 
@@ -210,7 +281,9 @@ describe("validateInteractiveCommand", () => {
     });
 
     it("rejects ftp", () => {
-      expect(validateInteractiveCommand("ftp server.example.com")).not.toBeNull();
+      expect(
+        validateInteractiveCommand("ftp server.example.com"),
+      ).not.toBeNull();
     });
 
     it("rejects sftp", () => {
@@ -248,14 +321,18 @@ describe("validateInteractiveCommand", () => {
 
   describe("scaffolding commands", () => {
     it("rejects npx create-next-app without flags", () => {
-      const result = validateInteractiveCommand("npx create-next-app@latest myapp");
+      const result = validateInteractiveCommand(
+        "npx create-next-app@latest myapp",
+      );
       expect(result).not.toBeNull();
       expect(result!.message).toContain("interactive input");
     });
 
     it("allows npx create-next-app with --yes", () => {
       expect(
-        validateInteractiveCommand("npx create-next-app@latest myapp --yes --typescript"),
+        validateInteractiveCommand(
+          "npx create-next-app@latest myapp --yes --typescript",
+        ),
       ).toBeNull();
     });
 
@@ -327,11 +404,15 @@ describe("validateInteractiveCommand", () => {
     });
 
     it("rejects sudo -u root nano", () => {
-      expect(validateInteractiveCommand("sudo -u root nano /etc/hosts")).not.toBeNull();
+      expect(
+        validateInteractiveCommand("sudo -u root nano /etc/hosts"),
+      ).not.toBeNull();
     });
 
     it("allows sudo npm install", () => {
-      expect(validateInteractiveCommand("sudo npm install -g typescript")).toBeNull();
+      expect(
+        validateInteractiveCommand("sudo npm install -g typescript"),
+      ).toBeNull();
     });
   });
 
@@ -339,7 +420,9 @@ describe("validateInteractiveCommand", () => {
 
   describe("env var prefix handling", () => {
     it("rejects NODE_ENV=prod python (bare REPL with env prefix)", () => {
-      expect(validateInteractiveCommand("NODE_ENV=production python")).not.toBeNull();
+      expect(
+        validateInteractiveCommand("NODE_ENV=production python"),
+      ).not.toBeNull();
     });
 
     it("allows NODE_ENV=prod node script.js", () => {
@@ -369,11 +452,15 @@ describe("validateInteractiveCommand", () => {
     });
 
     it("allows curl", () => {
-      expect(validateInteractiveCommand("curl -s https://example.com")).toBeNull();
+      expect(
+        validateInteractiveCommand("curl -s https://example.com"),
+      ).toBeNull();
     });
 
     it("allows docker run", () => {
-      expect(validateInteractiveCommand("docker run --rm alpine echo hello")).toBeNull();
+      expect(
+        validateInteractiveCommand("docker run --rm alpine echo hello"),
+      ).toBeNull();
     });
 
     it("allows make", () => {
@@ -389,7 +476,9 @@ describe("validateInteractiveCommand", () => {
     });
 
     it("allows cd && npm test", () => {
-      expect(validateInteractiveCommand("cd stress-test && npm test")).toBeNull();
+      expect(
+        validateInteractiveCommand("cd stress-test && npm test"),
+      ).toBeNull();
     });
   });
 });

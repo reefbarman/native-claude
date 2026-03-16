@@ -97,6 +97,11 @@ export class AgentSession {
     images?: Array<{ name: string; mimeType: string; base64: string }>;
     documents?: Array<{ name: string; mimeType: string; base64: string }>;
   } | null = null;
+  private _pendingModeResume: {
+    mode: string;
+    reason?: string;
+    followUp?: string;
+  } | null = null;
 
   /**
    * Turn-bound media attachments (images + PDFs).
@@ -458,6 +463,27 @@ export class AgentSession {
     return null;
   }
 
+  queuePendingModeResume(
+    mode: string,
+    opts?: { reason?: string; followUp?: string },
+  ): void {
+    this._pendingModeResume = {
+      mode,
+      reason: opts?.reason,
+      followUp: opts?.followUp,
+    };
+  }
+
+  consumePendingModeResume(): {
+    mode: string;
+    reason?: string;
+    followUp?: string;
+  } | null {
+    const pending = this._pendingModeResume;
+    this._pendingModeResume = null;
+    return pending;
+  }
+
   /** Store pending media (images/PDFs) bound to a specific message index. */
   setPendingMedia(
     messageIndex: number,
@@ -495,6 +521,7 @@ export class AgentSession {
   abort(): void {
     this.abortController?.abort();
     this.abortController = null;
+    this._pendingModeResume = null;
   }
 
   get isAborted(): boolean {

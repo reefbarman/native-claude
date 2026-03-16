@@ -8,9 +8,15 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import * as fs from "fs";
-import { fork, type ChildProcess } from "child_process";
+import { fork, spawn, type ChildProcess } from "child_process";
 import { createHash } from "crypto";
-import type { WorkerToExtensionMessage, IndexPhase } from "./types.js";
+import picomatch from "picomatch";
+import { openAiCodexAuthManager } from "../agent/providers/index.js";
+import type {
+  WorkerToExtensionMessage,
+  IndexPhase,
+  EmbeddingAuthRefreshRequestMessage,
+} from "./types.js";
 
 // --- Public types ---
 
@@ -38,6 +44,24 @@ export interface IndexStatus {
 
 const WATCHER_DEBOUNCE_MS = 2000;
 const MAX_FILE_SIZE = 1_000_000; // 1MB
+const DEFAULT_INDEX_EXCLUSIONS = [
+  "**/node_modules/**",
+  "**/.git/**",
+  "**/dist/**",
+  "**/build/**",
+  "**/.next/**",
+  "**/coverage/**",
+  "**/__pycache__/**",
+  "**/target/**",
+  "**/.venv/**",
+  "**/vendor/**",
+  "**/.claude/**",
+  "**/.codex/**",
+  "**/.agentlink/**",
+  "**/.agents/**",
+  "**/*.min.js",
+  "**/*.map",
+];
 
 export class IndexerManager implements vscode.Disposable {
   private worker: ChildProcess | null = null;
@@ -94,13 +118,13 @@ export class IndexerManager implements vscode.Disposable {
         return;
       }
 
-      const openAiApiKey = await this.getOpenAiApiKey();
+      const embeddingBearerToken = await this.getEmbeddingBearerToken();
 
-      if (!openAiApiKey) {
+      if (!embeddingBearerToken) {
         this.updateStatus({
           state: "error",
           error:
-            "OpenAI API key not configured. Run 'AgentLink: Set OpenAI API Key' or set OPENAI_API_KEY env var.",
+            "OpenAI authentication not configured. Run 'AgentLink: Sign In to OpenAI/Codex' to choose ChatGPT/Codex OAuth or an OpenAI API key, or set OPENAI_API_KEY in the environment. Either method enables semantic search and indexing.",
         });
         return;
       }
@@ -117,30 +141,7 @@ export class IndexerManager implements vscode.Disposable {
       const collectionName = this.getCollectionName(workspaceRoot);
       const cachePath = this.getCachePath(collectionName);
 
-      // File discovery via VS Code API (respects .gitignore)
-      const exclusions = config.get<string[]>("indexExclusions", [
-        "**/node_modules/**",
-        "**/.git/**",
-        "**/dist/**",
-        "**/build/**",
-        "**/*.min.js",
-        "**/*.map",
-      ]);
-      const excludePattern = `{${exclusions.join(",")}}`;
-
-      const uris = await vscode.workspace.findFiles("**/*", excludePattern);
-
-      // Filter: skip oversized, binary detection happens in the worker
-      const files = uris
-        .map((u) => u.fsPath)
-        .filter((f) => {
-          try {
-            const stat = fs.statSync(f);
-            return stat.isFile() && stat.size > 0 && stat.size <= MAX_FILE_SIZE;
-          } catch {
-            return false;
-          }
-        });
+      const files = await this.discoverIndexableFiles(workspaceRoot, config);
 
       this.log(`Discovered ${files.length} files for indexing`);
       this.updateStatus({ state: "indexing", current: 0, total: files.length });
@@ -161,7 +162,7 @@ export class IndexerManager implements vscode.Disposable {
         workspaceRoot,
         collectionName,
         qdrantUrl,
-        openAiApiKey,
+        embeddingBearerToken,
         cachePath,
         force,
         granularity,
@@ -344,6 +345,39 @@ export class IndexerManager implements vscode.Disposable {
           this.updateStatus({ ...this.status, detail: msg.message });
         }
         break;
+
+      case "embeddingAuthRefreshRequest":
+        void this.handleEmbeddingAuthRefreshRequest(msg);
+        break;
+    }
+  }
+
+  private async handleEmbeddingAuthRefreshRequest(
+    msg: EmbeddingAuthRefreshRequestMessage,
+  ): Promise<void> {
+    const worker = this.worker;
+    if (!worker) return;
+
+    try {
+      const oauthMethod = await openAiCodexAuthManager.getPreferredAuthMethod();
+      const auth =
+        oauthMethod === "oauth"
+          ? await openAiCodexAuthManager.forceRefreshModelAuth("oauth")
+          : await openAiCodexAuthManager.resolveEmbeddingAuth();
+      worker.send({
+        type: "embeddingAuthRefreshResponse",
+        requestId: msg.requestId,
+        bearerToken: auth?.bearerToken || "",
+      });
+    } catch (error) {
+      this.log(
+        `[indexer] Failed to refresh embedding auth: ${error instanceof Error ? error.message : error}`,
+      );
+      worker.send({
+        type: "embeddingAuthRefreshResponse",
+        requestId: msg.requestId,
+        bearerToken: "",
+      });
     }
   }
 
@@ -355,29 +389,39 @@ export class IndexerManager implements vscode.Disposable {
   }
 
   private async flushIncrementalUpdate(): Promise<void> {
-    const added = [...this.pendingAdded];
-    const removed = [...this.pendingRemoved];
-    this.pendingAdded.clear();
-    this.pendingRemoved.clear();
+    const workspaceRoot = this.getWorkspaceRoot();
+    if (!workspaceRoot) return;
 
-    if (added.length === 0 && removed.length === 0) return;
+    let added = [...this.pendingAdded];
+    let removed = [...this.pendingRemoved];
+
+    const config = vscode.workspace.getConfiguration("agentlink");
+    const exclusions = this.getIndexExclusions(config);
+    added = await this.filterIndexableFiles(added, workspaceRoot, exclusions);
+    removed = await this.filterExplicitlyIncludedRemovedPaths(
+      removed,
+      workspaceRoot,
+      exclusions,
+    );
+
+    if (added.length === 0 && removed.length === 0) {
+      this.pendingAdded.clear();
+      this.pendingRemoved.clear();
+      return;
+    }
     if (
       this.status.state === "indexing" ||
       this.status.state === "discovering"
     ) {
-      // Queue for after current index completes — re-add to pending
-      for (const f of added) this.pendingAdded.add(f);
-      for (const f of removed) this.pendingRemoved.add(f);
       return;
     }
 
-    const workspaceRoot = this.getWorkspaceRoot();
-    if (!workspaceRoot) return;
+    this.pendingAdded.clear();
+    this.pendingRemoved.clear();
 
-    const config = vscode.workspace.getConfiguration("agentlink");
     const qdrantUrl = config.get<string>("qdrantUrl", "http://localhost:6333");
-    const openAiApiKey = await this.getOpenAiApiKey();
-    if (!openAiApiKey) return;
+    const embeddingBearerToken = await this.getEmbeddingBearerToken();
+    if (!embeddingBearerToken) return;
 
     const collectionName = this.getCollectionName(workspaceRoot);
     const cachePath = this.getCachePath(collectionName);
@@ -401,9 +445,175 @@ export class IndexerManager implements vscode.Disposable {
       workspaceRoot,
       collectionName,
       qdrantUrl,
-      openAiApiKey,
+      embeddingBearerToken,
       cachePath,
       granularity,
+    });
+  }
+
+  private async discoverIndexableFiles(
+    workspaceRoot: string,
+    config: vscode.WorkspaceConfiguration,
+  ): Promise<string[]> {
+    const exclusions = this.getIndexExclusions(config);
+    const excludePattern = `{${exclusions.join(",")}}`;
+
+    const uris = await vscode.workspace.findFiles("**/*", excludePattern);
+    const discovered = uris.map((u) => u.fsPath);
+    return this.filterIndexableFiles(discovered, workspaceRoot, exclusions);
+  }
+
+  private getIndexExclusions(config: vscode.WorkspaceConfiguration): string[] {
+    return config.get<string[]>("indexExclusions", DEFAULT_INDEX_EXCLUSIONS);
+  }
+
+  private async filterIndexableFiles(
+    files: string[],
+    workspaceRoot: string,
+    exclusions: string[] = DEFAULT_INDEX_EXCLUSIONS,
+  ): Promise<string[]> {
+    const exclusionMatcher = this.buildExclusionMatcher(
+      workspaceRoot,
+      exclusions,
+    );
+
+    const existingFiles = files.filter((filePath) => {
+      try {
+        if (exclusionMatcher(filePath)) return false;
+        const stat = fs.statSync(filePath);
+        return stat.isFile() && stat.size > 0 && stat.size <= MAX_FILE_SIZE;
+      } catch {
+        return false;
+      }
+    });
+
+    return this.filterGitIgnoredPaths(existingFiles, workspaceRoot, {
+      keepIgnored: false,
+    });
+  }
+
+  private async filterExplicitlyIncludedRemovedPaths(
+    files: string[],
+    workspaceRoot: string,
+    exclusions: string[],
+  ): Promise<string[]> {
+    if (files.length === 0) return files;
+    const exclusionMatcher = this.buildExclusionMatcher(
+      workspaceRoot,
+      exclusions,
+    );
+    return files.filter((filePath) => !exclusionMatcher(filePath));
+  }
+
+  private buildExclusionMatcher(
+    workspaceRoot: string,
+    exclusions: string[],
+  ): (filePath: string) => boolean {
+    const relativeMatchers = exclusions.map((pattern) =>
+      picomatch(pattern, { dot: true }),
+    );
+    const absoluteMatchers = exclusions
+      .filter((pattern) => path.isAbsolute(pattern))
+      .map((pattern) => picomatch(pattern, { dot: true }));
+
+    return (filePath: string) => {
+      const relPath = path
+        .relative(workspaceRoot, filePath)
+        .split(path.sep)
+        .join("/");
+      if (!relPath || relPath.startsWith("../") || relPath === "..") {
+        return true;
+      }
+
+      if (relativeMatchers.some((matcher) => matcher(relPath))) {
+        return true;
+      }
+
+      const normalizedAbsPath = filePath.split(path.sep).join("/");
+      return absoluteMatchers.some((matcher) => matcher(normalizedAbsPath));
+    };
+  }
+
+  private async filterGitIgnoredPaths(
+    files: string[],
+    workspaceRoot: string,
+    options: { keepIgnored: boolean },
+  ): Promise<string[]> {
+    if (files.length === 0) return files;
+
+    const relPathEntries = files
+      .map((filePath) => {
+        const relPath = path.relative(workspaceRoot, filePath);
+        if (!relPath || relPath.startsWith("..") || path.isAbsolute(relPath)) {
+          return null;
+        }
+        return { filePath, relPath: relPath.split(path.sep).join("/") };
+      })
+      .filter(
+        (entry): entry is { filePath: string; relPath: string } =>
+          entry !== null,
+      );
+
+    if (relPathEntries.length === 0) return [];
+
+    const ignoredRelPaths = await this.getGitIgnoredRelativePaths(
+      relPathEntries.map((entry) => entry.relPath),
+      workspaceRoot,
+    );
+
+    return relPathEntries
+      .filter(
+        (entry) => ignoredRelPaths.has(entry.relPath) === options.keepIgnored,
+      )
+      .map((entry) => entry.filePath);
+  }
+
+  private async getGitIgnoredRelativePaths(
+    relPaths: string[],
+    workspaceRoot: string,
+  ): Promise<Set<string>> {
+    if (relPaths.length === 0) return new Set();
+
+    return new Promise((resolve) => {
+      const child = spawn("git", ["check-ignore", "--stdin", "-z"], {
+        cwd: workspaceRoot,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+
+      const stdoutChunks: Buffer[] = [];
+      const stderrChunks: Buffer[] = [];
+
+      child.stdout.on("data", (chunk: Buffer) => {
+        stdoutChunks.push(chunk);
+      });
+      child.stderr.on("data", (chunk: Buffer) => {
+        stderrChunks.push(chunk);
+      });
+      child.on("error", (err) => {
+        const code = (err as NodeJS.ErrnoException).code;
+        this.log(
+          `Git ignore filtering unavailable (${String(code ?? err.message)}); indexing non-excluded files only.`,
+        );
+        resolve(new Set());
+      });
+      child.stdin.on("error", () => {
+        // git may exit before consuming all stdin; ignore broken-pipe errors.
+      });
+      child.on("close", (code) => {
+        const output = Buffer.concat(stdoutChunks).toString("utf8");
+        if (code === 0 || code === 1) {
+          resolve(new Set(output.split("\0").filter(Boolean)));
+          return;
+        }
+
+        const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
+        this.log(
+          `Git ignore filtering failed (${code ?? "unknown"})${stderr ? `: ${stderr}` : ""}`,
+        );
+        resolve(new Set());
+      });
+
+      child.stdin.end(Buffer.from(relPaths.join("\0") + "\0"));
     });
   }
 
@@ -468,12 +678,8 @@ export class IndexerManager implements vscode.Disposable {
     return false;
   }
 
-  private async getOpenAiApiKey(): Promise<string> {
-    // Try secret storage first (set via command palette)
-    const fromSecrets = await vscode.commands.executeCommand<string>(
-      "agentlink.getOpenAiApiKeyInternal",
-    );
-    if (fromSecrets) return fromSecrets;
-    return process.env.OPENAI_API_KEY || "";
+  private async getEmbeddingBearerToken(): Promise<string> {
+    const auth = await openAiCodexAuthManager.resolveEmbeddingAuth();
+    return auth?.bearerToken || "";
   }
 }

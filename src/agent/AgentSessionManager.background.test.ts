@@ -18,6 +18,11 @@ const mocks = vi.hoisted(() => {
     ),
     createSession: vi.fn(async (opts: any) => {
       seq += 1;
+      let pendingModeResume: {
+        mode: string;
+        reason?: string;
+        followUp?: string;
+      } | null = null;
       return {
         id: `bg-${seq}`,
         mode: opts.mode,
@@ -34,6 +39,18 @@ const mocks = vi.hoisted(() => {
         addUserMessage: vi.fn(),
         appendRuntimeError: vi.fn(),
         consumePendingInterjection: vi.fn(() => null),
+        queuePendingModeResume: vi.fn((mode: string, opts?: any) => {
+          pendingModeResume = {
+            mode,
+            reason: opts?.reason,
+            followUp: opts?.followUp,
+          };
+        }),
+        consumePendingModeResume: vi.fn(() => {
+          const pending = pendingModeResume;
+          pendingModeResume = null;
+          return pending;
+        }),
         setPendingMedia: vi.fn(),
         autoTitle: vi.fn(),
         getAllMessages: vi.fn(() => []),
@@ -292,5 +309,44 @@ describe("AgentSessionManager background agents", () => {
 
     releaseForeground?.();
     await sendPromise;
+  });
+
+  it("auto-continues once after a queued mode switch resume", async () => {
+    const mgr = new AgentSessionManager(config, "/tmp");
+    mgr.setToolContext(toolCtx);
+
+    const fg = await mgr.createSession("architect");
+    const addUserMessageSpy = vi.spyOn(fg, "addUserMessage");
+
+    mgr.queueModeSwitchResume(fg.id, "code", {
+      reason: "Implementation should happen in code mode",
+      followUp: "start with the concrete fix",
+    });
+
+    await mgr.sendMessage(fg.id, "plan the fix", fg.mode);
+
+    expect(addUserMessageSpy).toHaveBeenNthCalledWith(1, "plan the fix");
+    expect(addUserMessageSpy).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining("You just switched this session to code mode."),
+    );
+    expect(addUserMessageSpy).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining(
+        "Continue immediately in the new mode and start the next concrete implementation step now.",
+      ),
+    );
+    expect(addUserMessageSpy).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining(
+        "Switch reason: Implementation should happen in code mode",
+      ),
+    );
+    expect(addUserMessageSpy).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining("User follow-up: start with the concrete fix"),
+    );
+    expect(fg.consumePendingModeResume()).toBeNull();
+    expect(mocks.runBehavior).toHaveBeenCalledTimes(2);
   });
 });

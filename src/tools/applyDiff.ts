@@ -11,13 +11,36 @@ import type { ApprovalManager } from "../approvals/ApprovalManager.js";
 import type { ApprovalPanelProvider } from "../approvals/ApprovalPanelProvider.js";
 import { decisionToScope, saveWriteTrustRules } from "./writeApprovalUI.js";
 
-import { type ToolResult, type OnApprovalRequest } from "../shared/types.js";
+import {
+  type ToolResult,
+  type OnApprovalRequest,
+  errorResult,
+} from "../shared/types.js";
+import { handlePendingEditLockError } from "./pendingEditLock.js";
 
 interface SearchReplaceBlock {
   search: string;
   replace: string;
   index: number;
 }
+
+export type BlockApplyResult =
+  | {
+      index: number;
+      status: "applied";
+      matchType: "exact" | "flexible" | "escape_normalized";
+    }
+  | {
+      index: number;
+      status: "failed";
+      reason:
+        | "empty_search"
+        | "not_found"
+        | "ambiguous_exact"
+        | "ambiguous_flexible"
+        | "ambiguous_escape";
+      exactOccurrences: number;
+    };
 
 const SEARCH_MARKER = "<<<<<<< SEARCH";
 const DIVIDER_MARKER = "======= DIVIDER =======";
@@ -136,12 +159,12 @@ export function parseSearchReplaceBlocks(diff: string): ParseResult {
   // Detect whether this diff uses the new or legacy delimiter.
   // If the new delimiter appears anywhere, use strict mode (only match new delimiter).
   // Otherwise fall back to the legacy bare "=======" for backward compatibility.
-  const useNewDelimiter = lines.some((l) => l.trimEnd() === DIVIDER_MARKER);
+  const useNewDelimiter = lines.some((l) => l.trim() === DIVIDER_MARKER);
 
   while (i < lines.length) {
     // Look for <<<<<<< SEARCH — compare without leading/trailing whitespace.
     // Also accept trailing characters (e.g. "<<<<<<< SEARCH>" with a stray ">").
-    if (lines[i].trimEnd().startsWith(SEARCH_MARKER)) {
+    if (lines[i].trim().startsWith(SEARCH_MARKER)) {
       i++;
       const searchLines: string[] = [];
       const replaceLines: string[] = [];
@@ -149,7 +172,7 @@ export function parseSearchReplaceBlocks(diff: string): ParseResult {
       let foundReplace = false;
 
       while (i < lines.length) {
-        const trimmed = lines[i].trimEnd();
+        const trimmed = lines[i].trim();
 
         const isDivider = useNewDelimiter
           ? trimmed === DIVIDER_MARKER
@@ -203,46 +226,89 @@ export function parseSearchReplaceBlocks(diff: string): ParseResult {
 
 /**
  * Apply search/replace blocks to content sequentially.
- * Returns the new content and list of failed block indices.
+ * Returns the new content, failed block indices, and per-block outcomes.
  */
 export function applyBlocks(
   content: string,
   blocks: SearchReplaceBlock[],
-): { result: string; failedBlocks: number[] } {
+): {
+  result: string;
+  failedBlocks: number[];
+  blockResults: BlockApplyResult[];
+} {
   let result = content;
   const failedBlocks: number[] = [];
+  const blockResults: BlockApplyResult[] = [];
 
   for (const block of blocks) {
+    if (block.search.length === 0) {
+      failedBlocks.push(block.index);
+      blockResults.push({
+        index: block.index,
+        status: "failed",
+        reason: "empty_search",
+        exactOccurrences: 0,
+      });
+      continue;
+    }
+
     const occurrences = countOccurrences(result, block.search);
 
     if (occurrences === 0) {
-      // Fallback 1: try whitespace-flexible matching (tabs ≈ spaces)
-      const flexMatch = tryFlexibleMatch(result, block.search);
-      if (flexMatch) {
+      const flexAnalysis = analyzeFlexibleMatch(result, block.search);
+      if (flexAnalysis.match) {
         result =
-          result.slice(0, flexMatch.start) +
+          result.slice(0, flexAnalysis.match.start) +
           block.replace +
-          result.slice(flexMatch.end);
+          result.slice(flexAnalysis.match.end);
+        blockResults.push({
+          index: block.index,
+          status: "applied",
+          matchType: "flexible",
+        });
         continue;
       }
 
-      // Fallback 2: try escape-normalized matching (JSON escape corruption)
-      const escMatch = tryEscapeNormalizedMatch(result, block.search);
-      if (escMatch) {
-        const transformedReplace = escMatch.transformReplace(block.replace);
+      const escAnalysis = analyzeEscapeNormalizedMatch(result, block.search);
+      if (escAnalysis.match) {
+        const transformedReplace = escAnalysis.match.transformReplace(
+          block.replace,
+        );
         result =
-          result.slice(0, escMatch.start) +
+          result.slice(0, escAnalysis.match.start) +
           transformedReplace +
-          result.slice(escMatch.end);
+          result.slice(escAnalysis.match.end);
+        blockResults.push({
+          index: block.index,
+          status: "applied",
+          matchType: "escape_normalized",
+        });
         continue;
       }
 
       failedBlocks.push(block.index);
+      blockResults.push({
+        index: block.index,
+        status: "failed",
+        reason:
+          flexAnalysis.matchCount > 1
+            ? "ambiguous_flexible"
+            : escAnalysis.ambiguousVariantCount > 0
+              ? "ambiguous_escape"
+              : "not_found",
+        exactOccurrences: 0,
+      });
       continue;
     }
 
     if (occurrences > 1) {
       failedBlocks.push(block.index);
+      blockResults.push({
+        index: block.index,
+        status: "failed",
+        reason: "ambiguous_exact",
+        exactOccurrences: occurrences,
+      });
       continue;
     }
 
@@ -255,9 +321,14 @@ export function applyBlocks(
       result.slice(0, idx) +
       block.replace +
       result.slice(idx + block.search.length);
+    blockResults.push({
+      index: block.index,
+      status: "applied",
+      matchType: "exact",
+    });
   }
 
-  return { result, failedBlocks };
+  return { result, failedBlocks, blockResults };
 }
 
 /**
@@ -286,14 +357,14 @@ export function normalizeForComparison(line: string): string {
  * Returns the character offset range { start, end } in the original content,
  * or null if no unique match (0 or 2+) is found.
  */
-export function tryFlexibleMatch(
+function analyzeFlexibleMatch(
   content: string,
   search: string,
-): { start: number; end: number } | null {
+): { match: { start: number; end: number } | null; matchCount: number } {
   const contentLines = content.split("\n");
   const searchLines = search.split("\n");
 
-  if (searchLines.length === 0) return null;
+  if (searchLines.length === 0) return { match: null, matchCount: 0 };
 
   const normSearch = searchLines.map(normalizeForComparison);
   const normContent = contentLines.map(normalizeForComparison);
@@ -312,25 +383,31 @@ export function tryFlexibleMatch(
     if (isMatch) {
       matchCount++;
       matchLineStart = i;
-      if (matchCount > 1) return null; // Ambiguous — bail early
+      if (matchCount > 1) return { match: null, matchCount };
     }
   }
 
-  if (matchCount !== 1) return null;
+  if (matchCount !== 1) return { match: null, matchCount };
 
-  // Convert line indices to character offsets in the original content
   let start = 0;
   for (let i = 0; i < matchLineStart; i++) {
-    start += contentLines[i].length + 1; // +1 for \n
+    start += contentLines[i].length + 1;
   }
 
   let end = start;
   for (let i = 0; i < searchLines.length; i++) {
     end += contentLines[matchLineStart + i].length;
-    if (i < searchLines.length - 1) end += 1; // +1 for \n between lines
+    if (i < searchLines.length - 1) end += 1;
   }
 
-  return { start, end };
+  return { match: { start, end }, matchCount };
+}
+
+export function tryFlexibleMatch(
+  content: string,
+  search: string,
+): { start: number; end: number } | null {
+  return analyzeFlexibleMatch(content, search).match;
 }
 
 // ── Escape-normalized matching ─────────────────────────────────────────────
@@ -368,41 +445,61 @@ const ESCAPE_PAIRS: Array<{ interpreted: string; literal: string[] }> = [
  * Returns the match range and a transform function that converts the
  * replacement content to use the same escape style as the file.
  */
-export function tryEscapeNormalizedMatch(
-  content: string,
-  search: string,
-): {
+type EscapeMatch = {
   start: number;
   end: number;
   transformReplace: (replace: string) => string;
-} | null {
-  // Find which escape pairs are relevant (search contains the interpreted char)
+};
+
+function analyzeEscapeNormalizedMatch(
+  content: string,
+  search: string,
+): { match: EscapeMatch | null; ambiguousVariantCount: number } {
   const relevantPairs = ESCAPE_PAIRS.filter((p) =>
     search.includes(p.interpreted),
   );
-  if (relevantPairs.length === 0) return null;
+  if (relevantPairs.length === 0) {
+    return { match: null, ambiguousVariantCount: 0 };
+  }
 
-  // Try single-escape replacements first (most common case: only \n collapsed)
+  const seenVariants = new Set<string>();
+  let ambiguousVariantCount = 0;
+
+  const tryVariant = (
+    variant: string,
+    transformReplace: (replace: string) => string,
+  ): EscapeMatch | null => {
+    if (variant === search || seenVariants.has(variant)) return null;
+    seenVariants.add(variant);
+
+    const count = countOccurrences(content, variant);
+    if (count === 1) {
+      const start = content.indexOf(variant);
+      return {
+        start,
+        end: start + variant.length,
+        transformReplace,
+      };
+    }
+    if (count > 1) {
+      ambiguousVariantCount++;
+    }
+    return null;
+  };
+
   for (const pair of relevantPairs) {
     for (const lit of pair.literal) {
-      const variant = search.replaceAll(pair.interpreted, lit);
-      if (variant === search) continue;
-
-      const count = countOccurrences(content, variant);
-      if (count === 1) {
-        const start = content.indexOf(variant);
-        const interpreted = pair.interpreted;
-        return {
-          start,
-          end: start + variant.length,
-          transformReplace: (replace: string) =>
-            replace.replaceAll(interpreted, lit),
-        };
+      const interpreted = pair.interpreted;
+      const variant = search.replaceAll(interpreted, lit);
+      const match = tryVariant(variant, (replace: string) =>
+        replace.replaceAll(interpreted, lit),
+      );
+      if (match) {
+        return { match, ambiguousVariantCount };
       }
     }
   }
 
-  // Try all relevant escapes combined (e.g., file has both \n and \t as literals)
   if (relevantPairs.length > 1) {
     let variant = search;
     const transforms: Array<{ interpreted: string; literal: string }> = [];
@@ -411,26 +508,30 @@ export function tryEscapeNormalizedMatch(
       variant = variant.replaceAll(pair.interpreted, lit);
       transforms.push({ interpreted: pair.interpreted, literal: lit });
     }
-    if (variant !== search) {
-      const count = countOccurrences(content, variant);
-      if (count === 1) {
-        const start = content.indexOf(variant);
-        return {
-          start,
-          end: start + variant.length,
-          transformReplace: (replace: string) => {
-            let r = replace;
-            for (const t of transforms) {
-              r = r.replaceAll(t.interpreted, t.literal);
-            }
-            return r;
-          },
-        };
+    const match = tryVariant(variant, (replace: string) => {
+      let transformed = replace;
+      for (const t of transforms) {
+        transformed = transformed.replaceAll(t.interpreted, t.literal);
       }
+      return transformed;
+    });
+    if (match) {
+      return { match, ambiguousVariantCount };
     }
   }
 
-  return null;
+  return { match: null, ambiguousVariantCount };
+}
+
+export function tryEscapeNormalizedMatch(
+  content: string,
+  search: string,
+): {
+  start: number;
+  end: number;
+  transformReplace: (replace: string) => string;
+} | null {
+  return analyzeEscapeNormalizedMatch(content, search).match;
 }
 
 function countOccurrences(text: string, search: string): number {
@@ -442,6 +543,56 @@ function countOccurrences(text: string, search: string): number {
     pos += search.length;
   }
   return count;
+}
+
+function previewSearch(text: string): string {
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (compact.length <= 80) return compact;
+  return `${compact.slice(0, 77)}...`;
+}
+
+function describeBlockResult(
+  result: BlockApplyResult,
+): Record<string, unknown> {
+  if (result.status === "applied") {
+    return {
+      index: result.index,
+      status: result.status,
+      match_type: result.matchType,
+    };
+  }
+  return {
+    index: result.index,
+    status: result.status,
+    reason: result.reason,
+    exact_occurrences: result.exactOccurrences,
+  };
+}
+
+function formatFailedBlockMessage(
+  result: BlockApplyResult,
+  blocks: SearchReplaceBlock[],
+): string {
+  const block = blocks[result.index];
+  const preview = block ? previewSearch(block.search) : "";
+  if (result.status !== "failed") {
+    return `Block ${result.index}: applied`;
+  }
+
+  const reason =
+    result.reason === "empty_search"
+      ? "Search content was empty"
+      : result.reason === "ambiguous_exact"
+        ? `Ambiguous exact match (${result.exactOccurrences} occurrences found)`
+        : result.reason === "ambiguous_flexible"
+          ? "No exact match, and whitespace-normalized search matched multiple locations"
+          : result.reason === "ambiguous_escape"
+            ? "No exact match, and escape-normalized search matched multiple locations"
+            : "Search content not found (including whitespace/escape-normalized matching)";
+
+  return preview
+    ? `Block ${result.index}: ${reason} — search preview: ${preview}`
+    : `Block ${result.index}: ${reason}`;
 }
 
 export async function handleApplyDiff(
@@ -506,9 +657,12 @@ export async function handleApplyDiff(
             text: JSON.stringify({
               error: "No valid search/replace blocks found in diff",
               path: params.path,
+              hint:
+                malformedBlocks > 0
+                  ? "Some blocks were missing a >>>>>>> REPLACE marker"
+                  : "Ensure marker lines are on their own lines: <<<<<<< SEARCH / ======= DIVIDER ======= / >>>>>>> REPLACE",
               ...(malformedBlocks > 0 && {
                 malformed_blocks: malformedBlocks,
-                hint: "Some blocks were missing a >>>>>>> REPLACE marker",
               }),
             }),
           },
@@ -517,10 +671,11 @@ export async function handleApplyDiff(
     }
 
     // Apply blocks
-    const { result: newContent, failedBlocks } = applyBlocks(
-      originalContent,
-      blocks,
-    );
+    const {
+      result: newContent,
+      failedBlocks,
+      blockResults,
+    } = applyBlocks(originalContent, blocks);
 
     // Safety check: reject if the diff would introduce marker syntax into
     // the file. This prevents cascading corruption where a misparsed block
@@ -546,15 +701,12 @@ export async function handleApplyDiff(
 
     // If all blocks failed, return error without opening diff
     if (failedBlocks.length === blocks.length) {
-      const failedSearches = failedBlocks.map((i) => {
-        const block = blocks[i];
-        const occurrences = countOccurrences(originalContent, block.search);
-        if (occurrences === 0) {
-          return `Block ${i}: Search content not found`;
-        } else {
-          return `Block ${i}: Ambiguous match (${occurrences} occurrences found)`;
-        }
-      });
+      const failedDetails = blockResults.map((result) =>
+        describeBlockResult(result),
+      );
+      const failedSearches = blockResults.map((result) =>
+        formatFailedBlockMessage(result, blocks),
+      );
 
       return {
         content: [
@@ -563,6 +715,7 @@ export async function handleApplyDiff(
             text: JSON.stringify({
               error: "All search/replace blocks failed",
               failed_blocks: failedSearches,
+              failed_block_details: failedDetails,
               path: params.path,
             }),
           },
@@ -646,8 +799,25 @@ export async function handleApplyDiff(
         };
         if (failedBlocks.length > 0 || malformedBlocks > 0) {
           response.partial = true;
-          if (failedBlocks.length > 0) response.failed_blocks = failedBlocks;
+          if (failedBlocks.length > 0) {
+            response.failed_blocks = failedBlocks;
+            response.failed_block_details = blockResults
+              .filter((result) => result.status === "failed")
+              .map((result) => describeBlockResult(result));
+          }
           if (malformedBlocks > 0) response.malformed_blocks = malformedBlocks;
+        }
+        if (
+          blocks.length > 1 ||
+          blockResults.some(
+            (result) =>
+              result.status === "failed" ||
+              (result.status === "applied" && result.matchType !== "exact"),
+          )
+        ) {
+          response.block_results = blockResults.map((result) =>
+            describeBlockResult(result),
+          );
         }
         if (newDiagnostics) {
           response.new_diagnostics = newDiagnostics;
@@ -702,22 +872,38 @@ export async function handleApplyDiff(
       result.status === "accepted"
     ) {
       responseObj.partial = true;
-      if (failedBlocks.length > 0) responseObj.failed_blocks = failedBlocks;
+      if (failedBlocks.length > 0) {
+        responseObj.failed_blocks = failedBlocks;
+        responseObj.failed_block_details = blockResults
+          .filter((blockResult) => blockResult.status === "failed")
+          .map((blockResult) => describeBlockResult(blockResult));
+      }
       if (malformedBlocks > 0) responseObj.malformed_blocks = malformedBlocks;
+    }
+
+    if (
+      blocks.length > 1 ||
+      blockResults.some(
+        (blockResult) =>
+          blockResult.status === "failed" ||
+          (blockResult.status === "applied" &&
+            blockResult.matchType !== "exact"),
+      )
+    ) {
+      responseObj.block_results = blockResults.map((blockResult) =>
+        describeBlockResult(blockResult),
+      );
     }
 
     return {
       content: [{ type: "text", text: JSON.stringify(responseObj, null, 2) }],
     };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify({ error: message, path: params.path }),
-        },
-      ],
-    };
+    return (
+      handlePendingEditLockError(err, params.path) ??
+      errorResult(err instanceof Error ? err.message : String(err), {
+        path: params.path,
+      })
+    );
   }
 }

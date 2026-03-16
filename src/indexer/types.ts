@@ -15,7 +15,7 @@ export interface StartIndexMessage {
   /** Qdrant collection name, e.g. "al-{hash16}" */
   collectionName: string;
   qdrantUrl: string;
-  openAiApiKey: string;
+  embeddingBearerToken: string;
   /** Filesystem path for the hash cache JSON file */
   cachePath: string;
   /** If true, delete collection and re-index from scratch */
@@ -28,6 +28,12 @@ export interface CancelMessage {
   type: "cancel";
 }
 
+export interface EmbeddingAuthRefreshResponseMessage {
+  type: "embeddingAuthRefreshResponse";
+  requestId: string;
+  bearerToken: string;
+}
+
 export interface IncrementalUpdateMessage {
   type: "incrementalUpdate";
   /** New or changed file paths (absolute) */
@@ -37,7 +43,7 @@ export interface IncrementalUpdateMessage {
   workspaceRoot: string;
   collectionName: string;
   qdrantUrl: string;
-  openAiApiKey: string;
+  embeddingBearerToken: string;
   cachePath: string;
   /** Chunk granularity level */
   granularity: ChunkGranularity;
@@ -46,6 +52,7 @@ export interface IncrementalUpdateMessage {
 export type ExtensionToWorkerMessage =
   | StartIndexMessage
   | CancelMessage
+  | EmbeddingAuthRefreshResponseMessage
   | IncrementalUpdateMessage;
 
 // ============================================================
@@ -98,11 +105,17 @@ export interface ReadyMessage {
   type: "ready";
 }
 
+export interface EmbeddingAuthRefreshRequestMessage {
+  type: "embeddingAuthRefreshRequest";
+  requestId: string;
+}
+
 export type WorkerToExtensionMessage =
   | ProgressMessage
   | CompleteMessage
   | ErrorMessage
-  | ReadyMessage;
+  | ReadyMessage
+  | EmbeddingAuthRefreshRequestMessage;
 
 // ============================================================
 // Cache schema (stored as JSON on disk)

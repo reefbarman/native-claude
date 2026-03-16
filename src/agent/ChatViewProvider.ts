@@ -3,6 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { randomUUID } from "crypto";
 import { providerRegistry } from "./providers/index.js";
+import { getConfiguredBaseThresholdForModel } from "./modelCondenseThresholds.js";
 import type { AgentSessionManager } from "./AgentSessionManager.js";
 import type { AgentEvent } from "./types.js";
 import type { TodoItem } from "./todoTool.js";
@@ -410,7 +411,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private approvalManager: ApprovalManager | undefined;
   private approvalManagerListener: vscode.Disposable | undefined;
   private toolCallTracker: ToolCallTracker | undefined;
-  private mermaidPanel: vscode.WebviewPanel | undefined;
+  private specialBlockPanel: vscode.WebviewPanel | undefined;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -496,8 +497,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.pendingElicitations.clear();
 
     this.outputChannel.dispose();
-    this.mermaidPanel?.dispose();
-    this.mermaidPanel = undefined;
+    this.specialBlockPanel?.dispose();
+    this.specialBlockPanel = undefined;
     for (const w of this.fileWatchers) w.dispose();
     this.fileWatchers = [];
     this.approvalManagerListener?.dispose();
@@ -514,26 +515,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   setToolCallTracker(tracker: ToolCallTracker): void {
     this.toolCallTracker = tracker;
-    // Listen for cancel/complete actions on agent tool calls from the sidebar
-    tracker.on("agentCancel", (sessionId: string) => {
-      this.log(`[agent] agentCancel from sidebar, session=${sessionId}`);
-      if (this.sessionManager) {
-        const session = this.sessionManager.getSession(sessionId);
-        this.sessionManager.stopSession(sessionId);
-        this.toolCallTracker?.clearAgentCalls(sessionId);
-        this.postMessage({
-          type: "agentDone",
-          sessionId,
-          totalInputTokens: session?.totalInputTokens ?? 0,
-          totalOutputTokens: session?.totalOutputTokens ?? 0,
-          totalCacheReadTokens: session?.totalCacheReadTokens ?? 0,
-          totalCacheCreationTokens: session?.totalCacheCreationTokens ?? 0,
-        });
-        if (session?.background) {
-          this.sendBgSessionsUpdate();
-        }
-      }
-    });
   }
 
   /**
@@ -665,6 +646,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         // Reset session-level write approval when switching modes — "session"
         // approval was granted for the previous mode, not the new one.
         this.approvalManager?.resetSessionAgentWriteApproval(session.id);
+        this.sessionManager.queueModeSwitchResume(session.id, mode, {
+          reason,
+          followUp,
+        });
         this.sendInitialState();
         const suffix = followUp?.trim() ? ` | ${followUp.trim()}` : "";
         this.log(
@@ -885,12 +870,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async sendModelsUpdate(): Promise<void> {
     const allModels = providerRegistry.listAllModels();
     const authStatus = await providerRegistry.getAuthStatus();
+    const config = vscode.workspace.getConfiguration("agentlink");
     const models = allModels.map((m) => ({
       id: m.id,
       displayName: m.displayName,
       provider: m.provider,
       contextWindow: m.capabilities.contextWindow,
       authenticated: authStatus[m.provider] ?? false,
+      condenseThreshold: getConfiguredBaseThresholdForModel(config, m.id),
     }));
     this.postMessage({
       type: "agentModelsUpdate",
@@ -934,10 +921,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     };
 
     manager.onSessionsChanged = () => {
-      this.postMessage({
-        type: "agentSessionUpdate",
-        sessions: manager.getSessionInfos(),
-      });
+      // Session status can change outside the foreground event stream (for example
+      // when a tracked tool is force-cancelled/completed from the sidebar). Push a
+      // full foreground state refresh so the chat webview's streaming/session state
+      // stays aligned with the real session status, then refresh the sidebar strips.
+      this.sendInitialState();
       this.sendBgSessionsUpdate();
     };
   }
@@ -1156,7 +1144,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         );
 
         const mgr = this.sessionManager;
-        const config = mgr.getConfig();
 
         // For new sessions, create the session first so we can send stateUpdate
         // with the correct sessionId BEFORE streaming events start arriving.
@@ -1199,7 +1186,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               mode: fg.mode,
               model: fg.model,
               streaming: true,
-              condenseThreshold: config.autoCondenseThreshold,
+              condenseThreshold: getConfiguredBaseThresholdForModel(
+                vscode.workspace.getConfiguration("agentlink"),
+                fg.model,
+              ),
               agentWriteApproval:
                 this.approvalManager?.getAgentWriteApprovalState(fg.id),
             },
@@ -1255,7 +1245,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           });
           // Update state to show streaming
           const fg = this.sessionManager.getForegroundSession();
-          const config = this.sessionManager.getConfig();
           if (fg) {
             this.postMessage({
               type: "stateUpdate",
@@ -1264,7 +1253,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 mode: fg.mode,
                 model: fg.model,
                 streaming: true,
-                condenseThreshold: config.autoCondenseThreshold,
+                condenseThreshold: getConfiguredBaseThresholdForModel(
+                  vscode.workspace.getConfiguration("agentlink"),
+                  fg.model,
+                ),
                 agentWriteApproval:
                   this.approvalManager?.getAgentWriteApprovalState(fg.id),
               },
@@ -1336,6 +1328,39 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           .update("agentModel", model, vscode.ConfigurationTarget.Global);
         this.sendInitialState();
         this.log(`Model changed to: ${model}`);
+        break;
+      }
+
+      case "agentSetCondenseThreshold": {
+        const threshold = Number(msg.threshold);
+        if (!Number.isFinite(threshold)) break;
+        const config = vscode.workspace.getConfiguration("agentlink");
+        const currentModel =
+          this.sessionManager.getForegroundSession()?.model ??
+          this.sessionManager.getConfig().model;
+        const thresholds = {
+          ...(config.get("modelCondenseThresholds") as
+            | Record<string, number>
+            | undefined),
+          [currentModel]: Math.min(1, Math.max(0.1, threshold)),
+        };
+        await config.update(
+          "modelCondenseThresholds",
+          thresholds,
+          vscode.ConfigurationTarget.Global,
+        );
+        this.sessionManager.updateConfig({
+          autoCondenseThreshold: thresholds[currentModel],
+        });
+        const fg = this.sessionManager.getForegroundSession();
+        if (fg && fg.model === currentModel) {
+          fg.autoCondenseThreshold = thresholds[currentModel];
+          await this.sessionManager.maybeAutoCondenseForegroundSession();
+        }
+        this.sendInitialState();
+        this.log(
+          `Auto-condense threshold set to ${Math.round(thresholds[currentModel] * 100)}% for ${currentModel}`,
+        );
         break;
       }
 
@@ -1577,10 +1602,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       }
 
-      case "agentOpenMermaidPanel": {
+      case "agentOpenSpecialBlockPanel": {
+        const kind = msg.kind as "mermaid" | "vega" | "vega-lite";
         const source = msg.source as string;
         if (!source?.trim()) break;
-        this.openMermaidPanel(source);
+        if (!["mermaid", "vega", "vega-lite"].includes(kind)) break;
+        this.openSpecialBlockPanel(kind, source);
         break;
       }
 
@@ -1682,6 +1709,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const sessionId = msg.sessionId as string;
         if (!sessionId || !this.sessionManager) break;
         this.sessionManager.deletePersistedSession(sessionId);
+        this.approvalManager?.clearSession(sessionId);
         const sessions = this.sessionManager.listPersistedSessions();
         this.postMessage({ type: "agentSessionList", sessions });
         break;
@@ -1796,7 +1824,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
 
       case "agentCodexSignIn": {
-        // Trigger Codex sign-in from the webview (e.g. model picker "Sign in" row)
+        // Trigger unified OpenAI/Codex sign-in from the webview model picker.
         vscode.commands.executeCommand("agentlink.codexSignIn");
         break;
       }
@@ -1914,13 +1942,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           toolCallId: event.toolCallId,
           toolName: event.toolName,
         });
-        // Register with the sidebar's tool call tracker
-        this.toolCallTracker?.registerAgentCall(
-          event.toolCallId,
-          event.toolName,
-          "", // displayArgs populated by tool_input_delta
-          sessionId,
-        );
         // Keep bg strip in sync when a bg session starts a new tool
         if (isBackground) {
           this.sendBgSessionsUpdate();
@@ -1978,8 +1999,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           durationMs: event.durationMs,
           input: event.input,
         });
-        // Mark completed in the sidebar's tool call tracker
-        this.toolCallTracker?.completeAgentCall(event.toolCallId);
         // Emit user-visible annotation for follow-ups and user rejections
         try {
           const parsed = JSON.parse(resultText);
@@ -2808,7 +2827,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         fg?.status === "streaming" ||
         fg?.status === "tool_executing" ||
         fg?.status === "awaiting_approval",
-      condenseThreshold: config.autoCondenseThreshold,
+      condenseThreshold: getConfiguredBaseThresholdForModel(
+        vscode.workspace.getConfiguration("agentlink"),
+        fg?.model ?? config.model,
+      ),
       // Use the foreground session's ID so the write approval state reflects the
       // current session's trust level rather than a shared synthetic "agent" ID.
       agentWriteApproval: this.approvalManager?.getAgentWriteApprovalState(
@@ -2934,11 +2956,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 </html>`;
   }
 
-  private openMermaidPanel(source: string): void {
-    const existing = this.mermaidPanel;
+  private openSpecialBlockPanel(
+    kind: "mermaid" | "vega" | "vega-lite",
+    source: string,
+  ): void {
+    const existing = this.specialBlockPanel;
     if (existing) {
-      existing.webview.html = this.getMermaidPanelHtml(
+      existing.title = this.getSpecialBlockPanelTitle(kind);
+      existing.webview.html = this.getSpecialBlockPanelHtml(
         existing.webview,
+        kind,
         source,
       );
       existing.reveal(vscode.ViewColumn.Beside, false);
@@ -2946,29 +2973,49 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     const panel = vscode.window.createWebviewPanel(
-      "agentlinkMermaidPreview",
-      "Mermaid Diagram",
+      "agentlinkSpecialBlockPreview",
+      this.getSpecialBlockPanelTitle(kind),
       { viewColumn: vscode.ViewColumn.Beside, preserveFocus: false },
       {
         enableScripts: true,
         localResourceRoots: [
           vscode.Uri.joinPath(this.extensionUri, "node_modules", "mermaid"),
+          vscode.Uri.joinPath(this.extensionUri, "node_modules", "vega"),
+          vscode.Uri.joinPath(this.extensionUri, "node_modules", "vega-lite"),
+          vscode.Uri.joinPath(this.extensionUri, "node_modules", "vega-embed"),
         ],
       },
     );
 
-    this.mermaidPanel = panel;
+    this.specialBlockPanel = panel;
     panel.onDidDispose(() => {
-      if (this.mermaidPanel === panel) {
-        this.mermaidPanel = undefined;
+      if (this.specialBlockPanel === panel) {
+        this.specialBlockPanel = undefined;
       }
     });
-    panel.webview.html = this.getMermaidPanelHtml(panel.webview, source);
+    panel.webview.html = this.getSpecialBlockPanelHtml(
+      panel.webview,
+      kind,
+      source,
+    );
   }
 
-  private getMermaidPanelHtml(webview: vscode.Webview, source: string): string {
+  private getSpecialBlockPanelTitle(
+    kind: "mermaid" | "vega" | "vega-lite",
+  ): string {
+    if (kind === "mermaid") return "Mermaid Diagram";
+    if (kind === "vega-lite") return "Vega-Lite Chart";
+    return "Vega Chart";
+  }
+
+  private getSpecialBlockPanelHtml(
+    webview: vscode.Webview,
+    kind: "mermaid" | "vega" | "vega-lite",
+    source: string,
+  ): string {
     const nonce = randomUUID().replace(/-/g, "");
     const escapedSource = JSON.stringify(source);
+    const escapedKind = JSON.stringify(kind);
     const mermaidModuleUri = webview.asWebviewUri(
       vscode.Uri.joinPath(
         this.extensionUri,
@@ -2978,6 +3025,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         "mermaid.esm.min.mjs",
       ),
     );
+    const vegaEmbedModuleUri = webview.asWebviewUri(
+      vscode.Uri.joinPath(
+        this.extensionUri,
+        "node_modules",
+        "vega-embed",
+        "build",
+        "embed.js",
+      ),
+    );
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -2985,8 +3041,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy"
-    content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}' ${webview.cspSource} blob:; worker-src blob:; img-src ${webview.cspSource} data: blob:;">
-  <title>Mermaid Diagram</title>
+    content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}' ${webview.cspSource} 'unsafe-eval' blob:; worker-src blob:; img-src ${webview.cspSource} data: blob:; font-src ${webview.cspSource} data:;">
+  <title>${this.getSpecialBlockPanelTitle(kind)}</title>
   <style>
     :root { color-scheme: dark light; }
     body {
@@ -3002,8 +3058,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       padding: 12px;
       overflow: auto;
       min-height: 120px;
+      background: var(--vscode-editor-background);
     }
-    #diagram svg {
+    #diagram svg,
+    #diagram canvas {
       display: block;
       margin: 0 auto;
       max-width: 100%;
@@ -3016,41 +3074,56 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   </style>
 </head>
 <body>
-  <div id="diagram">Rendering diagram...</div>
+  <div id="diagram">Rendering preview...</div>
   <script nonce="${nonce}" type="module">
     import mermaid from "${mermaidModuleUri}";
+    import embed from "${vegaEmbedModuleUri}";
     const source = ${escapedSource};
+    const kind = ${escapedKind};
     const target = document.getElementById("diagram");
-    mermaid.initialize({
-      startOnLoad: false,
-      theme: "base",
-      securityLevel: "loose",
-      fontFamily: "var(--vscode-font-family)",
-      themeVariables: {
-        primaryColor: "#2a5e58",
-        primaryTextColor: "#e0e0e0",
-        primaryBorderColor: "#4ECDC4",
-        secondaryColor: "#1e3a36",
-        secondaryTextColor: "#e0e0e0",
-        secondaryBorderColor: "#3ba89f",
-        tertiaryColor: "#163330",
-        tertiaryTextColor: "#e0e0e0",
-        tertiaryBorderColor: "#2d7a72",
-        lineColor: "#4ECDC4",
-        textColor: "#e0e0e0"
-      }
-    });
+
+    const escapeHtml = (value) => value
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+
     try {
-      const id = "mermaid-panel-" + Date.now();
-      const { svg } = await mermaid.render(id, source);
-      target.innerHTML = svg;
+      if (kind === "mermaid") {
+        mermaid.initialize({
+          startOnLoad: false,
+          theme: "base",
+          securityLevel: "loose",
+          fontFamily: "var(--vscode-font-family)",
+          themeVariables: {
+            primaryColor: "#2a5e58",
+            primaryTextColor: "#e0e0e0",
+            primaryBorderColor: "#4EC9B0",
+            secondaryColor: "#1e3a36",
+            secondaryTextColor: "#e0e0e0",
+            secondaryBorderColor: "#3ba89f",
+            tertiaryColor: "#163330",
+            tertiaryTextColor: "#e0e0e0",
+            tertiaryBorderColor: "#2d7a72",
+            lineColor: "#4EC9B0",
+            textColor: "#e0e0e0"
+          }
+        });
+        const id = "special-block-panel-" + Date.now();
+        const { svg } = await mermaid.render(id, source);
+        target.innerHTML = svg;
+      } else {
+        const spec = JSON.parse(source);
+        target.innerHTML = "";
+        await embed(target, spec, {
+          actions: false,
+          renderer: "svg",
+          mode: kind,
+          theme: "dark"
+        });
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      const escaped = message
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;");
-      target.innerHTML = '<div class="error">Failed to render diagram: ' + escaped + "</div>";
+      target.innerHTML = '<div class="error">Failed to render preview: ' + escapeHtml(message) + "</div>";
     }
   </script>
 </body>

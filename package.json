@@ -2,7 +2,7 @@
   "name": "agentlink",
   "displayName": "AgentLink",
   "description": "MCP server that provides AI agents with native VS Code tools — diff-based file editing, integrated terminal, diagnostics",
-  "version": "1.4.17",
+  "version": "1.5.0",
   "publisher": "agentlink",
   "repository": {
     "type": "git",
@@ -139,11 +139,11 @@
       },
       {
         "command": "agentlink.codexSignIn",
-        "title": "AgentLink: Sign In to OpenAI Codex"
+        "title": "AgentLink: Sign In to OpenAI/Codex"
       },
       {
         "command": "agentlink.codexSignOut",
-        "title": "AgentLink: Sign Out of OpenAI Codex"
+        "title": "AgentLink: Manage OpenAI/Codex Authentication"
       }
     ],
     "menus": {
@@ -246,7 +246,7 @@
         "agentlink.semanticSearchEnabled": {
           "type": "boolean",
           "default": false,
-          "description": "Enable semantic codebase search via Qdrant vector index. Requires Qdrant running and an OpenAI API key."
+          "description": "Enable semantic codebase search via Qdrant vector index. Requires Qdrant running and an OpenAI API key for embeddings."
         },
         "agentlink.qdrantUrl": {
           "type": "string",
@@ -287,6 +287,10 @@
             "**/target/**",
             "**/.venv/**",
             "**/vendor/**",
+            "**/.claude/**",
+            "**/.codex/**",
+            "**/.agentlink/**",
+            "**/.agents/**",
             "**/*.min.js",
             "**/*.map"
           ],
@@ -343,7 +347,18 @@
           "default": 0.9,
           "minimum": 0.1,
           "maximum": 1,
-          "description": "Fraction of the context window (0.1–1.0) at which auto-condensing triggers. Default is 0.9 (90%)."
+          "deprecationMessage": "Use agentlink.modelCondenseThresholds instead.",
+          "description": "Legacy global auto-condense threshold used for migration. New per-model thresholds are stored in agentlink.modelCondenseThresholds."
+        },
+        "agentlink.modelCondenseThresholds": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "number",
+            "minimum": 0.1,
+            "maximum": 1
+          },
+          "description": "Per-model auto-condense thresholds keyed by model ID. Anthropic Sonnet/Opus default to 0.6; other models default to 0.9 when no override is stored."
         },
         "agentlink.writeRules": {
           "type": "array",
@@ -391,6 +406,9 @@
     "picomatch": "^4.0.3",
     "preact": "^10.28.4",
     "simple-git": "^3.32.3",
+    "vega": "^6.2.0",
+    "vega-embed": "^7.1.0",
+    "vega-lite": "^6.4.2",
     "web-tree-sitter": "^0.26.6",
     "zod": "^4.3.6",
     "zod-to-json-schema": "^3.25.1"
