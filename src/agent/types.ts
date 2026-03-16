@@ -19,6 +19,7 @@ export type AgentMessage = MessageParam & {
   preservedContext?: {
     toolNames: string[];
     mcpServerNames?: string[];
+    activeSkills?: string[];
   };
   runtimeError?: {
     message: string;

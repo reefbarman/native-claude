@@ -1,8 +1,9 @@
 import { randomUUID } from "crypto";
 import type { ContentBlock, TextBlock } from "./providers/types.js";
 import type { SessionStatus, AgentConfig, AgentMessage } from "./types.js";
-import { buildSystemPrompt } from "./systemPrompt.js";
+import { buildPromptArtifacts } from "./systemPrompt.js";
 import type { AgentMode } from "./modes.js";
+import type { SkillEntry } from "./skillLoader.js";
 import { BUILT_IN_MODES } from "./modes.js";
 import { getEffectiveHistory, injectSyntheticToolResults } from "./condense.js";
 
@@ -37,6 +38,10 @@ export class AgentSession {
   private messages: AgentMessage[] = [];
   /** Files read during this session (for folded file context on condense) */
   readonly filesRead = new Set<string>();
+  /** Skills advertised in the current system prompt, keyed by path for allowlist validation. */
+  private advertisedSkills = new Map<string, SkillEntry>();
+  /** Skill names explicitly loaded during this session and kept alive across condense. */
+  readonly loadedSkills = new Set<string>();
   /** Total input tokens from the most recent API response: uncached + cache_read + cache_creation.
    *  This represents actual context window usage (used for condense threshold check & context bar). */
   lastInputTokens = 0;
@@ -156,7 +161,7 @@ export class AgentSession {
     activeFilePath?: string;
     providerId?: string;
   }): Promise<AgentSession> {
-    const systemPrompt = await buildSystemPrompt(opts.mode, opts.cwd, {
+    const artifacts = await buildPromptArtifacts(opts.mode, opts.cwd, {
       devMode: opts.devMode,
       activeFilePath: opts.activeFilePath,
       providerId: opts.providerId,
@@ -168,16 +173,18 @@ export class AgentSession {
       opts.agentMode ??
       BUILT_IN_MODES.find((m) => m.slug === opts.mode) ??
       BUILT_IN_MODES[0];
-    return new AgentSession({
+    const session = new AgentSession({
       mode: opts.mode,
       agentMode,
       config: opts.config,
-      systemPrompt,
+      systemPrompt: artifacts.systemPrompt,
       cwd: opts.cwd,
       background: opts.background,
       activeFilePath: opts.activeFilePath,
       providerId: opts.providerId,
     });
+    session.setAdvertisedSkills(artifacts.skills);
+    return session;
   }
 
   /**
@@ -185,12 +192,14 @@ export class AgentSession {
    * Preserves the activeFilePath that was set at session creation.
    */
   async rebuildSystemPrompt(opts?: { devMode?: boolean }): Promise<void> {
-    this.systemPrompt = await buildSystemPrompt(this.mode, this.cwd, {
+    const artifacts = await buildPromptArtifacts(this.mode, this.cwd, {
       devMode: opts?.devMode,
       activeFilePath: this.activeFilePath,
       providerId: this.providerId,
       model: this.model,
     });
+    this.systemPrompt = artifacts.systemPrompt;
+    this.setAdvertisedSkills(artifacts.skills);
   }
 
   /**
@@ -200,7 +209,7 @@ export class AgentSession {
     mode: string,
     opts?: { agentMode?: AgentMode; devMode?: boolean },
   ): Promise<void> {
-    const systemPrompt = await buildSystemPrompt(mode, this.cwd, {
+    const artifacts = await buildPromptArtifacts(mode, this.cwd, {
       devMode: opts?.devMode,
       providerId: this.providerId,
       model: this.model,
@@ -212,7 +221,8 @@ export class AgentSession {
 
     this.mode = mode;
     this.agentMode = agentMode;
-    this.systemPrompt = systemPrompt;
+    this.systemPrompt = artifacts.systemPrompt;
+    this.setAdvertisedSkills(artifacts.skills);
     this.lastActiveAt = Date.now();
   }
 
@@ -293,6 +303,7 @@ export class AgentSession {
     totalCacheCreationTokens?: number;
     lastInputTokens?: number;
     lastCacheReadTokens?: number;
+    loadedSkills?: string[];
     messages: AgentMessage[];
   }): void {
     this.id = data.id;
@@ -306,11 +317,33 @@ export class AgentSession {
     this.lastInputTokens = data.lastInputTokens ?? 0;
     this.lastCacheReadTokens = data.lastCacheReadTokens ?? 0;
     this.messages = data.messages;
+    this.loadedSkills.clear();
+    for (const skill of data.loadedSkills ?? []) {
+      if (skill.trim()) this.loadedSkills.add(skill.trim());
+    }
   }
 
   /** Record that a file was read during this session */
   trackFileRead(filePath: string): void {
     this.filesRead.add(filePath);
+  }
+
+  setAdvertisedSkills(skills: SkillEntry[]): void {
+    this.advertisedSkills = new Map(
+      skills.map((skill) => [skill.skillPath, skill]),
+    );
+  }
+
+  getAdvertisedSkills(): SkillEntry[] {
+    return Array.from(this.advertisedSkills.values());
+  }
+
+  getLoadedSkills(): string[] {
+    return [...this.loadedSkills];
+  }
+
+  trackLoadedSkill(skillName: string): void {
+    if (skillName.trim()) this.loadedSkills.add(skillName.trim());
   }
 
   addUsage(

@@ -4,6 +4,7 @@ import type { ChatMessage, ContentBlock } from "../types";
 import { StreamingText } from "./StreamingText";
 import { ThinkingBlock } from "./ThinkingBlock";
 import { ToolCallBlock } from "./ToolCallBlock";
+import { SkillLoadBlock } from "./SkillLoadBlock";
 import { ErrorBlock } from "./ErrorBlock";
 import { ApiRequestBlock } from "./ApiRequestBlock";
 import { BgAgentBlock } from "./BgAgentBlock";
@@ -21,7 +22,7 @@ export function getStreamingActivity(blocks: ContentBlock[]): string {
   for (let i = blocks.length - 1; i >= 0; i--) {
     const b = blocks[i];
     if (b.type === "text") return "Writing…";
-    if (b.type === "tool_call") {
+    if (b.type === "tool_call" || b.type === "skill_load") {
       if (!b.complete) return "Running tool…";
       // Last block is a completed tool → agent is sending results back to the API
       return "Waiting for response…";
@@ -146,6 +147,8 @@ export function MessageBubble({
                   onOpenFile={onOpenFile}
                 />
               );
+            case "skill_load":
+              return <SkillLoadBlock key={block.id} block={block} />;
             case "text": {
               const isActiveStream = streaming && i === lastIdx;
               return (

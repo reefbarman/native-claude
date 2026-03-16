@@ -181,6 +181,90 @@ describe("webview App reducer background agent launch blocks", () => {
     });
   });
 
+  it("converts load_skill tool calls into dedicated skill_load blocks", () => {
+    const toolCallId = "skill-tool-1";
+    const skillPath = "/workspace/.claude/skills/push-to-repo/SKILL.md";
+    const content = "# Push to repo\n\nUse this skill to commit and tag.";
+
+    let state = reducer(initialState, {
+      type: "ADD_USER_MESSAGE",
+      text: "load the push skill",
+    });
+
+    state = reducer(state, {
+      type: "TOOL_START",
+      toolCallId,
+      toolName: "load_skill",
+    });
+
+    state = reducer(state, {
+      type: "TOOL_COMPLETE",
+      toolCallId,
+      toolName: "load_skill",
+      result: JSON.stringify({
+        skill_name: "push-to-repo",
+        path: skillPath,
+        content,
+      }),
+      durationMs: 7,
+      input: { path: skillPath },
+    });
+
+    const assistant = state.messages[state.messages.length - 1];
+    expect(assistant?.role).toBe("assistant");
+
+    const skillBlock = assistant?.blocks.find(
+      (b) => b.type === "skill_load" && b.id === toolCallId,
+    );
+    expect(skillBlock).toBeDefined();
+    expect(skillBlock).toMatchObject({
+      type: "skill_load",
+      id: toolCallId,
+      inputJson: JSON.stringify({ path: skillPath }),
+      result: JSON.stringify({
+        skill_name: "push-to-repo",
+        path: skillPath,
+        content,
+      }),
+      complete: true,
+      durationMs: 7,
+      skillName: "push-to-repo",
+      path: skillPath,
+      content,
+    });
+  });
+
+  it("marks incomplete skill_load blocks complete when DONE is dispatched", () => {
+    const toolCallId = "skill-tool-stop";
+
+    let state = reducer(initialState, {
+      type: "ADD_USER_MESSAGE",
+      text: "load the push skill",
+    });
+
+    state = reducer(state, {
+      type: "TOOL_START",
+      toolCallId,
+      toolName: "load_skill",
+    });
+
+    state = reducer(state, { type: "DONE" });
+
+    const assistant = state.messages[state.messages.length - 1];
+    expect(assistant?.role).toBe("assistant");
+
+    const skillBlock = assistant?.blocks.find(
+      (b) => b.type === "skill_load" && b.id === toolCallId,
+    );
+    expect(skillBlock).toBeDefined();
+    expect(skillBlock).toMatchObject({
+      type: "skill_load",
+      id: toolCallId,
+      complete: true,
+      result: '{"status":"stopped"}',
+    });
+  });
+
   it("retains queued images and documents in messageQueue state", () => {
     const images = [
       { name: "diagram.png", mimeType: "image/png", base64: "img-base64" },
@@ -264,6 +348,62 @@ describe("webview App reducer background agent launch blocks", () => {
       {
         type: "text",
         text: '## Resume Anchor (deterministic)\n- Continue from this task: "Investigate condense"## Conversation Summary\n\nSummary body',
+      },
+    ]);
+  });
+
+  it("restores persisted load_skill tool calls as skill_load blocks", async () => {
+    const { agentMessagesToChatMessages } = await import("./App");
+
+    const skillPath = "/workspace/.claude/skills/push-to-repo/SKILL.md";
+    const content = "# Push to repo\n\nUse this skill to commit and tag.";
+
+    const restored = agentMessagesToChatMessages([
+      { role: "user", content: "load the push skill" },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "skill-tool-restore",
+            name: "load_skill",
+            input: { path: skillPath },
+          },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "skill-tool-restore",
+            content: JSON.stringify({
+              skill_name: "push-to-repo",
+              path: skillPath,
+              content,
+            }),
+          },
+        ],
+      },
+    ] as unknown[]);
+
+    expect(restored).toHaveLength(2);
+    expect(restored[0]?.role).toBe("user");
+    expect(restored[1]?.role).toBe("assistant");
+    expect(restored[1]?.blocks).toEqual([
+      {
+        type: "skill_load",
+        id: "skill-tool-restore",
+        inputJson: JSON.stringify({ path: skillPath }),
+        result: JSON.stringify({
+          skill_name: "push-to-repo",
+          path: skillPath,
+          content,
+        }),
+        complete: true,
+        skillName: "push-to-repo",
+        path: skillPath,
+        content,
       },
     ]);
   });

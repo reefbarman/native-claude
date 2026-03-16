@@ -402,6 +402,17 @@ export type ContentBlock =
       durationMs?: number;
     }
   | {
+      type: "skill_load";
+      id: string;
+      inputJson: string;
+      result: string;
+      complete: boolean;
+      skillName?: string;
+      path?: string;
+      content?: string;
+      durationMs?: number;
+    }
+  | {
       type: "bg_agent";
       /** The background session ID */
       sessionId: string;

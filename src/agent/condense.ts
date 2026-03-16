@@ -459,6 +459,7 @@ export interface SummarizeOptions {
   preservedContext?: {
     toolNames: string[];
     mcpServerNames?: string[];
+    activeSkills?: string[];
   };
 }
 
@@ -552,6 +553,7 @@ export function renderDeterministicSections(options: {
   preservedContext?: {
     toolNames: string[];
     mcpServerNames?: string[];
+    activeSkills?: string[];
   };
 }): string {
   const userLines =
@@ -570,6 +572,11 @@ export function renderDeterministicSections(options: {
 
   const serverLines = options.preservedContext?.mcpServerNames?.length
     ? options.preservedContext.mcpServerNames
+        .map((name) => `- ${name}`)
+        .join("\n")
+    : "- None";
+  const skillLines = options.preservedContext?.activeSkills?.length
+    ? options.preservedContext.activeSkills
         .map((name) => `- ${name}`)
         .join("\n")
     : "- None";
@@ -592,6 +599,9 @@ export function renderDeterministicSections(options: {
     "",
     "### MCP servers with exposed tools",
     serverLines,
+    "",
+    "### Active loaded skills",
+    skillLines,
     "</system-reminder>",
   ].join("\n");
 }

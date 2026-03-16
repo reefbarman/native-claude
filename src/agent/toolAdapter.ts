@@ -28,6 +28,7 @@ import {
 
 // --- Handler imports ---
 import { handleReadFile } from "../tools/readFile.js";
+import { handleLoadSkill } from "../tools/loadSkill.js";
 import { handleListFiles } from "../tools/listFiles.js";
 import { handleSearchFiles } from "../tools/searchFiles.js";
 import { handleWriteFile } from "../tools/writeFile.js";
@@ -62,6 +63,7 @@ import { handleDeleteFeedback } from "../tools/deleteFeedback.js";
 
 export const READ_ONLY_TOOLS = new Set([
   "read_file",
+  "load_skill",
   "list_files",
   "search_files",
   "codebase_search",
@@ -89,7 +91,7 @@ export const READ_ONLY_TOOLS = new Set([
 
 // --- Tools excluded from the agent (MCP-only or not applicable) ---
 
-const EXCLUDED_TOOLS = new Set(["handshake"]);
+const EXCLUDED_TOOLS = new Set(["handshake", "load_skill"]);
 const DEV_FEEDBACK_TOOLS = new Set([
   "send_feedback",
   "get_feedback",
@@ -112,6 +114,7 @@ function zodSchemaToJsonSchema(
 
 const TOOL_SCHEMAS: Record<string, Record<string, z.ZodTypeAny>> = {
   read_file: schemas.readFileSchema,
+  load_skill: schemas.loadSkillSchema,
   list_files: schemas.listFilesSchema,
   search_files: schemas.searchFilesSchema,
   get_diagnostics: schemas.getDiagnosticsSchema,
@@ -499,8 +502,20 @@ export function getAgentTools(
   // Background agents are excluded from switch_mode and spawn tools to prevent
   // inadvertent foreground mode changes and nested spawning.
   const metaTools = profileAllowlist ? [] : MCP_META_TOOLS;
+  const hiddenAgentTools = profileAllowlist
+    ? []
+    : [
+        {
+          name: "load_skill",
+          description:
+            TOOL_REGISTRY.load_skill?.description ??
+            "Load the full contents of an advertised skill file.",
+          input_schema: zodSchemaToJsonSchema(schemas.loadSkillSchema),
+        },
+      ];
   return [
     ...nativeTools,
+    ...hiddenAgentTools,
     ...allowedMcpTools,
     ...metaTools,
     ...(profileAllowlist ? [] : [ASK_USER_TOOL]),
@@ -537,6 +552,10 @@ export interface ToolDispatchContext {
   ) => Promise<QuestionResponse>;
   /** Called whenever the agent reads a file — used to track files for folded context on condense */
   onFileRead?: (filePath: string) => void;
+  /** Returns the set of skills explicitly advertised to the current session. */
+  getAdvertisedSkills?: () => Array<{ name: string; skillPath: string }>;
+  /** Called whenever the agent loads a skill so the session can preserve it across condense. */
+  onSkillLoad?: (skillName: string) => void;
   /** Spawn a background agent session. Returns routing metadata and new session ID. */
   onSpawnBackground?: (
     request: SpawnBackgroundRequest,
@@ -714,6 +733,25 @@ export async function dispatchToolCall(
         ctx.onFileRead(params.path);
       }
       return handleReadFile(params, approvalManager, approvalPanel, sessionId);
+    case "load_skill": {
+      const result = await handleLoadSkill(
+        params,
+        approvalManager,
+        approvalPanel,
+        sessionId,
+        ctx.getAdvertisedSkills?.() ?? [],
+      );
+      try {
+        const text = result.content.find((c) => c.type === "text")?.text;
+        if (text && ctx.onSkillLoad) {
+          const parsed = JSON.parse(text) as { skill_name?: string };
+          if (parsed.skill_name) ctx.onSkillLoad(parsed.skill_name);
+        }
+      } catch {
+        // ignore malformed/non-JSON results
+      }
+      return result;
+    }
     case "list_files":
       return handleListFiles(params, approvalManager, approvalPanel, sessionId);
     case "search_files":

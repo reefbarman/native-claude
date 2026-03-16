@@ -5,6 +5,11 @@ import { exec } from "child_process";
 import { loadAllInstructions, loadModeRules } from "./configLoader.js";
 import { loadSkills, type SkillEntry } from "./skillLoader.js";
 
+export interface PromptArtifacts {
+  systemPrompt: string;
+  skills: SkillEntry[];
+}
+
 /**
  * Base system prompt — shared across all modes.
  * Defines identity, general behavior, and communication style.
@@ -338,7 +343,7 @@ You are in **Review mode** — your primary role is to perform critical technica
 
 /**
  * Build the skills XML section injected into the system prompt.
- * The model uses this to decide whether to self-activate a skill by calling read_file.
+ * The model uses this to decide whether to self-activate a skill by calling load_skill.
  */
 function getSkillsSection(skills: SkillEntry[]): string {
   if (skills.length === 0) return "";
@@ -354,7 +359,7 @@ function getSkillsSection(skills: SkillEntry[]): string {
 
 ## Skills
 
-You have access to the following skills. Before each response, check if any skill matches the user's request. If one matches, call \`read_file\` with the skill's \`path\` to load its full instructions, then follow them. If no skill matches, respond normally — skills are optional enhancements, not required steps.
+You have access to the following skills. Before each response, check if any skill matches the user's request. If one matches, call \`load_skill\` with the skill's \`path\` to load its full instructions, then follow them. If no skill matches, respond normally — skills are optional enhancements, not required steps.
 
 <skills>
 ${items}
@@ -471,7 +476,7 @@ You are running as a background review agent. Complete your review efficiently �
  * When providerId is set, includes provider-specific behavioral tuning.
  * When lightweight is true, builds a minimal prompt (used for background reviews).
  */
-export async function buildSystemPrompt(
+export async function buildPromptArtifacts(
   mode: string,
   cwd: string,
   options?: {
@@ -482,10 +487,10 @@ export async function buildSystemPrompt(
     isBackground?: boolean;
     lightweight?: boolean;
   },
-): Promise<string> {
+): Promise<PromptArtifacts> {
   // Lightweight path: minimal prompt for background review agents
   if (options?.lightweight) {
-    return buildLightweightPrompt(mode, cwd);
+    return { systemPrompt: buildLightweightPrompt(mode, cwd), skills: [] };
   }
 
   const base = getBasePrompt(cwd);
@@ -522,9 +527,29 @@ export async function buildSystemPrompt(
       : `\n\n## Background Agent\n\nYou are running as a background agent. Complete your task as efficiently as possible — be thorough but concise. Avoid unnecessary exploration or tangents.\n\n- When you use \`ask_user\`, your question is routed to the foreground agent (not the user directly). The foreground agent will answer autonomously if it can, or forward to the user if necessary. Phrase questions so they make sense to another AI agent with full context of the codebase.\n- You have no time or token limits — but the foreground agent can kill you if you appear stuck. Work steadily toward completion.\n- Structure your final output clearly so the foreground agent can easily summarise your findings for the user.`
     : "";
 
-  return `${base}
+  return {
+    systemPrompt: `${base}
 ${modePrompt}
 ${providerPrompt}
 ${systemInfo}${plansSection}
-${devFeedback}${customSection}${rulesSection}${skillsSection}${backgroundSection}`.trimEnd();
+${devFeedback}${customSection}${rulesSection}${skillsSection}${backgroundSection}`.trimEnd(),
+    skills,
+  };
+}
+
+export async function buildSystemPrompt(
+  mode: string,
+  cwd: string,
+  options?: {
+    devMode?: boolean;
+    activeFilePath?: string;
+    providerId?: string;
+    model?: string;
+    isBackground?: boolean;
+    /** When lightweight is true, builds a minimal prompt (used for background reviews). */
+    lightweight?: boolean;
+  },
+): Promise<string> {
+  const artifacts = await buildPromptArtifacts(mode, cwd, options);
+  return artifacts.systemPrompt;
 }

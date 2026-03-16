@@ -2,14 +2,23 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { ContentBlock } from "./providers/types.js";
 import { AgentSession } from "./AgentSession.js";
 import type { AgentConfig } from "./types.js";
-import { buildSystemPrompt } from "./systemPrompt.js";
+import { buildSystemPrompt, buildPromptArtifacts } from "./systemPrompt.js";
 
-// Mock buildSystemPrompt so create() doesn't hit the filesystem
-vi.mock("./systemPrompt.js", () => ({
-  buildSystemPrompt: vi.fn().mockResolvedValue("mock system prompt"),
-}));
+// Mock prompt builders so create() doesn't hit the filesystem
+vi.mock("./systemPrompt.js", () => {
+  const buildSystemPromptMock = vi.fn().mockResolvedValue("mock system prompt");
+  const buildPromptArtifactsMock = vi.fn().mockResolvedValue({
+    systemPrompt: "mock system prompt",
+    skills: [],
+  });
+  return {
+    buildSystemPrompt: buildSystemPromptMock,
+    buildPromptArtifacts: buildPromptArtifactsMock,
+  };
+});
 
 const mockedBuildSystemPrompt = vi.mocked(buildSystemPrompt);
+const mockedBuildPromptArtifacts = vi.mocked(buildPromptArtifacts);
 
 const testConfig: AgentConfig = {
   model: "claude-sonnet-4-6",
@@ -34,6 +43,10 @@ async function makeSession(
 describe("AgentSession", () => {
   beforeEach(() => {
     mockedBuildSystemPrompt.mockResolvedValue("mock system prompt");
+    mockedBuildPromptArtifacts.mockResolvedValue({
+      systemPrompt: "mock system prompt",
+      skills: [],
+    });
   });
 
   describe("creation", () => {
@@ -93,9 +106,9 @@ describe("AgentSession", () => {
       expect(session.providerId).toBeUndefined();
     });
 
-    it("passes providerId to buildSystemPrompt on create", async () => {
+    it("passes providerId to buildPromptArtifacts on create", async () => {
       await makeSession({ providerId: "codex" });
-      expect(mockedBuildSystemPrompt).toHaveBeenCalledWith(
+      expect(mockedBuildPromptArtifacts).toHaveBeenCalledWith(
         "code",
         "/test",
         expect.objectContaining({ providerId: "codex" }),
@@ -350,7 +363,10 @@ describe("AgentSession", () => {
       session.addUserMessage("keep this context");
       const priorMessageCount = session.messageCount;
 
-      mockedBuildSystemPrompt.mockResolvedValueOnce("mock ask prompt");
+      mockedBuildPromptArtifacts.mockResolvedValueOnce({
+        systemPrompt: "mock ask prompt",
+        skills: [],
+      });
       await session.setMode("ask");
 
       expect(session.mode).toBe("ask");
@@ -363,12 +379,15 @@ describe("AgentSession", () => {
       });
     });
 
-    it("setMode passes stored providerId to buildSystemPrompt", async () => {
+    it("setMode passes stored providerId to buildPromptArtifacts", async () => {
       const session = await makeSession({ providerId: "codex" });
-      mockedBuildSystemPrompt.mockClear();
-      mockedBuildSystemPrompt.mockResolvedValueOnce("mock ask prompt");
+      mockedBuildPromptArtifacts.mockClear();
+      mockedBuildPromptArtifacts.mockResolvedValueOnce({
+        systemPrompt: "mock ask prompt",
+        skills: [],
+      });
       await session.setMode("ask");
-      expect(mockedBuildSystemPrompt).toHaveBeenCalledWith(
+      expect(mockedBuildPromptArtifacts).toHaveBeenCalledWith(
         "ask",
         "/test",
         expect.objectContaining({ providerId: "codex" }),
@@ -377,12 +396,15 @@ describe("AgentSession", () => {
   });
 
   describe("rebuildSystemPrompt", () => {
-    it("passes stored providerId to buildSystemPrompt", async () => {
+    it("passes stored providerId to buildPromptArtifacts", async () => {
       const session = await makeSession({ providerId: "codex" });
-      mockedBuildSystemPrompt.mockClear();
-      mockedBuildSystemPrompt.mockResolvedValueOnce("rebuilt prompt");
+      mockedBuildPromptArtifacts.mockClear();
+      mockedBuildPromptArtifacts.mockResolvedValueOnce({
+        systemPrompt: "rebuilt prompt",
+        skills: [],
+      });
       await session.rebuildSystemPrompt();
-      expect(mockedBuildSystemPrompt).toHaveBeenCalledWith(
+      expect(mockedBuildPromptArtifacts).toHaveBeenCalledWith(
         "code",
         "/test",
         expect.objectContaining({ providerId: "codex" }),

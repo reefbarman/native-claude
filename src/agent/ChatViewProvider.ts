@@ -1670,6 +1670,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             inputJson?: string;
             result?: string;
             durationMs?: number;
+            skillName?: string;
+            path?: string;
+            content?: string;
           }>;
         }>;
         this.exportTranscript(messages);
@@ -2383,6 +2386,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         inputJson?: string;
         result?: string;
         durationMs?: number;
+        skillName?: string;
+        path?: string;
+        content?: string;
       }>;
     }>,
   ): Promise<void> {
@@ -2451,6 +2457,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               lines.push(`\`\`\``);
             }
             if (block.result) {
+              lines.push(``);
+              lines.push(`<details><summary>Result</summary>`);
+              lines.push(``);
+              lines.push(`\`\`\``);
+              lines.push(block.result);
+              lines.push(`\`\`\``);
+              lines.push(``);
+              lines.push(`</details>`);
+            }
+            lines.push(``);
+            break;
+          }
+
+          case "skill_load": {
+            const duration = block.durationMs ? ` (${block.durationMs}ms)` : "";
+            lines.push(`**Skill load**${duration}`);
+            if (block.skillName) lines.push(`Skill: ${block.skillName}`);
+            if (block.path) lines.push(`Path: ${block.path}`);
+            if (block.content) {
+              lines.push(``);
+              lines.push(`<details><summary>Content</summary>`);
+              lines.push(``);
+              lines.push(`\`\`\``);
+              lines.push(block.content);
+              lines.push(`\`\`\``);
+              lines.push(``);
+              lines.push(`</details>`);
+            } else if (block.result) {
               lines.push(``);
               lines.push(`<details><summary>Result</summary>`);
               lines.push(``);

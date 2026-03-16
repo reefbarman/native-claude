@@ -34,6 +34,7 @@ interface MetadataFile {
   totalCacheCreationTokens?: number;
   lastInputTokens?: number;
   lastCacheReadTokens?: number;
+  loadedSkills?: string[];
 }
 
 const SCHEMA_VERSION = 1;
@@ -110,6 +111,7 @@ export class SessionStore {
     totalCacheCreationTokens: number;
     lastInputTokens: number;
     lastCacheReadTokens: number;
+    getLoadedSkills?(): string[];
     getAllMessages(): AgentMessage[];
   }): void {
     const sessionDir = path.join(this.historyDir, session.id);
@@ -137,6 +139,7 @@ export class SessionStore {
       totalCacheCreationTokens: session.totalCacheCreationTokens,
       lastInputTokens: session.lastInputTokens,
       lastCacheReadTokens: session.lastCacheReadTokens,
+      loadedSkills: session.getLoadedSkills?.() ?? [],
     };
     fs.writeFileSync(
       path.join(sessionDir, "metadata.json"),

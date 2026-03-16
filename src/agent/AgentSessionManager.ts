@@ -575,6 +575,7 @@ export class AgentSessionManager {
   private buildPreservedContext(session: AgentSession): {
     toolNames: string[];
     mcpServerNames: string[];
+    activeSkills: string[];
   } {
     const mcpToolDefs = this.toolCtx?.mcpHub?.getToolDefs() ?? [];
     const rawTools = this.toolCtx
@@ -592,6 +593,7 @@ export class AgentSessionManager {
             .filter((name) => name.length > 0),
         ),
       ],
+      activeSkills: [...session.loadedSkills],
     };
   }
 
@@ -810,8 +812,10 @@ export class AgentSessionManager {
       lastInputTokens: metadata?.lastInputTokens ?? 0,
       // Use 0 for resumed sessions so cache-aware threshold isn't biased by stale prior runs.
       lastCacheReadTokens: 0,
+      loadedSkills: metadata?.loadedSkills ?? [],
       messages,
     });
+    await session.rebuildSystemPrompt({ devMode: this.devMode });
 
     this.sessions.set(sessionId, session);
     this.foregroundId = sessionId;

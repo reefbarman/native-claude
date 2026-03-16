@@ -44,6 +44,28 @@ import type { WebviewModelInfo } from "./types";
 
 const DEFAULT_MAX_TOKENS = 200_000;
 
+function parseLoadSkillResult(result: string): {
+  skillName?: string;
+  path?: string;
+  content?: string;
+} {
+  try {
+    const parsed = JSON.parse(result) as {
+      skill_name?: unknown;
+      path?: unknown;
+      content?: unknown;
+    };
+    return {
+      skillName:
+        typeof parsed.skill_name === "string" ? parsed.skill_name : undefined,
+      path: typeof parsed.path === "string" ? parsed.path : undefined,
+      content: typeof parsed.content === "string" ? parsed.content : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
 interface VsCodeApi {
   postMessage(message: unknown): void;
   getState(): unknown;
@@ -299,14 +321,30 @@ export function agentMessagesToChatMessages(raw: unknown[]): ChatMessage[] {
           });
         } else if (block.type === "tool_use") {
           const toolId = block.id ?? crypto.randomUUID();
-          blocks.push({
-            type: "tool_call",
-            id: toolId,
-            name: block.name ?? "",
-            inputJson: JSON.stringify(block.input ?? {}),
-            result: toolResults.get(toolId) ?? "",
-            complete: true,
-          });
+          const toolName = block.name ?? "";
+          const result = toolResults.get(toolId) ?? "";
+          if (toolName === "load_skill") {
+            const parsed = parseLoadSkillResult(result);
+            blocks.push({
+              type: "skill_load",
+              id: toolId,
+              inputJson: JSON.stringify(block.input ?? {}),
+              result,
+              complete: true,
+              skillName: parsed.skillName,
+              path: parsed.path,
+              content: parsed.content,
+            });
+          } else {
+            blocks.push({
+              type: "tool_call",
+              id: toolId,
+              name: toolName,
+              inputJson: JSON.stringify(block.input ?? {}),
+              result,
+              complete: true,
+            });
+          }
         }
       }
       if (blocks.length > 0) {
@@ -484,14 +522,24 @@ export function reducer(state: AppState, action: AppAction): AppState {
     case "TOOL_START": {
       const all = ensureAssistant(state.messages);
       const { msgs, last } = cloneLast(all);
-      last.blocks.push({
-        type: "tool_call",
-        id: action.toolCallId,
-        name: action.toolName,
-        inputJson: "",
-        result: "",
-        complete: false,
-      });
+      last.blocks.push(
+        action.toolName === "load_skill"
+          ? {
+              type: "skill_load",
+              id: action.toolCallId,
+              inputJson: "",
+              result: "",
+              complete: false,
+            }
+          : {
+              type: "tool_call",
+              id: action.toolCallId,
+              name: action.toolName,
+              inputJson: "",
+              result: "",
+              complete: false,
+            },
+      );
       return { ...state, messages: msgs, statusOverride: null };
     }
 
@@ -502,7 +550,9 @@ export function reducer(state: AppState, action: AppAction): AppState {
       for (; tiIdx >= 0; tiIdx--) {
         if (
           state.messages[tiIdx].blocks.some(
-            (b) => b.type === "tool_call" && b.id === action.toolCallId,
+            (b) =>
+              (b.type === "tool_call" || b.type === "skill_load") &&
+              b.id === action.toolCallId,
           )
         ) {
           break;
@@ -512,7 +562,8 @@ export function reducer(state: AppState, action: AppAction): AppState {
       const tiMsgs = [...state.messages];
       const tiTarget = { ...tiMsgs[tiIdx] };
       tiTarget.blocks = tiTarget.blocks.map((b) =>
-        b.type === "tool_call" && b.id === action.toolCallId
+        (b.type === "tool_call" || b.type === "skill_load") &&
+        b.id === action.toolCallId
           ? { ...b, inputJson: b.inputJson + action.partialJson }
           : b,
       );
@@ -530,7 +581,9 @@ export function reducer(state: AppState, action: AppAction): AppState {
       for (let i = state.messages.length - 1; i >= 0; i--) {
         if (
           state.messages[i].blocks.some(
-            (b) => b.type === "tool_call" && b.id === action.toolCallId,
+            (b) =>
+              (b.type === "tool_call" || b.type === "skill_load") &&
+              b.id === action.toolCallId,
           )
         ) {
           targetIdx = i;
@@ -541,20 +594,34 @@ export function reducer(state: AppState, action: AppAction): AppState {
 
       const msgs = [...state.messages];
       const target = { ...msgs[targetIdx] };
-      target.blocks = target.blocks.map((b) =>
-        b.type === "tool_call" && b.id === action.toolCallId
-          ? {
-              ...b,
-              inputJson:
-                b.inputJson !== "" || action.input === undefined
-                  ? b.inputJson
-                  : JSON.stringify(action.input),
-              result: action.result,
-              complete: true,
-              durationMs: action.durationMs,
-            }
-          : b,
-      );
+      target.blocks = target.blocks.map((b) => {
+        if (
+          (b.type === "tool_call" || b.type === "skill_load") &&
+          b.id === action.toolCallId
+        ) {
+          const nextBase = {
+            ...b,
+            inputJson:
+              b.inputJson !== "" || action.input === undefined
+                ? b.inputJson
+                : JSON.stringify(action.input),
+            result: action.result,
+            complete: true,
+            durationMs: action.durationMs,
+          };
+          if (b.type === "skill_load") {
+            const parsed = parseLoadSkillResult(action.result);
+            return {
+              ...nextBase,
+              skillName: parsed.skillName,
+              path: parsed.path,
+              content: parsed.content,
+            };
+          }
+          return nextBase;
+        }
+        return b;
+      });
       msgs[targetIdx] = target;
 
       // When ask_user completes, add a question_answer summary block
@@ -729,14 +796,18 @@ export function reducer(state: AppState, action: AppAction): AppState {
       const doneMessages = state.messages.map((m) => {
         const hasIncomplete = m.blocks.some(
           (b) =>
-            (b.type === "tool_call" && !b.complete) ||
+            ((b.type === "tool_call" || b.type === "skill_load") &&
+              !b.complete) ||
             (b.type === "thinking" && !b.complete),
         );
         if (!hasIncomplete) return m;
         return {
           ...m,
           blocks: m.blocks.map((b) => {
-            if (b.type === "tool_call" && !b.complete) {
+            if (
+              (b.type === "tool_call" || b.type === "skill_load") &&
+              !b.complete
+            ) {
               return {
                 ...b,
                 complete: true,

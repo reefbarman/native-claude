@@ -39,6 +39,14 @@ export const readFileSchema = {
     ),
 };
 
+export const loadSkillSchema = {
+  path: z
+    .string()
+    .describe(
+      "Absolute or workspace-relative path of a skill file that was explicitly advertised in the current system prompt.",
+    ),
+};
+
 export const listFilesSchema = {
   path: z
     .string()

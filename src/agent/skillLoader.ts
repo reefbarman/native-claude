@@ -5,7 +5,7 @@ import * as path from "path";
 export interface SkillEntry {
   name: string;
   description: string;
-  /** Absolute path to the SKILL.md file — passed to the model so it can read_file it */
+  /** Absolute path to the SKILL.md file — passed to the model so it can load_skill it */
   skillPath: string;
 }
 

@@ -951,6 +951,11 @@ body {
   padding: 6px 8px;
 }
 
+.skill-load-content {
+  max-height: 420px;
+  overflow-y: auto;
+}
+
 /* ── JSON Syntax Highlighting ── */
 
 .json-key {

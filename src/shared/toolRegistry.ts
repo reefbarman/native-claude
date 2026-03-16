@@ -37,6 +37,11 @@ export const TOOL_REGISTRY: Record<string, ToolMeta> = {
     description:
       "Read the contents of a file with line numbers. Returns content in 'line_number | content' format. Includes file metadata (size, modified, language), git status, and diagnostics summary when available. Supports optional 'query' param to semantically jump to the most relevant section using the codebase index.",
   },
+  load_skill: {
+    label: "Load advertised skill",
+    description:
+      "Load the full contents of a skill file that was explicitly advertised in the current system prompt. Only valid for skill paths from the current session's skill list; not a general-purpose file reader.",
+  },
   list_files: {
     label: "Directory listing",
     description:

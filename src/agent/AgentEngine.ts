@@ -1038,6 +1038,9 @@ export class AgentEngine {
                   ...ctx,
                   sessionId: session.id,
                   trackerCtx,
+                  getAdvertisedSkills: () => session.getAdvertisedSkills(),
+                  onSkillLoad: (skillName: string) =>
+                    session.trackLoadedSkill(skillName),
                 },
               ),
               forcePromise,
@@ -1046,6 +1049,9 @@ export class AgentEngine {
               ...ctx,
               sessionId: session.id,
               trackerCtx,
+              getAdvertisedSkills: () => session.getAdvertisedSkills(),
+              onSkillLoad: (skillName: string) =>
+                session.trackLoadedSkill(skillName),
             }));
         return {
           tool_use_id: call.id,

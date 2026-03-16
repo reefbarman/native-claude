@@ -1,9 +1,11 @@
 import { handleReadFile } from "../../tools/readFile.js";
+import { handleLoadSkill } from "../../tools/loadSkill.js";
 import { handleListFiles } from "../../tools/listFiles.js";
 import { handleSearchFiles } from "../../tools/searchFiles.js";
 import { handleGetDiagnostics } from "../../tools/getDiagnostics.js";
 import {
   readFileSchema,
+  loadSkillSchema,
   listFilesSchema,
   searchFilesSchema,
   getDiagnosticsSchema,
@@ -26,6 +28,24 @@ export function registerFileTools(ctx: ToolRegistrationContext): void {
       (params) => {
         touch();
         return handleReadFile(params, approvalManager, approvalPanel, sid());
+      },
+      (p) => String(p.path ?? ""),
+      sid,
+    ),
+  );
+
+  server.registerTool(
+    "load_skill",
+    {
+      description: desc("load_skill"),
+      inputSchema: loadSkillSchema,
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    tracker.wrapHandler(
+      "load_skill",
+      (params) => {
+        touch();
+        return handleLoadSkill(params, approvalManager, approvalPanel, sid());
       },
       (p) => String(p.path ?? ""),
       sid,

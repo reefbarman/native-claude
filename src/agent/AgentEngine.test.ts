@@ -15,6 +15,10 @@ import type {
 
 const mocks = vi.hoisted(() => ({
   mockBuildSystemPrompt: vi.fn().mockResolvedValue("mock system prompt"),
+  mockBuildPromptArtifacts: vi.fn().mockResolvedValue({
+    systemPrompt: "mock system prompt",
+    skills: [],
+  }),
   mockSummarizeConversation: vi.fn(),
   mockGetEffectiveHistory: vi.fn((messages: unknown[]) => messages),
   mockInjectSyntheticToolResults: vi.fn((messages: unknown[]) => messages),
@@ -22,6 +26,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("./systemPrompt.js", () => ({
   buildSystemPrompt: mocks.mockBuildSystemPrompt,
+  buildPromptArtifacts: mocks.mockBuildPromptArtifacts,
 }));
 
 vi.mock("./condense.js", () => ({
