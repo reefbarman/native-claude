@@ -17,6 +17,14 @@ import type {
   IndexPhase,
   EmbeddingAuthRefreshRequestMessage,
 } from "./types.js";
+import type {
+  SemanticReadinessReason,
+  SemanticReadinessSnapshot,
+} from "../shared/semanticReadiness.js";
+import {
+  classifySemanticReadiness,
+  getSemanticReadinessMessage,
+} from "../shared/semanticReadiness.js";
 
 // --- Public types ---
 
@@ -38,6 +46,8 @@ export interface IndexStatus {
     cancelled?: boolean;
   };
   error?: string;
+  readinessReason?: SemanticReadinessReason;
+  readinessMessage?: string;
 }
 
 // --- Constants ---
@@ -96,45 +106,93 @@ export class IndexerManager implements vscode.Disposable {
     }
 
     this.cancelRequested = false;
-    this.updateStatus({ state: "discovering" });
 
     try {
       const config = vscode.workspace.getConfiguration("agentlink");
+      const semanticEnabled = config.get<boolean>(
+        "semanticSearchEnabled",
+        false,
+      );
       const qdrantUrl = config.get<string>(
         "qdrantUrl",
         "http://localhost:6333",
       );
+      const workspaceRoot = this.getWorkspaceRoot();
+
+      const embeddingBearerToken = await this.getEmbeddingBearerToken();
+
+      if (!semanticEnabled) {
+        const readinessReason = this.classifyPreflightReadinessReason({
+          semanticEnabled,
+          hasWorkspace: Boolean(workspaceRoot),
+          hasEmbeddingAuth: Boolean(embeddingBearerToken),
+        });
+        const message = getSemanticReadinessMessage(readinessReason);
+        this.updateStatus({
+          state: "error",
+          readinessReason,
+          readinessMessage: message,
+          error: message,
+        });
+        return;
+      }
+
+      if (!workspaceRoot) {
+        const readinessReason = this.classifyPreflightReadinessReason({
+          semanticEnabled,
+          hasWorkspace: false,
+          hasEmbeddingAuth: Boolean(embeddingBearerToken),
+        });
+        const message = getSemanticReadinessMessage(readinessReason);
+        this.updateStatus({
+          state: "error",
+          readinessReason,
+          readinessMessage: message,
+          error: message,
+        });
+        return;
+      }
+
+      if (!embeddingBearerToken) {
+        const readinessReason = this.classifyPreflightReadinessReason({
+          semanticEnabled,
+          hasWorkspace: true,
+          hasEmbeddingAuth: false,
+        });
+        const message = getSemanticReadinessMessage(readinessReason);
+        this.updateStatus({
+          state: "error",
+          readinessReason,
+          readinessMessage: message,
+          error: message,
+        });
+        return;
+      }
+
+      this.updateStatus({ state: "discovering", detail: undefined });
+
       // Pre-flight: check Qdrant is reachable with retry + backoff
       const qdrantReachable = await this.waitForQdrant(qdrantUrl);
       if (!qdrantReachable) {
         if (this.cancelRequested) {
           this.updateStatus({ state: "idle" });
         } else {
+          const readinessReason = this.classifyPreflightReadinessReason({
+            semanticEnabled,
+            hasWorkspace: true,
+            hasEmbeddingAuth: true,
+            qdrantReachable: false,
+          });
+          const message = getSemanticReadinessMessage(readinessReason, {
+            qdrantUrl,
+          });
           this.updateStatus({
             state: "error",
-            error: `Qdrant not reachable at ${qdrantUrl}. Make sure Qdrant is running (e.g. docker run -p 6333:6333 qdrant/qdrant).`,
+            readinessReason,
+            readinessMessage: message,
+            error: message,
           });
         }
-        return;
-      }
-
-      const embeddingBearerToken = await this.getEmbeddingBearerToken();
-
-      if (!embeddingBearerToken) {
-        this.updateStatus({
-          state: "error",
-          error:
-            "OpenAI API key not configured for embeddings. Semantic search and indexing require an API key (set OPENAI_API_KEY or run 'AgentLink: Set OpenAI API Key for Embeddings'). Model chat can still use OpenAI/Codex OAuth.",
-        });
-        return;
-      }
-
-      const workspaceRoot = this.getWorkspaceRoot();
-      if (!workspaceRoot) {
-        this.updateStatus({
-          state: "error",
-          error: "No workspace folder open",
-        });
         return;
       }
 
@@ -168,9 +226,12 @@ export class IndexerManager implements vscode.Disposable {
         granularity,
       });
     } catch (err) {
+      const message = `Failed to start indexing: ${err}`;
       this.updateStatus({
         state: "error",
-        error: `Failed to start indexing: ${err}`,
+        readinessReason: "generic_error",
+        readinessMessage: getSemanticReadinessMessage("generic_error"),
+        error: message,
       });
     }
   }
@@ -279,6 +340,8 @@ export class IndexerManager implements vscode.Disposable {
       if (this.status.state === "indexing") {
         this.updateStatus({
           state: "error",
+          readinessReason: "generic_error",
+          readinessMessage: getSemanticReadinessMessage("generic_error"),
           error: `Worker process exited unexpectedly (code=${code})`,
         });
       }
@@ -289,6 +352,8 @@ export class IndexerManager implements vscode.Disposable {
       this.worker = null;
       this.updateStatus({
         state: "error",
+        readinessReason: "generic_error",
+        readinessMessage: getSemanticReadinessMessage("generic_error"),
         error: `Worker process error: ${err.message}`,
       });
     });
@@ -339,7 +404,12 @@ export class IndexerManager implements vscode.Disposable {
       case "error":
         this.log(`Indexer error: ${msg.message}`);
         if (msg.fatal) {
-          this.updateStatus({ state: "error", error: msg.message });
+          this.updateStatus({
+            state: "error",
+            readinessReason: "generic_error",
+            readinessMessage: getSemanticReadinessMessage("generic_error"),
+            error: msg.message,
+          });
         } else {
           // Surface non-fatal errors as detail so the UI isn't silent
           this.updateStatus({ ...this.status, detail: msg.message });
@@ -616,8 +686,31 @@ export class IndexerManager implements vscode.Disposable {
   private updateStatus(partial: Partial<IndexStatus>): void {
     // Preserve lastCompleted across status updates unless explicitly set
     const lastCompleted = partial.lastCompleted ?? this.status.lastCompleted;
-    this.status = { ...this.status, ...partial, lastCompleted };
+    const shouldClearReadiness =
+      partial.state === "idle" ||
+      partial.state === "discovering" ||
+      partial.state === "indexing";
+    const readinessReason = shouldClearReadiness
+      ? undefined
+      : (partial.readinessReason ?? this.status.readinessReason);
+    const readinessMessage = shouldClearReadiness
+      ? undefined
+      : (partial.readinessMessage ?? this.status.readinessMessage);
+    this.status = {
+      ...this.status,
+      ...partial,
+      lastCompleted,
+      readinessReason,
+      readinessMessage,
+    };
     this._onStatusChanged.fire(this.status);
+  }
+
+  private classifyPreflightReadinessReason(
+    snapshot: SemanticReadinessSnapshot,
+  ): SemanticReadinessReason {
+    const reason = classifySemanticReadiness(snapshot);
+    return reason === "ready" ? "generic_error" : reason;
   }
 
   private getWorkspaceRoot(): string | undefined {

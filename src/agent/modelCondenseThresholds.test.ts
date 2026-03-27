@@ -8,16 +8,19 @@ import {
 } from "./modelCondenseThresholds.js";
 
 describe("modelCondenseThresholds", () => {
-  it("defaults Anthropic Sonnet and Opus models to 0.6", () => {
+  it("defaults large-context frontier models to 0.6", () => {
     expect(getDefaultAutoCondenseThreshold("claude-sonnet-4-6")).toBe(0.6);
     expect(getDefaultAutoCondenseThreshold("claude-opus-4-6")).toBe(0.6);
+    expect(getDefaultAutoCondenseThreshold("gpt-5.4")).toBe(0.6);
+    expect(getDefaultAutoCondenseThreshold("gpt-5.4-pro")).toBe(0.6);
   });
 
-  it("defaults non-Sonnet/Opus models to 0.9", () => {
+  it("defaults other models to 0.9", () => {
     expect(getDefaultAutoCondenseThreshold("claude-haiku-4-5-20251001")).toBe(
       0.9,
     );
-    expect(getDefaultAutoCondenseThreshold("gpt-5.4")).toBe(0.9);
+    expect(getDefaultAutoCondenseThreshold("gpt-5.4-mini")).toBe(0.9);
+    expect(getDefaultAutoCondenseThreshold("gpt-5.3-codex")).toBe(0.9);
   });
 
   it("prefers explicit per-model overrides", () => {

@@ -92,6 +92,7 @@ interface AppState {
     text: string;
     fullText?: string;
     isSlashCommand?: boolean;
+    slashCommandLabel?: string;
     attachments?: string[];
     images?: Array<{ name: string; mimeType: string; base64: string }>;
     documents?: Array<{ name: string; mimeType: string; base64: string }>;
@@ -110,7 +111,12 @@ type AppAction =
       systemPrompt?: string;
       loadedInstructions?: Array<{ source: string; chars: number }>;
     }
-  | { type: "ADD_USER_MESSAGE"; text: string; isSlashCommand?: boolean }
+  | {
+      type: "ADD_USER_MESSAGE";
+      text: string;
+      isSlashCommand?: boolean;
+      slashCommandLabel?: string;
+    }
   | { type: "THINKING_START"; thinkingId: string }
   | { type: "THINKING_DELTA"; thinkingId: string; text: string }
   | { type: "THINKING_END"; thinkingId: string }
@@ -145,7 +151,17 @@ type AppAction =
     }
   | { type: "TODO_UPDATE"; todos: TodoItem[] }
   | { type: "ADD_ANNOTATION"; text: string; badge: "follow-up" | "rejection" }
-  | { type: "ERROR"; error: string; retryable: boolean }
+  | {
+      type: "ERROR";
+      error: string;
+      retryable: boolean;
+      code?: string;
+      actions?: {
+        signIn?: boolean;
+        signInAnotherAccount?: boolean;
+        condense?: boolean;
+      };
+    }
   | { type: "DONE" }
   | { type: "NEW_SESSION" }
   | { type: "TOGGLE_THINKING" }
@@ -158,6 +174,7 @@ type AppAction =
       text: string;
       fullText?: string;
       isSlashCommand?: boolean;
+      slashCommandLabel?: string;
       attachments?: string[];
       images?: Array<{ name: string; mimeType: string; base64: string }>;
       documents?: Array<{ name: string; mimeType: string; base64: string }>;
@@ -165,7 +182,12 @@ type AppAction =
   | { type: "EDIT_QUEUE_MESSAGE"; id: string; text: string }
   | { type: "REMOVE_FROM_QUEUE"; id: string }
   | { type: "CLEAR_QUEUE" }
-  | { type: "ADD_INTERJECTION"; text: string }
+  | {
+      type: "ADD_INTERJECTION";
+      text: string;
+      isSlashCommand?: boolean;
+      slashCommandLabel?: string;
+    }
   | { type: "SET_QUESTION"; id: string; questions: Question[] }
   | { type: "CLEAR_QUESTION" }
   | {
@@ -175,7 +197,17 @@ type AppAction =
       durationMs: number;
       validationWarnings?: string[];
     }
-  | { type: "ADD_CONDENSE_ERROR"; errorMessage: string }
+  | {
+      type: "ADD_CONDENSE_ERROR";
+      errorMessage: string;
+      retryable?: boolean;
+      code?: string;
+      actions?: {
+        signIn?: boolean;
+        signInAnotherAccount?: boolean;
+        condense?: boolean;
+      };
+    }
   | { type: "ADD_WARNING"; message: string }
   | { type: "SET_STATUS_OVERRIDE"; message: string | null }
   | { type: "SET_RESTORING_SESSION"; restoring: boolean }
@@ -253,25 +285,35 @@ export function agentMessagesToChatMessages(raw: unknown[]): ChatMessage[] {
       role: string;
       content: unknown;
       isSummary?: boolean;
-      runtimeError?: { message: string; retryable: boolean };
+      uiHint?: {
+        userMessage?: {
+          displayText?: string;
+          isSlashCommand?: boolean;
+          slashCommandLabel?: string;
+        };
+        condense?: {
+          prevInputTokens?: number;
+          newInputTokens?: number;
+          durationMs?: number;
+          validationWarnings?: string[];
+          errorMessage?: string;
+          condensing?: boolean;
+        };
+      };
+      runtimeError?: {
+        message: string;
+        retryable: boolean;
+        code?: string;
+        actions?: {
+          signIn?: boolean;
+          signInAnotherAccount?: boolean;
+          condense?: boolean;
+        };
+      };
     };
-    if (m.runtimeError?.message) {
-      result.push({
-        id: crypto.randomUUID(),
-        role: "warning",
-        content: "",
-        timestamp: Date.now(),
-        blocks: [],
-        warningMessage: m.runtimeError.message,
-        error: {
-          message: m.runtimeError.message,
-          retryable: m.runtimeError.retryable,
-        },
-      });
-      continue;
-    }
     if (m.isSummary) {
       const summaryText = getSummaryText(m.content);
+      const hint = m.uiHint?.condense;
       result.push({
         id: crypto.randomUUID(),
         role: "condense",
@@ -279,9 +321,12 @@ export function agentMessagesToChatMessages(raw: unknown[]): ChatMessage[] {
         timestamp: Date.now(),
         blocks: [],
         condenseInfo: {
-          prevInputTokens: 0,
-          newInputTokens: 0,
-          errorMessage: undefined,
+          prevInputTokens: hint?.prevInputTokens ?? 0,
+          newInputTokens: hint?.newInputTokens ?? 0,
+          durationMs: hint?.durationMs,
+          validationWarnings: hint?.validationWarnings,
+          errorMessage: hint?.errorMessage,
+          condensing: hint?.condensing,
         },
       });
       if (summaryText) {
@@ -298,12 +343,17 @@ export function agentMessagesToChatMessages(raw: unknown[]): ChatMessage[] {
 
     if (m.role === "user") {
       if (typeof m.content === "string") {
+        const hint = m.uiHint?.userMessage;
         result.push({
           id: crypto.randomUUID(),
           role: "user",
-          content: m.content,
+          content: hint?.displayText ?? m.content,
           timestamp: Date.now(),
           blocks: [],
+          isSlashCommand: hint?.isSlashCommand,
+          slashCommandLabel:
+            hint?.slashCommandLabel ??
+            (hint?.isSlashCommand ? hint.displayText : undefined),
         });
       }
       // Skip tool_result arrays — they're internal and shouldn't be displayed
@@ -355,13 +405,24 @@ export function agentMessagesToChatMessages(raw: unknown[]): ChatMessage[] {
           }
         }
       }
-      if (blocks.length > 0) {
+      const hasRuntimeError = Boolean(m.runtimeError?.message);
+      if (blocks.length > 0 || hasRuntimeError) {
         result.push({
           id: crypto.randomUUID(),
           role: "assistant",
           content: "",
           timestamp: Date.now(),
           blocks,
+          ...(hasRuntimeError
+            ? {
+                error: {
+                  message: m.runtimeError!.message,
+                  retryable: m.runtimeError!.retryable,
+                  code: m.runtimeError!.code,
+                  actions: m.runtimeError!.actions,
+                },
+              }
+            : {}),
         });
       }
     }
@@ -436,6 +497,7 @@ export function reducer(state: AppState, action: AppAction): AppState {
             timestamp: Date.now(),
             blocks: [],
             isSlashCommand: action.isSlashCommand,
+            slashCommandLabel: action.slashCommandLabel,
           },
           {
             id: crypto.randomUUID(),
@@ -788,7 +850,12 @@ export function reducer(state: AppState, action: AppAction): AppState {
     case "ERROR": {
       const all = ensureAssistant(state.messages);
       const { msgs, last } = cloneLast(all);
-      last.error = { message: action.error, retryable: action.retryable };
+      last.error = {
+        message: action.error,
+        retryable: action.retryable,
+        code: action.code,
+        actions: action.actions,
+      };
       return {
         ...state,
         streaming: false,
@@ -917,6 +984,9 @@ export function reducer(state: AppState, action: AppAction): AppState {
             text: action.text,
             ...(action.fullText ? { fullText: action.fullText } : {}),
             ...(action.isSlashCommand ? { isSlashCommand: true } : {}),
+            ...(action.slashCommandLabel
+              ? { slashCommandLabel: action.slashCommandLabel }
+              : {}),
             ...(action.attachments ? { attachments: action.attachments } : {}),
             ...(action.images ? { images: action.images } : {}),
             ...(action.documents ? { documents: action.documents } : {}),
@@ -934,6 +1004,7 @@ export function reducer(state: AppState, action: AppAction): AppState {
                 text: action.text,
                 fullText: action.text,
                 isSlashCommand: false,
+                slashCommandLabel: undefined,
               }
             : q,
         ),
@@ -960,6 +1031,8 @@ export function reducer(state: AppState, action: AppAction): AppState {
             content: action.text,
             timestamp: Date.now(),
             blocks: [],
+            isSlashCommand: action.isSlashCommand,
+            slashCommandLabel: action.slashCommandLabel,
           },
           {
             id: crypto.randomUUID(),
@@ -1079,36 +1152,60 @@ export function reducer(state: AppState, action: AppAction): AppState {
       const filtered = state.messages.filter(
         (m) => !(m.role === "condense" && m.condenseInfo?.condensing),
       );
+      const withCondenseRow = [
+        ...filtered,
+        {
+          id: crypto.randomUUID(),
+          role: "condense" as const,
+          content: "",
+          timestamp: Date.now(),
+          blocks: [],
+          condenseInfo: {
+            prevInputTokens: 0,
+            newInputTokens: 0,
+            errorMessage: action.errorMessage,
+          },
+        },
+      ];
+
+      if (!action.retryable && !action.code && !action.actions) {
+        return {
+          ...state,
+          messages: withCondenseRow,
+          statusOverride: null,
+        };
+      }
+
+      const all = ensureAssistant(withCondenseRow);
+      const { msgs, last } = cloneLast(all);
+      last.error = {
+        message: action.errorMessage,
+        retryable: action.retryable ?? false,
+        code: action.code,
+        actions: action.actions,
+      };
+
       return {
         ...state,
-        messages: [
-          ...filtered,
-          {
-            id: crypto.randomUUID(),
-            role: "condense" as const,
-            content: "",
-            timestamp: Date.now(),
-            blocks: [],
-            condenseInfo: {
-              prevInputTokens: 0,
-              newInputTokens: 0,
-              errorMessage: action.errorMessage,
-            },
-          },
-        ],
+        messages: msgs,
+        statusOverride: null,
       };
     }
 
     case "LOAD_SESSION": {
-      // Apply checkpoint IDs to user messages if provided
+      // Apply checkpoint IDs to the user message immediately before each checkpoint.
+      // `turnIndex` is the number of visible user turns already committed at the
+      // snapshot, so the visible row is `turnIndex - 1`.
       let msgs = action.messages;
       if (action.checkpoints && action.checkpoints.length > 0) {
         msgs = [...msgs];
         for (const cp of action.checkpoints) {
           let userCount = 0;
+          const targetUserIndex = cp.turnIndex - 1;
+          if (targetUserIndex < 0) continue;
           for (let i = 0; i < msgs.length; i++) {
             if (msgs[i].role === "user") {
-              if (userCount === cp.turnIndex) {
+              if (userCount === targetUserIndex) {
                 msgs[i] = { ...msgs[i], checkpointId: cp.checkpointId };
                 break;
               }
@@ -1169,13 +1266,16 @@ export function reducer(state: AppState, action: AppAction): AppState {
     }
 
     case "SET_CHECKPOINT": {
-      // Attach checkpointId to the most recent user message (turnIndex = its position)
+      // Attach checkpointId to the user message immediately before this checkpoint.
+      // `turnIndex` is a snapshot user-turn count, so the visible row is
+      // `turnIndex - 1`.
       const msgs = [...state.messages];
-      // Find the user message at the given turnIndex (0-based index into user messages)
       let userCount = 0;
+      const targetUserIndex = action.turnIndex - 1;
+      if (targetUserIndex < 0) return state;
       for (let i = 0; i < msgs.length; i++) {
         if (msgs[i].role === "user") {
-          if (userCount === action.turnIndex) {
+          if (userCount === targetUserIndex) {
             msgs[i] = { ...msgs[i], checkpointId: action.checkpointId };
             break;
           }
@@ -1495,6 +1595,8 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
             type: "ERROR",
             error: msg.error,
             retryable: msg.retryable,
+            code: msg.code,
+            actions: msg.actions,
           });
           break;
         case "agentTodoUpdate":
@@ -1520,15 +1622,24 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
             const documentsCombined = queue.flatMap((q) => q.documents ?? []);
             messageQueueRef.current = [];
             dispatch({ type: "CLEAR_QUEUE" });
+            const isSlashCombined =
+              queue.length === 1 ? queue[0]?.isSlashCommand === true : false;
+            const slashCommandLabelCombined =
+              queue.length === 1 ? queue[0]?.slashCommandLabel : undefined;
             setTimeout(() => {
               streamingRef.current = true;
               dispatch({
                 type: "ADD_USER_MESSAGE",
                 text: displayCombined,
+                isSlashCommand: isSlashCombined,
+                slashCommandLabel: slashCommandLabelCombined,
               });
               vscodeApi.postMessage({
                 command: "agentSend",
                 text: sendCombined,
+                displayText: displayCombined,
+                isSlashCommand: isSlashCombined,
+                slashCommandLabel: slashCommandLabelCombined,
                 attachments:
                   attachmentsCombined.length > 0
                     ? attachmentsCombined
@@ -1638,6 +1749,9 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
           dispatch({
             type: "ADD_CONDENSE_ERROR",
             errorMessage: msg.error,
+            retryable: msg.retryable,
+            code: msg.code,
+            actions: msg.actions,
           });
           break;
 
@@ -1684,6 +1798,13 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
           dispatch({
             type: "ADD_INTERJECTION",
             text: (msg.displayText as string | undefined) ?? msg.text,
+            isSlashCommand:
+              (msg.isSlashCommand as boolean | undefined) ?? false,
+            slashCommandLabel:
+              (msg.slashCommandLabel as string | undefined) ??
+              ((msg.isSlashCommand as boolean | undefined)
+                ? (msg.displayText as string | undefined)
+                : undefined),
           });
           dispatch({ type: "REMOVE_FROM_QUEUE", id: msg.queueId });
           messageQueueRef.current = messageQueueRef.current.filter(
@@ -1796,6 +1917,7 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
       text: string,
       attachments: string[] = [],
       displayText?: string,
+      slashCommandLabel?: string,
       media?: Array<{
         name: string;
         mimeType: string;
@@ -1829,6 +1951,7 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
           })) ?? [];
 
       // Build display text with media indicators
+      const isSlashCommand = slashCommandLabel !== undefined;
       let displayWithMedia = displayText ?? fullText;
       if (images.length > 0 || documents.length > 0) {
         const indicators: string[] = [];
@@ -1855,7 +1978,8 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
           // (e.g. slash commands or media indicators) so queue drain sends the
           // actual agent input rather than UI-only decoration.
           fullText: displayWithMedia !== fullText ? fullText : undefined,
-          isSlashCommand: displayText !== undefined,
+          isSlashCommand,
+          slashCommandLabel,
           attachments: attachments.length > 0 ? attachments : undefined,
           images: images.length > 0 ? images : undefined,
           documents: documents.length > 0 ? documents : undefined,
@@ -1866,6 +1990,8 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
           command: "agentQueueMessage",
           text: fullText,
           displayText: displayWithMedia,
+          isSlashCommand,
+          slashCommandLabel,
           queueId,
           sessionId: stateRef.current.sessionId,
           attachments: attachments.length > 0 ? attachments : undefined,
@@ -1880,11 +2006,26 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
       dispatch({
         type: "ADD_USER_MESSAGE",
         text: displayWithMedia,
-        isSlashCommand: displayText !== undefined,
+        isSlashCommand,
+        slashCommandLabel,
       });
+      // Log media being sent for debugging
+      if (images.length > 0 || documents.length > 0) {
+        console.log(
+          `[agentlink:media] sending agentSend with ${images.length} image(s), ${documents.length} document(s)`,
+        );
+        for (const img of images) {
+          console.log(
+            `[agentlink:media]   image: name="${img.name}" mimeType="${img.mimeType}" base64Length=${img.base64?.length ?? 0}`,
+          );
+        }
+      }
       vscodeApi.postMessage({
         command: "agentSend",
         text: fullText,
+        displayText: displayWithMedia,
+        isSlashCommand,
+        slashCommandLabel,
         attachments,
         images: images.length > 0 ? images : undefined,
         documents: documents.length > 0 ? documents : undefined,
@@ -2218,6 +2359,18 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
     }
   }, [state.availableModels, handleSignIn]);
 
+  const handleErrorSignInAnotherAccount = useCallback(() => {
+    vscodeApi.postMessage({ command: "agentCodexAddAccount" });
+  }, [vscodeApi]);
+
+  const handleErrorCondense = useCallback(() => {
+    vscodeApi.postMessage({
+      command: "agentSlashCommand",
+      name: "condense",
+      args: "",
+    });
+  }, [vscodeApi]);
+
   const handleShowHistory = useCallback(() => {
     vscodeApi.postMessage({ command: "agentListSessions" });
     setShowHistory((prev) => !prev);
@@ -2454,6 +2607,8 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
           onViewCheckpointDiff={handleViewCheckpointDiff}
           onRetry={handleRetry}
           onSignIn={handleErrorSignIn}
+          onSignInAnotherAccount={handleErrorSignInAnotherAccount}
+          onCondense={handleErrorCondense}
           bgSessions={bgSessions}
           onStopBackground={handleStopBackground}
           onOpenTranscript={handleOpenBgTranscript}
@@ -2491,6 +2646,7 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
                             queueId: item.id,
                             text: trimmed,
                             displayText: trimmed,
+                            isSlashCommand: false,
                             attachments: item.attachments,
                             images: item.images,
                             documents: item.documents,
@@ -2555,6 +2711,7 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
                             command: "agentQueueMessage",
                             text: nextHead.fullText ?? nextHead.text,
                             displayText: nextHead.text,
+                            isSlashCommand: nextHead.isSlashCommand === true,
                             queueId: nextHead.id,
                             sessionId: stateRef.current.sessionId,
                             attachments: nextHead.attachments,
@@ -2572,18 +2729,33 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
             ))}
           </div>
         )}
-        {(state.lastInputTokens > 0 || state.lastOutputTokens > 0) && (
-          <ContextBar
-            inputTokens={state.lastInputTokens}
-            outputTokens={state.lastOutputTokens}
-            cacheReadTokens={state.lastCacheReadTokens}
-            maxContextWindow={
-              state.availableModels.find((m) => m.id === state.chatState.model)
-                ?.contextWindow ?? DEFAULT_MAX_TOKENS
-            }
-            condenseThreshold={state.chatState.condenseThreshold}
-          />
-        )}
+        {(state.lastInputTokens > 0 || state.lastOutputTokens > 0) &&
+          (() => {
+            const currentModel = state.availableModels.find(
+              (m) => m.id === state.chatState.model,
+            );
+            return (
+              <ContextBar
+                inputTokens={state.lastInputTokens}
+                outputTokens={state.lastOutputTokens}
+                cacheReadTokens={state.lastCacheReadTokens}
+                maxContextWindow={
+                  currentModel?.contextWindow ?? DEFAULT_MAX_TOKENS
+                }
+                outputReservation={
+                  state.chatState.contextBudget?.outputReservation
+                }
+                safetyBufferTokens={
+                  state.chatState.contextBudget?.safetyBufferTokens
+                }
+                softThresholdBudget={
+                  state.chatState.contextBudget?.softThresholdBudget
+                }
+                hardBudget={state.chatState.contextBudget?.hardBudget}
+                condenseThreshold={state.chatState.condenseThreshold}
+              />
+            );
+          })()}
         {mcpStatusInfos && (
           <div class="mcp-status-panel">
             <div class="mcp-status-header">

@@ -48,6 +48,7 @@ interface InputAreaProps {
     text: string,
     attachments: string[],
     displayText?: string,
+    slashCommandLabel?: string,
     media?: Array<{
       name: string;
       mimeType: string;
@@ -126,23 +127,23 @@ export function InputArea({
     () => parseMatchedSlashCommand(text, slashCommands),
     [text, slashCommands],
   );
-  const pendingMedia = useMemo(
-    () =>
-      mediaAttachments.length > 0
-        ? mediaAttachments.map((m) => {
-            const commaIdx = m.dataUrl.indexOf(",");
-            const base64 =
-              commaIdx >= 0 ? m.dataUrl.slice(commaIdx + 1) : m.dataUrl;
-            return {
-              name: m.name,
-              mimeType: m.mimeType,
-              base64,
-              kind: m.kind,
-            };
-          })
-        : undefined,
-    [mediaAttachments],
-  );
+  const pendingMedia = useMemo(() => {
+    if (mediaAttachments.length === 0) return undefined;
+    const result = mediaAttachments.map((m) => {
+      const commaIdx = m.dataUrl.indexOf(",");
+      const base64 = commaIdx >= 0 ? m.dataUrl.slice(commaIdx + 1) : m.dataUrl;
+      console.log(
+        `[agentlink:media] pendingMedia: name="${m.name}" mimeType="${m.mimeType}" kind="${m.kind}" dataUrlLength=${m.dataUrl.length} base64Length=${base64.length} commaIdx=${commaIdx}`,
+      );
+      return {
+        name: m.name,
+        mimeType: m.mimeType,
+        base64,
+        kind: m.kind,
+      };
+    });
+    return result;
+  }, [mediaAttachments]);
   const matchedExecutableSlashCommand = useMemo(() => {
     if (!matchedSlashCommand) {
       return null;
@@ -176,17 +177,24 @@ export function InputArea({
       closeSlash();
       if (textareaRef.current) textareaRef.current.style.height = "auto";
 
-      const { command, args, displayText } = matchedExecutableSlashCommand;
+      const { command, args, displayText, userText, prefixText } =
+        matchedExecutableSlashCommand;
       if (command.builtin) {
         onExecuteBuiltinCommand?.(command.name, args);
       } else if (command.body) {
-        const finalText = args ? args + "\n\n" + command.body : command.body;
-        onSend(finalText, attachments, displayText, pendingMedia);
+        const contextParts = [prefixText, args].filter(
+          (part) => part.length > 0,
+        );
+        const commandInput = contextParts.join("\n\n");
+        const finalText = commandInput
+          ? `${commandInput}\n\n${command.body}`
+          : command.body;
+        onSend(finalText, attachments, userText, displayText, pendingMedia);
       }
       return;
     }
 
-    onSend(trimmed, attachments, undefined, pendingMedia);
+    onSend(trimmed, attachments, undefined, undefined, pendingMedia);
     setText("");
     setAttachments([]);
     setMediaAttachments([]);
@@ -280,6 +288,22 @@ export function InputArea({
         return c;
       });
   })();
+
+  const hasSlashPrefixAlternatives = useMemo(() => {
+    if (!matchedExecutableSlashCommand || slashView !== "main") {
+      return false;
+    }
+    const exactName = matchedExecutableSlashCommand.command.name.toLowerCase();
+    return slashCommands.some((cmd) => {
+      const name = cmd.name.toLowerCase();
+      return name !== exactName && name.startsWith(exactName);
+    });
+  }, [matchedExecutableSlashCommand, slashView, slashCommands]);
+
+  const shouldShowSlashPopup =
+    slashOpen &&
+    filteredSlashCommands.length > 0 &&
+    (!matchedExecutableSlashCommand || hasSlashPrefixAlternatives);
 
   // Commands that execute immediately with no args needed
   const ZERO_ARG_BUILTINS = new Set([
@@ -389,11 +413,7 @@ export function InputArea({
   const handleKeyDown = useCallback(
     (e: KeyboardEvent) => {
       // Handle slash popup navigation
-      if (
-        slashOpen &&
-        filteredSlashCommands.length > 0 &&
-        !matchedSlashCommand
-      ) {
+      if (shouldShowSlashPopup) {
         if (e.key === "ArrowDown") {
           e.preventDefault();
           setSlashSelectedIdx((i) => (i + 1) % filteredSlashCommands.length);
@@ -407,12 +427,10 @@ export function InputArea({
           return;
         }
         if (e.key === "Enter" && !e.shiftKey) {
-          if (!matchedSlashCommand) {
-            e.preventDefault();
-            const cmd = filteredSlashCommands[slashSelectedIdx];
-            if (cmd) handleSlashSelect(cmd);
-            return;
-          }
+          e.preventDefault();
+          const cmd = filteredSlashCommands[slashSelectedIdx];
+          if (cmd) handleSlashSelect(cmd);
+          return;
         }
         if (e.key === "Tab") {
           e.preventDefault();
@@ -466,12 +484,11 @@ export function InputArea({
     [
       handleSubmit,
       pickerOpen,
-      slashOpen,
       filteredSlashCommands,
       slashSelectedIdx,
       handleSlashSelect,
       closeSlash,
-      matchedSlashCommand,
+      shouldShowSlashPopup,
     ],
   );
 
@@ -540,7 +557,11 @@ export function InputArea({
         const file = item.getAsFile();
         if (!file) continue;
 
-        const isImage = ACCEPTED_IMAGE_TYPES.has(item.type);
+        // Capture item properties synchronously — DataTransferItem objects
+        // are cleared after the event handler returns, so reading item.type
+        // inside the async FileReader.onload callback returns "".
+        const itemType = item.type;
+        const isImage = ACCEPTED_IMAGE_TYPES.has(itemType);
         const maxBytes = isImage ? MAX_IMAGE_BYTES : MAX_DOC_BYTES;
 
         if (file.size > maxBytes) {
@@ -555,15 +576,36 @@ export function InputArea({
           continue;
         }
 
+        const fileName =
+          file.name || (isImage ? "pasted-image.png" : "pasted-document.pdf");
         const reader = new FileReader();
         reader.onload = () => {
           const dataUrl = reader.result as string;
+          // Use the synchronously-captured itemType. If it's somehow still
+          // empty, infer from the data URL prefix or fall back to file extension.
+          let mimeType = itemType;
+          if (!mimeType) {
+            const dataUrlMatch = dataUrl.match(/^data:([^;,]+)/);
+            if (dataUrlMatch) {
+              mimeType = dataUrlMatch[1];
+            }
+          }
+          if (!mimeType) {
+            const ext = fileName.split(".").pop()?.toLowerCase();
+            const extMap: Record<string, string> = {
+              png: "image/png",
+              jpg: "image/jpeg",
+              jpeg: "image/jpeg",
+              gif: "image/gif",
+              webp: "image/webp",
+              pdf: "application/pdf",
+            };
+            mimeType = (ext && extMap[ext]) || "image/png";
+          }
           const attachment: MediaAttachment = {
             id: crypto.randomUUID(),
-            name:
-              file.name ||
-              (isImage ? "pasted-image.png" : "pasted-document.pdf"),
-            mimeType: item.type,
+            name: fileName,
+            mimeType,
             dataUrl,
             kind: isImage ? "image" : "document",
           };
@@ -907,31 +949,29 @@ export function InputArea({
           vscodeApi={vscodeApi}
         />
       )}
-      {slashOpen &&
-        filteredSlashCommands.length > 0 &&
-        !matchedSlashCommand && (
-          <SlashCommandPopup
-            commands={filteredSlashCommands}
-            selectedIndex={slashSelectedIdx}
-            anchor={getPickerAnchor()}
-            onSelect={handleSlashSelect}
-            onClose={closeSlash}
-            isSubView={slashView !== "main"}
-            subViewTitle={
-              slashView === "mode"
-                ? "Switch Mode"
-                : slashView === "model"
-                  ? "Switch Model"
-                  : slashView === "mcp"
-                    ? "Open MCP Config"
-                    : undefined
-            }
-            onBack={() => {
-              setSlashView("main");
-              setSlashSelectedIdx(0);
-            }}
-          />
-        )}
+      {shouldShowSlashPopup && (
+        <SlashCommandPopup
+          commands={filteredSlashCommands}
+          selectedIndex={slashSelectedIdx}
+          anchor={getPickerAnchor()}
+          onSelect={handleSlashSelect}
+          onClose={closeSlash}
+          isSubView={slashView !== "main"}
+          subViewTitle={
+            slashView === "mode"
+              ? "Switch Mode"
+              : slashView === "model"
+                ? "Switch Model"
+                : slashView === "mcp"
+                  ? "Open MCP Config"
+                  : undefined
+          }
+          onBack={() => {
+            setSlashView("main");
+            setSlashSelectedIdx(0);
+          }}
+        />
+      )}
       <div
         class={`input-wrapper ${dragOver ? "drag-over" : ""} ${pickerOpen ? "picker-active" : ""} ${matchedExecutableSlashCommand ? "slash-match-active" : ""}`}
         ref={inputWrapperRef}

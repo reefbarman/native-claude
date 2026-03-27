@@ -146,7 +146,7 @@ export const TOOL_REGISTRY: Record<string, ToolMeta> = {
   execute_command: {
     label: "Integrated terminal",
     description:
-      "Run a command in VS Code's integrated terminal. Use `background` for long-running processes and `timeout` for quick commands. If the response includes `output_file`, read that file instead of re-running the command. Piped `grep`/`head`/`tail` patterns are rejected; use `output_grep`, `output_head`, or `output_tail` instead. Interactive commands are rejected unless you switch to a non-interactive form.",
+      "Run a command in VS Code's integrated terminal. Sequential calls automatically reuse an idle default terminal — avoid creating named terminals unless you intentionally need separation (parallel/background work or temporary environment isolation). Use `background` for long-running processes and `timeout` for quick commands. If the response includes `output_file`, read that file instead of re-running the command. Piped `grep`/`head`/`tail` patterns are rejected; use `output_grep`, `output_head`, or `output_tail` instead. Interactive commands are rejected unless you switch to a non-interactive form.",
   },
   get_terminal_output: {
     label: "Read background terminal output",

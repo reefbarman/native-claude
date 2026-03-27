@@ -171,6 +171,10 @@ Useful command-palette entries include:
 - **AgentLink: Configure Agents**
 - **AgentLink: Sign In to OpenAI/Codex**
 - **AgentLink: Manage OpenAI/Codex Authentication**
+- **AgentLink: Manage ChatGPT/Codex Accounts**
+- **AgentLink: Add ChatGPT/Codex Account**
+- **AgentLink: Switch Active ChatGPT/Codex Account**
+- **AgentLink: Re-sign In / Replace ChatGPT/Codex Account**
 - **AgentLink: Set OpenAI API Key**
 - **AgentLink: Rebuild Codebase Index** / **AgentLink: Cancel Indexing**
 - **AgentLink: Clear Session Approvals**
@@ -680,6 +684,8 @@ For single-file edits, prefer `apply_diff` — it provides better diff review an
 
 Run a command in VS Code's integrated terminal. Output is captured when shell integration is available.
 
+By default, AgentLink reuses an existing idle terminal for sequential commands. Omit `terminal_name` and `terminal_id` unless you intentionally need a separate terminal (parallel work, long-running background process, or temporary environment isolation).
+
 **Interactive command validation:** Commands that require interactive input are automatically rejected with a helpful suggestion.
 
 Output is capped to the **last 200 lines** by default. Full output is saved to a temp file (returned as `output_file`) for on-demand access via `read_file`. Use `output_head`, `output_tail`, or `output_grep` to customize filtering.
@@ -690,9 +696,9 @@ Common response fields include `terminal_id` (for reuse/polling), `output`, and 
 | --------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `command`             | string   | Shell command to execute                                                                                                                                |
 | `cwd`                 | string?  | Working directory                                                                                                                                       |
-| `terminal_id`         | string?  | Reuse a specific terminal by ID                                                                                                                         |
-| `terminal_name`       | string?  | Run in a named terminal (e.g. `Server`, `Tests`)                                                                                                        |
-| `split_from`          | string?  | Split alongside an existing terminal, creating a visual group                                                                                           |
+| `terminal_id`         | string?  | Reuse a specific terminal by ID. Usually omit for sequential commands so AgentLink can auto-reuse the default terminal.                                 |
+| `terminal_name`       | string?  | Run in a named terminal (e.g. `Server`, `Tests`). Use only when intentionally creating/reusing a separate terminal.                                     |
+| `split_from`          | string?  | Split alongside an existing terminal, creating a visual group (for intentionally separate terminals).                                                   |
 | `background`          | boolean? | Run without waiting for completion. Returns immediately with `terminal_id`. Use `get_terminal_output` to check progress.                                |
 | `timeout`             | number?  | Timeout in seconds. Timed-out commands transition to background state — use `get_terminal_output` with the returned `terminal_id` to check on progress. |
 | `output_head`         | number?  | Return only the first N lines of output                                                                                                                 |
@@ -705,6 +711,8 @@ Common response fields include `terminal_id` (for reuse/polling), `output`, and 
 ### close_terminals
 
 Close managed terminals. With no arguments, closes all terminals created by AgentLink.
+
+Use this proactively to clean up dedicated terminals you created for background/parallel work once they are no longer needed.
 
 | Parameter | Type      | Description                                                                      |
 | --------- | --------- | -------------------------------------------------------------------------------- |

@@ -12,6 +12,7 @@ import { BgAgentResultBlock } from "./BgAgentResultBlock";
 import { BgQuestionBlock } from "./BgQuestionBlock";
 import { QuestionAnswerBlock } from "./QuestionAnswerBlock";
 import type { BgSessionInfoProps } from "./BackgroundSessionStrip";
+import { matchFilePaths } from "./filePathLinks";
 
 /**
  * Derive a short activity label from the current message blocks.
@@ -47,6 +48,8 @@ interface MessageBubbleProps {
   }) => void;
   onRetry?: () => void;
   onSignIn?: () => void;
+  onSignInAnotherAccount?: () => void;
+  onCondense?: () => void;
   bgSessions?: BgSessionInfoProps[];
   onStopBackground?: (sessionId: string) => void;
   onOpenTranscript?: (sessionId: string) => void;
@@ -59,6 +62,8 @@ export function MessageBubble({
   onOpenSpecialBlockPanel,
   onRetry,
   onSignIn,
+  onSignInAnotherAccount,
+  onCondense,
   bgSessions,
   onStopBackground,
   onOpenTranscript,
@@ -72,15 +77,6 @@ export function MessageBubble({
   }, [streaming]);
 
   if (message.role === "user") {
-    // Slash command display — render as a compact pill, not a full bubble
-    if (message.isSlashCommand) {
-      return (
-        <div class="message slash-cmd-message">
-          <i class="codicon codicon-terminal slash-cmd-msg-icon" />
-          <span class="slash-cmd-msg-name">{message.content}</span>
-        </div>
-      );
-    }
     // Annotation messages (follow-up / rejection from approval cards)
     if (message.badge) {
       const isReject = message.badge === "rejection";
@@ -102,14 +98,35 @@ export function MessageBubble({
       );
     }
     const { files, mediaLabel, cleanText } = parseAttachments(message.content);
-    const hasAttachments = files.length > 0 || mediaLabel !== null;
+    const slashLabel = message.slashCommandLabel;
+    const hasSlashLabel = Boolean(message.isSlashCommand && slashLabel);
+    const isStandaloneSlashCommand =
+      hasSlashLabel &&
+      cleanText.length > 0 &&
+      cleanText === slashLabel &&
+      files.length === 0 &&
+      mediaLabel === null;
+
+    if (isStandaloneSlashCommand) {
+      return (
+        <div class="message user-message">
+          <SlashCommandToolCall label={slashLabel!} />
+          <CopyButton text={message.content} />
+        </div>
+      );
+    }
+
+    const showAttachmentRow =
+      files.length > 0 || mediaLabel !== null || hasSlashLabel;
+
     return (
       <div class="message user-message">
         <div class="message-content user-content">
-          {hasAttachments && (
+          {showAttachmentRow && (
             <UserAttachments
               files={files}
               mediaLabel={mediaLabel}
+              slashLabel={hasSlashLabel ? slashLabel : undefined}
               onOpenFile={onOpenFile}
             />
           )}
@@ -246,8 +263,12 @@ export function MessageBubble({
         <ErrorBlock
           error={message.error.message}
           retryable={message.error.retryable}
+          code={message.error.code}
+          actions={message.error.actions}
           onRetry={onRetry}
           onSignIn={onSignIn}
+          onSignInAnotherAccount={onSignInAnotherAccount}
+          onCondense={onCondense}
         />
       )}
     </div>
@@ -291,13 +312,15 @@ function parseAttachments(content: string): {
 function UserAttachments({
   files,
   mediaLabel,
+  slashLabel,
   onOpenFile,
 }: {
   files: string[];
   mediaLabel: string | null;
+  slashLabel?: string;
   onOpenFile?: (path: string, line?: number) => void;
 }) {
-  if (files.length === 0 && !mediaLabel) return null;
+  if (files.length === 0 && !mediaLabel && !slashLabel) return null;
 
   return (
     <div class="user-attachments">
@@ -329,13 +352,31 @@ function UserAttachments({
           <span class="user-attachment-chip-name">{mediaLabel}</span>
         </span>
       )}
+      {slashLabel && (
+        <span class="user-attachment-chip user-attachment-slash-command">
+          <i class="codicon codicon-terminal" />
+          <span class="user-attachment-chip-name">{slashLabel}</span>
+        </span>
+      )}
     </div>
   );
 }
 
-// FILE_PATH_RE for plain text (user messages) — same pattern as StreamingText
-const FILE_PATH_RE =
-  /(?<![:/])\b((?:(?:\/[\w.-]+)+|[\w][\w-]*(?:\/[\w.-]+)+)\.\w{1,8})(?::(\d+)(?:-\d+)?)?/g;
+function SlashCommandToolCall({ label }: { label: string }) {
+  const firstSpace = label.indexOf(" ");
+  const command = firstSpace >= 0 ? label.slice(0, firstSpace) : label;
+  const args = firstSpace >= 0 ? label.slice(firstSpace + 1).trim() : "";
+
+  return (
+    <div class="tool-call-block slash-standalone-command-block">
+      <div class="slash-standalone-command-row">
+        <i class="codicon codicon-terminal slash-standalone-command-icon" />
+        <span class="slash-standalone-command-name">{command}</span>
+        {args && <span class="slash-standalone-command-args">{args}</span>}
+      </div>
+    </div>
+  );
+}
 
 function UserText({
   text,
@@ -348,31 +389,26 @@ function UserText({
 
   const parts: ComponentChild[] = [];
   let lastIndex = 0;
-  let match: RegExpExecArray | null;
-  FILE_PATH_RE.lastIndex = 0;
 
-  while ((match = FILE_PATH_RE.exec(text)) !== null) {
+  for (const match of matchFilePaths(text)) {
     if (match.index > lastIndex) {
       parts.push(text.slice(lastIndex, match.index));
     }
-    const filePath = match[1];
-    const line = match[2] ? parseInt(match[2], 10) : undefined;
-    const idx = match.index;
     parts.push(
       <a
-        key={idx}
+        key={match.index}
         class="file-path-link"
         href="#"
-        title={`Open ${filePath}${line !== undefined ? `:${line}` : ""}`}
+        title={`Open ${match.filePath}${match.line !== undefined ? `:${match.line}` : ""}`}
         onClick={(e: MouseEvent) => {
           e.preventDefault();
-          onOpenFile(filePath, line);
+          onOpenFile(match.filePath, match.line);
         }}
       >
-        {match[0]}
+        {match.fullMatch}
       </a>,
     );
-    lastIndex = match.index + match[0].length;
+    lastIndex = match.index + match.fullMatch.length;
   }
 
   if (parts.length === 0) return <>{text}</>;

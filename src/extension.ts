@@ -33,12 +33,17 @@ import {
 
 import { setStoredAnthropicApiKey } from "./agent/clientFactory.js";
 import { IndexerManager } from "./indexer/IndexerManager.js";
+import type { SemanticReadinessReason } from "./shared/semanticReadiness.js";
 import { ChatViewProvider } from "./agent/ChatViewProvider.js";
 import { AgentSessionManager } from "./agent/AgentSessionManager.js";
 import {
   getConfiguredBaseThresholdForModel,
   getMigratedModelCondenseThresholdMap,
 } from "./agent/modelCondenseThresholds.js";
+import {
+  resolveModelForMode,
+  FALLBACK_AGENT_MODEL,
+} from "./agent/modeModelPreferences.js";
 import { SessionStore } from "./agent/SessionStore.js";
 import type { AgentConfig } from "./agent/types.js";
 import { AgentCodeActionProvider } from "./agent/AgentCodeActionProvider.js";
@@ -48,6 +53,7 @@ import {
   CodexProvider,
   openAiCodexAuthManager,
 } from "./agent/providers/index.js";
+import type { CodexCredentials } from "./agent/providers/codex/CodexOAuthManager.js";
 import { CodexOAuthFlowError } from "./agent/providers/codex/CodexOAuthManager.js";
 
 export const DIFF_VIEW_URI_SCHEME = "agentlink-diff";
@@ -66,6 +72,9 @@ let activeAuthToken: string | undefined;
 let indexerManager: IndexerManager | null = null;
 let chatViewProvider: ChatViewProvider;
 let agentSessionManager: AgentSessionManager;
+
+const SEMANTIC_SETUP_PROMPT_DISMISSED_KEY =
+  "semanticSetupPromptDismissedGlobally";
 
 function log(message: string): void {
   const timestamp = new Date().toISOString();
@@ -95,6 +104,40 @@ function getOrCreateAuthToken(context: vscode.ExtensionContext): string {
     log("Generated new auth token");
   }
   return token;
+}
+
+function getSemanticSetupTitle(reason?: SemanticReadinessReason): string {
+  switch (reason) {
+    case "missing_embeddings_auth":
+      return "Set up semantic search: OpenAI API key required";
+    case "missing_index":
+      return "Set up semantic search: build codebase index";
+    case "qdrant_unavailable":
+      return "Semantic search unavailable: Qdrant is not reachable";
+    case "disabled":
+      return "Semantic search is disabled";
+    case "no_workspace":
+      return "Semantic search requires an open workspace";
+    default:
+      return "Set up semantic search";
+  }
+}
+
+function getSemanticSetupDetail(reason?: SemanticReadinessReason): string {
+  switch (reason) {
+    case "missing_embeddings_auth":
+      return "Semantic indexing and search need embeddings auth. Configure an OpenAI API key for embeddings, or use API key mode for models + embeddings.";
+    case "missing_index":
+      return "Embeddings auth is configured, but this workspace has not been indexed yet.";
+    case "qdrant_unavailable":
+      return "Qdrant must be reachable at the configured URL before semantic indexing/search can run.";
+    case "disabled":
+      return "Enable agentlink.semanticSearchEnabled in settings to use semantic indexing and search.";
+    case "no_workspace":
+      return "Open a workspace folder to build and query a semantic codebase index.";
+    default:
+      return "Semantic search requires setup before it can run.";
+  }
 }
 
 // --- Multi-agent config management ---
@@ -451,6 +494,183 @@ function showAgentPickerInSidebar(): void {
   vscode.commands.executeCommand("agentLink.statusView.focus");
 }
 
+async function promptForCodexAccountLabel(
+  defaultValue = "",
+): Promise<string | undefined> {
+  const label = await vscode.window.showInputBox({
+    title: "Codex Account Label",
+    prompt:
+      "Optional: name this Codex OAuth account (email is used automatically when available).",
+    value: defaultValue,
+    ignoreFocusOut: true,
+  });
+  return label?.trim() || undefined;
+}
+
+async function completeCodexOAuthSignIn(options?: {
+  replaceAccountId?: string;
+  forceLabelPrompt?: boolean;
+}): Promise<{
+  accountLabel: string;
+  accountEmail?: string;
+  action: "added" | "updated" | "replaced";
+  accountId: string;
+} | null> {
+  const authUrl = openAiCodexAuthManager.startAuthorizationFlow();
+  await vscode.env.openExternal(vscode.Uri.parse(authUrl));
+  log("[codex] Opened browser for OAuth sign-in");
+
+  const creds: CodexCredentials =
+    await openAiCodexAuthManager.waitForCallback();
+  const label =
+    options?.forceLabelPrompt || !creds.email
+      ? await promptForCodexAccountLabel(creds.email ?? "")
+      : undefined;
+
+  const result = await openAiCodexAuthManager.saveOAuthCredentials(creds, {
+    replaceAccountId: options?.replaceAccountId,
+    label,
+    makeActive: true,
+  });
+
+  return {
+    accountLabel: result.account.label,
+    accountEmail: result.account.email,
+    action: result.action,
+    accountId: result.account.id,
+  };
+}
+
+async function pickOAuthAccount(
+  title: string,
+  placeHolder: string,
+): Promise<
+  | {
+      id: string;
+      label: string;
+      email?: string;
+      chatgptAccountId?: string;
+      isActive: boolean;
+    }
+  | undefined
+> {
+  const accounts = await openAiCodexAuthManager.listOAuthAccounts();
+  if (accounts.length === 0) {
+    vscode.window.showInformationMessage(
+      "No ChatGPT/Codex OAuth accounts are signed in.",
+    );
+    return undefined;
+  }
+
+  const picked = await vscode.window.showQuickPick(
+    accounts.map((a) => ({
+      label: `${a.isActive ? "$(check) " : ""}${a.label}`,
+      description: a.email ?? a.chatgptAccountId ?? a.id,
+      detail: a.isActive ? "Active account" : undefined,
+      account: a,
+    })),
+    {
+      title,
+      placeHolder,
+      ignoreFocusOut: true,
+    },
+  );
+
+  return picked?.account;
+}
+
+async function manageCodexAccountsFlow(): Promise<void> {
+  const accounts = await openAiCodexAuthManager.listOAuthAccounts();
+  if (accounts.length === 0) {
+    vscode.window.showInformationMessage(
+      "No ChatGPT/Codex OAuth accounts are signed in yet.",
+    );
+    return;
+  }
+
+  const account = await pickOAuthAccount(
+    "Manage ChatGPT/Codex Accounts",
+    "Select an account",
+  );
+  if (!account) return;
+
+  const action = await vscode.window.showQuickPick(
+    [
+      { label: "Set active", value: "setActive" },
+      { label: "Re-sign in / replace", value: "replace" },
+      { label: "Rename label", value: "rename" },
+      { label: "Remove account", value: "remove" },
+    ],
+    {
+      title: `Manage account: ${account.label}`,
+      ignoreFocusOut: true,
+    },
+  );
+
+  if (!action) return;
+
+  if (action.value === "setActive") {
+    await openAiCodexAuthManager.setActiveOAuthAccount(account.id);
+    vscode.window.showInformationMessage(
+      `Active Codex account set to ${account.label}.`,
+    );
+    return;
+  }
+
+  if (action.value === "replace") {
+    try {
+      const result = await completeCodexOAuthSignIn({
+        replaceAccountId: account.id,
+      });
+      if (!result) return;
+      vscode.window.showInformationMessage(
+        `Updated ChatGPT/Codex account ${result.accountLabel}${
+          result.accountEmail ? ` (${result.accountEmail})` : ""
+        }.`,
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log(`[codex] Re-sign-in failed: ${message}`);
+      if (err instanceof CodexOAuthFlowError && err.code === "timeout") {
+        vscode.window.showWarningMessage(
+          "OpenAI/Codex sign-in timed out. If the browser flow is still open, close it and try again.",
+        );
+      } else if (
+        err instanceof CodexOAuthFlowError &&
+        err.code === "port_in_use"
+      ) {
+        vscode.window.showErrorMessage(
+          "OpenAI/Codex sign-in couldn't start because port 1455 is already in use. Close other Codex/Roo login flows and try again.",
+        );
+      } else {
+        vscode.window.showErrorMessage(`Codex sign-in failed: ${message}`);
+      }
+    }
+    return;
+  }
+
+  if (action.value === "rename") {
+    const nextLabel = await promptForCodexAccountLabel(account.label);
+    if (!nextLabel) return;
+    await openAiCodexAuthManager.updateOAuthAccountLabel(account.id, nextLabel);
+    vscode.window.showInformationMessage(
+      `Updated account label to ${nextLabel}.`,
+    );
+    return;
+  }
+
+  if (action.value === "remove") {
+    const confirm = await vscode.window.showWarningMessage(
+      `Remove ChatGPT/Codex account ${account.label}?`,
+      { modal: true },
+      "Remove",
+    );
+    if (confirm !== "Remove") return;
+    await openAiCodexAuthManager.removeOAuthAccount(account.id);
+    vscode.window.showInformationMessage(`Removed account ${account.label}.`);
+  }
+}
+
 export function activate(context: vscode.ExtensionContext): void {
   outputChannel = vscode.window.createOutputChannel("AgentLink");
   context.subscriptions.push(outputChannel);
@@ -530,10 +750,15 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
   const sessionStore = new SessionStore(workspaceCwd);
   const explicitAgentModel = getExplicitAgentModel(agentConfiguration);
+  const configuredMode =
+    agentConfiguration.get<string>("defaultMode")?.trim() || "code";
   const configuredModel =
     explicitAgentModel ??
-    agentConfiguration.get<string>("agentModel") ??
-    "claude-sonnet-4-6";
+    resolveModelForMode(
+      agentConfiguration,
+      configuredMode,
+      FALLBACK_AGENT_MODEL,
+    );
   const startupModel =
     explicitAgentModel ?? sessionStore.list()[0]?.model ?? configuredModel;
   const migratedThresholds = getMigratedModelCondenseThresholdMap(
@@ -646,6 +871,8 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (
         e.affectsConfiguration("agentlink.agentModel") ||
+        e.affectsConfiguration("agentlink.modeModelPreferences") ||
+        e.affectsConfiguration("agentlink.defaultMode") ||
         e.affectsConfiguration("agentlink.agentMaxTokens") ||
         e.affectsConfiguration("agentlink.thinkingBudget") ||
         e.affectsConfiguration("agentlink.showThinking") ||
@@ -656,7 +883,14 @@ export function activate(context: vscode.ExtensionContext): void {
         e.affectsConfiguration("agentlink.codexStoreResponses")
       ) {
         const config = vscode.workspace.getConfiguration("agentlink");
-        const model = config.get<string>("agentModel") ?? "claude-sonnet-4-6";
+        const fgMode = agentSessionManager.getForegroundSession()?.mode;
+        const effectiveMode =
+          fgMode ?? config.get<string>("defaultMode")?.trim() ?? "code";
+        const model = resolveModelForMode(
+          config,
+          effectiveMode,
+          FALLBACK_AGENT_MODEL,
+        );
         agentSessionManager.updateConfig({
           model,
           maxTokens: config.get<number>("agentMaxTokens") ?? 8192,
@@ -723,6 +957,106 @@ export function activate(context: vscode.ExtensionContext): void {
       );
     }),
     vscode.commands.registerCommand(
+      "agentlink.setupSemanticSearch",
+      async (reason?: SemanticReadinessReason) => {
+        const action = await vscode.window.showQuickPick(
+          [
+            {
+              label: "Set OpenAI API key for embeddings only",
+              description:
+                "Best when model chat already uses OAuth and only embeddings setup is missing",
+              value: "embeddingsKey",
+            },
+            {
+              label: "Set OpenAI API key for models + embeddings",
+              description:
+                "Use one API key for model chat and semantic search/indexing",
+              value: "modelsAndEmbeddingsKey",
+            },
+            {
+              label: "Sign in with ChatGPT/Codex (OAuth)",
+              description:
+                "Model-chat auth only. Embeddings still require an API key",
+              value: "oauth",
+            },
+            {
+              label: "Build/Rebuild codebase index",
+              description:
+                "Use after embeddings auth is configured for this workspace",
+              value: "rebuild",
+            },
+            {
+              label: "Open AgentLink settings",
+              value: "settings",
+            },
+          ],
+          {
+            title: getSemanticSetupTitle(reason),
+            placeHolder: getSemanticSetupDetail(reason),
+            ignoreFocusOut: true,
+          },
+        );
+
+        if (!action) return;
+
+        if (action.value === "embeddingsKey") {
+          await vscode.commands.executeCommand("agentlink.setOpenaiApiKey");
+          const start = await vscode.window.showInformationMessage(
+            "Embeddings key configured. Start indexing now?",
+            "Index Codebase",
+          );
+          if (start === "Index Codebase") {
+            await vscode.commands.executeCommand("agentlink.rebuildIndex");
+          }
+          return;
+        }
+
+        if (action.value === "modelsAndEmbeddingsKey") {
+          const key = await vscode.window.showInputBox({
+            title: "OpenAI API Key",
+            prompt:
+              "Enter your OpenAI API key for models and embeddings. OAuth remains preferred for model chat if also configured.",
+            password: true,
+            ignoreFocusOut: true,
+            validateInput: (v) => (v.trim() ? null : "API key cannot be empty"),
+          });
+          if (!key) return;
+          await openAiCodexAuthManager.storeApiKey(
+            key.trim(),
+            "models+embeddings",
+          );
+          vscode.window.showInformationMessage(
+            "OpenAI API key stored securely for models and embeddings.",
+          );
+          const start = await vscode.window.showInformationMessage(
+            "API key configured. Start indexing now?",
+            "Index Codebase",
+          );
+          if (start === "Index Codebase") {
+            await vscode.commands.executeCommand("agentlink.rebuildIndex");
+          }
+          return;
+        }
+
+        if (action.value === "oauth") {
+          await vscode.commands.executeCommand("agentlink.codexSignIn");
+          return;
+        }
+
+        if (action.value === "rebuild") {
+          await vscode.commands.executeCommand("agentlink.rebuildIndex");
+          return;
+        }
+
+        if (action.value === "settings") {
+          await vscode.commands.executeCommand(
+            "workbench.action.openSettings",
+            "agentlink",
+          );
+        }
+      },
+    ),
+    vscode.commands.registerCommand(
       "agentlink.setAnthropicApiKey",
       async () => {
         const key = await vscode.window.showInputBox({
@@ -787,61 +1121,111 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("agentlink.installHooks", () => {
       installHooks(context.extensionUri, log);
     }),
-    vscode.commands.registerCommand("agentlink.codexSignIn", async () => {
-      const choice = await vscode.window.showQuickPick(
-        [
-          {
-            label: "Sign in with ChatGPT/Codex",
-            description: "Use your ChatGPT/Codex OAuth session for model chat",
-            value: "oauth",
-          },
-          {
-            label: "Use OpenAI API key",
-            description: "Use an OpenAI API key for models and embeddings",
-            value: "apiKey",
-          },
-        ],
-        {
-          title: "OpenAI/Codex Authentication",
-          placeHolder:
-            "Choose model auth. Embeddings always use an API key. OAuth is preferred for model chat when both are configured.",
-          ignoreFocusOut: true,
-        },
-      );
-      if (!choice) return;
+    vscode.commands.registerCommand(
+      "agentlink.codexSignIn",
+      async (preferredChoice?: "apiKeyOnly") => {
+        const choice =
+          preferredChoice === "apiKeyOnly"
+            ? { value: "apiKey" }
+            : await vscode.window.showQuickPick(
+                [
+                  {
+                    label: "Sign in with ChatGPT/Codex",
+                    description:
+                      "Use your ChatGPT/Codex OAuth sessions for model chat",
+                    value: "oauth",
+                  },
+                  {
+                    label: "Use OpenAI API key",
+                    description:
+                      "Use an OpenAI API key for models and embeddings",
+                    value: "apiKey",
+                  },
+                ],
+                {
+                  title: "OpenAI/Codex Authentication",
+                  placeHolder:
+                    "Choose model auth. Embeddings always use an API key. OAuth is preferred for model chat when both are configured.",
+                  ignoreFocusOut: true,
+                },
+              );
+        if (!choice) return;
 
-      if (choice.value === "apiKey") {
-        const key = await vscode.window.showInputBox({
-          title: "OpenAI API Key",
-          prompt:
-            "Enter your OpenAI API key for models and embeddings. OAuth remains preferred for model chat if also configured.",
-          password: true,
-          ignoreFocusOut: true,
-          validateInput: (v) => (v.trim() ? null : "API key cannot be empty"),
-        });
-        if (!key) return;
-        await openAiCodexAuthManager.storeApiKey(
-          key.trim(),
-          "models+embeddings",
-        );
-        vscode.window.showInformationMessage(
-          "OpenAI API key stored securely for models and embeddings.",
-        );
-        return;
-      }
+        if (choice.value === "apiKey") {
+          const key = await vscode.window.showInputBox({
+            title: "OpenAI API Key",
+            prompt:
+              "Enter your OpenAI API key for models and embeddings. OAuth remains preferred for model chat if also configured.",
+            password: true,
+            ignoreFocusOut: true,
+            validateInput: (v) => (v.trim() ? null : "API key cannot be empty"),
+          });
+          if (!key) return;
+          await openAiCodexAuthManager.storeApiKey(
+            key.trim(),
+            "models+embeddings",
+          );
+          vscode.window.showInformationMessage(
+            "OpenAI API key stored securely for models and embeddings.",
+          );
+          return;
+        }
 
+        try {
+          const result = await completeCodexOAuthSignIn();
+          if (!result) return;
+          log(
+            `[codex] Signed in as ${result.accountEmail ?? result.accountLabel}`,
+          );
+          vscode.window.showInformationMessage(
+            `${
+              result.action === "added"
+                ? "Added"
+                : result.action === "updated"
+                  ? "Updated"
+                  : "Replaced"
+            } ChatGPT/Codex account ${result.accountLabel}${
+              result.accountEmail ? ` (${result.accountEmail})` : ""
+            }. OAuth is preferred for model chat and will round-robin on usage-limit 429s.`,
+          );
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          log(`[codex] Sign-in failed: ${message}`);
+          if (err instanceof CodexOAuthFlowError && err.code === "timeout") {
+            vscode.window.showWarningMessage(
+              "OpenAI/Codex sign-in timed out. If the browser flow is still open, close it and try again.",
+            );
+          } else if (
+            err instanceof CodexOAuthFlowError &&
+            err.code === "port_in_use"
+          ) {
+            vscode.window.showErrorMessage(
+              "OpenAI/Codex sign-in couldn't start because port 1455 is already in use. Close other Codex/Roo login flows and try again.",
+            );
+          } else {
+            vscode.window.showErrorMessage(`Codex sign-in failed: ${message}`);
+          }
+        }
+      },
+    ),
+    vscode.commands.registerCommand("agentlink.codexAddAccount", async () => {
       try {
-        const authUrl = openAiCodexAuthManager.startAuthorizationFlow();
-        await vscode.env.openExternal(vscode.Uri.parse(authUrl));
-        log("[codex] Opened browser for OAuth sign-in");
-        const creds = await openAiCodexAuthManager.waitForCallback();
-        log(`[codex] Signed in as ${creds.email ?? "unknown"}`);
+        const result = await completeCodexOAuthSignIn();
+        if (!result) return;
+        const actionLabel =
+          result.action === "added"
+            ? "Added"
+            : result.action === "updated"
+              ? "Updated"
+              : "Replaced";
         vscode.window.showInformationMessage(
-          `Signed in with ChatGPT/Codex${creds.email ? ` as ${creds.email}` : ""}. This OAuth session is preferred for model chat. Semantic search/indexing embeddings use your OpenAI API key.`,
+          `${actionLabel} ChatGPT/Codex account ${result.accountLabel}${
+            result.accountEmail ? ` (${result.accountEmail})` : ""
+          } and set it active.`,
         );
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        log(`[codex] Sign-in failed: ${message}`);
+        log(`[codex] Add-account sign-in failed: ${message}`);
         if (err instanceof CodexOAuthFlowError && err.code === "timeout") {
           vscode.window.showWarningMessage(
             "OpenAI/Codex sign-in timed out. If the browser flow is still open, close it and try again.",
@@ -854,10 +1238,72 @@ export function activate(context: vscode.ExtensionContext): void {
             "OpenAI/Codex sign-in couldn't start because port 1455 is already in use. Close other Codex/Roo login flows and try again.",
           );
         } else {
-          vscode.window.showErrorMessage(`Codex sign-in failed: ${message}`);
+          vscode.window.showErrorMessage(
+            `Codex add-account failed: ${message}`,
+          );
         }
       }
     }),
+    vscode.commands.registerCommand(
+      "agentlink.codexSwitchAccount",
+      async () => {
+        const account = await pickOAuthAccount(
+          "Switch Active ChatGPT/Codex Account",
+          "Select an account to make active",
+        );
+        if (!account) return;
+        await openAiCodexAuthManager.setActiveOAuthAccount(account.id);
+        vscode.window.showInformationMessage(
+          `Active Codex account set to ${account.label}.`,
+        );
+      },
+    ),
+    vscode.commands.registerCommand(
+      "agentlink.codexReplaceAccount",
+      async () => {
+        const account = await pickOAuthAccount(
+          "Replace ChatGPT/Codex Account",
+          "Select an account to re-sign in / replace",
+        );
+        if (!account) return;
+        try {
+          const result = await completeCodexOAuthSignIn({
+            replaceAccountId: account.id,
+          });
+          if (!result) return;
+          vscode.window.showInformationMessage(
+            `Replaced account ${result.accountLabel}${
+              result.accountEmail ? ` (${result.accountEmail})` : ""
+            } and set it active.`,
+          );
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          log(`[codex] Replace-account sign-in failed: ${message}`);
+          if (err instanceof CodexOAuthFlowError && err.code === "timeout") {
+            vscode.window.showWarningMessage(
+              "OpenAI/Codex sign-in timed out. If the browser flow is still open, close it and try again.",
+            );
+          } else if (
+            err instanceof CodexOAuthFlowError &&
+            err.code === "port_in_use"
+          ) {
+            vscode.window.showErrorMessage(
+              "OpenAI/Codex sign-in couldn't start because port 1455 is already in use. Close other Codex/Roo login flows and try again.",
+            );
+          } else {
+            vscode.window.showErrorMessage(
+              `Codex replace-account failed: ${message}`,
+            );
+          }
+        }
+      },
+    ),
+    vscode.commands.registerCommand(
+      "agentlink.codexManageAccounts",
+      async () => {
+        await manageCodexAccountsFlow();
+      },
+    ),
     vscode.commands.registerCommand("agentlink.codexSignOut", async () => {
       const hasOAuth = await openAiCodexAuthManager.hasOAuth();
       const hasApiKey = await openAiCodexAuthManager.hasApiKey();
@@ -866,8 +1312,13 @@ export function activate(context: vscode.ExtensionContext): void {
         const choice = await vscode.window.showQuickPick(
           [
             {
-              label: "Remove ChatGPT/Codex sign-in",
-              description: "Removes the preferred OAuth session",
+              label: "Remove one ChatGPT/Codex account",
+              description: "Keeps other signed-in OAuth accounts",
+              value: "removeOneOAuth",
+            },
+            {
+              label: "Remove all ChatGPT/Codex accounts",
+              description: "Clears all OAuth sessions",
               value: "oauth",
             },
             {
@@ -877,7 +1328,7 @@ export function activate(context: vscode.ExtensionContext): void {
             },
             {
               label: "Remove both",
-              description: "Clears both OAuth and API-key auth",
+              description: "Clears OAuth accounts and API key",
               value: "both",
             },
           ],
@@ -889,7 +1340,15 @@ export function activate(context: vscode.ExtensionContext): void {
           },
         );
         if (!choice) return;
-        if (choice.value === "oauth") {
+
+        if (choice.value === "removeOneOAuth") {
+          const account = await pickOAuthAccount(
+            "Remove ChatGPT/Codex Account",
+            "Select an account to remove",
+          );
+          if (!account) return;
+          await openAiCodexAuthManager.removeOAuthAccount(account.id);
+        } else if (choice.value === "oauth") {
           await openAiCodexAuthManager.clearOAuth();
         } else if (choice.value === "apiKey") {
           await openAiCodexAuthManager.clearApiKey();
@@ -904,11 +1363,37 @@ export function activate(context: vscode.ExtensionContext): void {
       }
 
       if (hasOAuth) {
-        await openAiCodexAuthManager.clearOAuth();
+        const accounts = await openAiCodexAuthManager.listOAuthAccounts();
+        if (accounts.length > 1) {
+          const action = await vscode.window.showQuickPick(
+            [
+              { label: "Remove one account", value: "one" },
+              { label: "Remove all accounts", value: "all" },
+            ],
+            {
+              title: "Remove ChatGPT/Codex Account",
+              ignoreFocusOut: true,
+            },
+          );
+          if (!action) return;
+          if (action.value === "one") {
+            const account = await pickOAuthAccount(
+              "Remove ChatGPT/Codex Account",
+              "Select an account to remove",
+            );
+            if (!account) return;
+            await openAiCodexAuthManager.removeOAuthAccount(account.id);
+          } else {
+            await openAiCodexAuthManager.clearOAuth();
+          }
+        } else {
+          await openAiCodexAuthManager.clearOAuth();
+        }
+
         vscode.window.showInformationMessage(
-          "Removed ChatGPT/Codex sign-in. AgentLink will use your OpenAI API key for models (if scoped for models) and for embeddings.",
+          "Updated ChatGPT/Codex OAuth accounts.",
         );
-        log("[codex] Signed out OAuth session");
+        log("[codex] Updated OAuth accounts");
         return;
       }
 
@@ -1040,6 +1525,41 @@ export function activate(context: vscode.ExtensionContext): void {
       sidebarProvider.updateIndexStatus(status);
       if (status.state === "error" && status.error) {
         statusBarManager.setError(`Indexing: ${status.error}`);
+
+        const dismissed = context.globalState.get<boolean>(
+          SEMANTIC_SETUP_PROMPT_DISMISSED_KEY,
+          false,
+        );
+        if (
+          !dismissed &&
+          status.readinessReason &&
+          (status.readinessReason === "missing_embeddings_auth" ||
+            status.readinessReason === "missing_index" ||
+            status.readinessReason === "qdrant_unavailable" ||
+            status.readinessReason === "disabled")
+        ) {
+          void vscode.window
+            .showInformationMessage(
+              "Semantic search/indexing needs setup.",
+              "Set Up Semantic Search",
+              "Dismiss",
+            )
+            .then(async (choice) => {
+              if (choice === "Set Up Semantic Search") {
+                await vscode.commands.executeCommand(
+                  "agentlink.setupSemanticSearch",
+                  status.readinessReason,
+                );
+                return;
+              }
+              if (choice === "Dismiss") {
+                await context.globalState.update(
+                  SEMANTIC_SETUP_PROMPT_DISMISSED_KEY,
+                  true,
+                );
+              }
+            });
+        }
       } else if (status.state !== "error") {
         statusBarManager.clearError();
       }
@@ -1065,6 +1585,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // Cleanup on deactivation
   context.subscriptions.push({
     dispose: () => {
+      agentSessionManager.saveAllSessions();
       stopServer();
       disposeTerminalManager();
     },

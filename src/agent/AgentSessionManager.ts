@@ -26,6 +26,7 @@ import {
   getConfiguredBaseThresholdForModel,
   getEffectiveAutoCondenseThreshold,
 } from "./modelCondenseThresholds.js";
+import { resolveModelForMode } from "./modeModelPreferences.js";
 import type {
   SpawnBackgroundRequest,
   SpawnBackgroundResult,
@@ -174,6 +175,18 @@ export class AgentSessionManager {
     };
   }
 
+  private getModelForMode(mode: string): string {
+    try {
+      const configured = vscode.workspace.getConfiguration("agentlink");
+      return resolveModelForMode(configured, mode, this.config.model);
+    } catch (err) {
+      this.log?.(
+        `[agent] Failed to resolve configured model for mode ${mode}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return this.config.model;
+    }
+  }
+
   private applyThresholdToSession(session: AgentSession): void {
     session.autoCondenseThreshold = this.getCondenseThresholdForModel(
       session.model,
@@ -188,8 +201,13 @@ export class AgentSessionManager {
     mode: string,
     opts?: { activeFilePath?: string },
   ): Promise<AgentSession> {
-    const config = this.buildConfigForModel(this.config.model);
+    const model = this.getModelForMode(mode);
+    const config = this.buildConfigForModel(model);
     const providerId = providerRegistry.tryResolveProvider(config.model)?.id;
+    this.updateConfig({
+      model,
+      autoCondenseThreshold: config.autoCondenseThreshold,
+    });
     const session = await AgentSession.create({
       mode,
       config,
@@ -242,10 +260,32 @@ export class AgentSessionManager {
     return this.sessions.get(id);
   }
 
+  saveAllSessions(): void {
+    for (const id of this.sessions.keys()) {
+      this.saveSession(id);
+    }
+  }
+
   saveSession(id: string): void {
     const session = this.sessions.get(id);
     if (session) {
-      this.store?.save(session);
+      this.store?.save({
+        id: session.id,
+        mode: session.mode,
+        model: session.model,
+        title: session.title,
+        createdAt: session.createdAt,
+        lastActiveAt: session.lastActiveAt,
+        totalInputTokens: session.totalInputTokens,
+        totalOutputTokens: session.totalOutputTokens,
+        totalCacheReadTokens: session.totalCacheReadTokens,
+        totalCacheCreationTokens: session.totalCacheCreationTokens,
+        lastInputTokens: session.lastInputTokens,
+        lastCacheReadTokens: session.lastCacheReadTokens,
+        getLoadedSkills: () => session.getLoadedSkills(),
+        getAllMessages: () => session.getAllMessages(),
+        checkpoints: this.checkpoints.get(id) ?? [],
+      });
     }
   }
 
@@ -276,6 +316,9 @@ export class AgentSessionManager {
     opts?: {
       thinkingEnabled?: boolean;
       activeFilePath?: string;
+      displayText?: string;
+      isSlashCommand?: boolean;
+      slashCommandLabel?: string;
       images?: Array<{ name: string; mimeType: string; base64: string }>;
       documents?: Array<{ name: string; mimeType: string; base64: string }>;
     },
@@ -298,11 +341,11 @@ export class AgentSessionManager {
       session.thinkingBudget = this.config.thinkingBudget;
     }
 
-    // Create checkpoint before adding user message, but only for messages after
-    // the first — the first message has no prior state worth restoring to.
-    // turnIndex is the 0-based index of this human user message in the sequence
-    // of human user messages (not counting tool-result messages that also have
-    // role "user"). The UI's SET_CHECKPOINT reducer counts messages the same way.
+    // Create checkpoint before adding the next user message, but only after the
+    // first turn — the initial message has no prior state worth restoring to.
+    // `turnIndex` here means "how many visible user turns already exist at this
+    // snapshot". Example: immediately before the second user message, turnIndex=1.
+    // In the UI that checkpoint is displayed on the first user message.
     const turnIndex = session
       .getAllMessages()
       .filter((m) => m.role === "user" && typeof m.content === "string").length;
@@ -325,12 +368,21 @@ export class AgentSessionManager {
     // webview already drained the queue and sent this message via agentSend,
     // the old interjection would otherwise be re-emitted mid-turn as a duplicate.
     session.consumePendingInterjection();
-    session.addUserMessage(text);
+    session.addUserMessage(text, {
+      displayText: opts?.displayText,
+      isSlashCommand: opts?.isSlashCommand === true,
+      slashCommandLabel: opts?.slashCommandLabel,
+    });
 
     // Store pasted images/PDFs bound to the just-added user message index.
     // These are injected into the API call by AgentEngine, not stored in history.
     const msgIndex = session.messageCount - 1;
     session.setPendingMedia(msgIndex, opts?.images, opts?.documents);
+    if (opts?.images?.length || opts?.documents?.length) {
+      this.log?.(
+        `[media] setPendingMedia at rawIndex=${msgIndex} images=${opts?.images?.length ?? 0} documents=${opts?.documents?.length ?? 0} totalRawMessages=${session.messageCount}`,
+      );
+    }
 
     session.status = "streaming";
 
@@ -340,7 +392,19 @@ export class AgentSessionManager {
 
     // Persist immediately so the session appears in history even if the
     // API call fails (e.g. network error, auth failure on the first message).
-    this.store?.save(session);
+    this.saveSession(session.id);
+    let lastPersistedActiveAt = session.lastActiveAt;
+
+    const persistIfHistoryChanged = () => {
+      if (session.lastActiveAt !== lastPersistedActiveAt) {
+        this.saveSession(session.id);
+        lastPersistedActiveAt = session.lastActiveAt;
+      }
+    };
+
+    // Keep checkpointing in-flight turns so reloads don't drop recent transcript
+    // progress. The guard above avoids writes unless message history changed.
+    const inFlightPersistTimer = setInterval(persistIfHistoryChanged, 1000);
 
     this.onSessionsChanged?.();
 
@@ -351,12 +415,13 @@ export class AgentSessionManager {
     try {
       while (true) {
         let naturalDone = false;
+
         for await (const event of this.getEngine().run(session)) {
           if (event.type === "todo_update") {
             lastTodos = event.todos;
           }
           if (event.type === "done") {
-            this.store?.save(session);
+            this.saveSession(session.id);
             naturalDone = true;
             // Don't forward yet — check for pending todos first
             continue;
@@ -364,11 +429,12 @@ export class AgentSessionManager {
           this.onEvent?.(session.id, event);
 
           // After forwarding a user_interjection event, create a checkpoint so
-          // the user can revert to the state before the mid-run message.
-          // We create it AFTER forwarding so agentCheckpointCreated arrives at
-          // the webview after agentInterjection — the message must already exist
-          // in webview state before the checkpoint can be attached to it.
+          // the user can revert to the state immediately before that injected
+          // turn. Because the message already exists in webview state at this
+          // point, the checkpoint will render on the preceding user message.
           if (event.type === "user_interjection") {
+            // The interjection is already present in the transcript here, so
+            // length - 1 gives the index of that injected user turn.
             const interjectionTurnIndex =
               session
                 .getAllMessages()
@@ -455,7 +521,7 @@ export class AgentSessionManager {
       session.status = "error";
       this.onEvent?.(session.id, { type: "error", error, retryable: false });
       // Persist before emitting done so sendSessionList sees the saved session
-      this.store?.save(session);
+      this.saveSession(session.id);
       this.onEvent?.(session.id, {
         type: "done",
         totalInputTokens: session.totalInputTokens,
@@ -463,9 +529,11 @@ export class AgentSessionManager {
         totalCacheReadTokens: session.totalCacheReadTokens,
         totalCacheCreationTokens: session.totalCacheCreationTokens,
       });
+    } finally {
+      clearInterval(inFlightPersistTimer);
+      persistIfHistoryChanged();
+      this.onSessionsChanged?.();
     }
-
-    this.onSessionsChanged?.();
   }
 
   /**
@@ -517,6 +585,7 @@ export class AgentSessionManager {
     if (session) {
       session.abort();
       session.status = "idle";
+      this.saveSession(session.id);
       // Mark bg sessions as cancelled so the UI can distinguish stop vs complete
       if (session.background) {
         this.bgCancelled.add(sessionId);
@@ -538,12 +607,22 @@ export class AgentSessionManager {
     this.engine = null;
 
     session.status = "streaming";
+    let lastPersistedActiveAt = session.lastActiveAt;
+
+    const persistIfHistoryChanged = () => {
+      if (session.lastActiveAt !== lastPersistedActiveAt) {
+        this.saveSession(session.id);
+        lastPersistedActiveAt = session.lastActiveAt;
+      }
+    };
+
+    const inFlightPersistTimer = setInterval(persistIfHistoryChanged, 1000);
     this.onSessionsChanged?.();
 
     try {
       for await (const event of this.getEngine().run(session)) {
         if (event.type === "done") {
-          this.store?.save(session);
+          this.saveSession(session.id);
         }
         this.onEvent?.(session.id, event);
       }
@@ -551,7 +630,7 @@ export class AgentSessionManager {
       const error = err instanceof Error ? err.message : String(err);
       session.status = "error";
       this.onEvent?.(session.id, { type: "error", error, retryable: false });
-      this.store?.save(session);
+      this.saveSession(session.id);
       this.onEvent?.(session.id, {
         type: "done",
         totalInputTokens: session.totalInputTokens,
@@ -559,9 +638,11 @@ export class AgentSessionManager {
         totalCacheReadTokens: session.totalCacheReadTokens,
         totalCacheCreationTokens: session.totalCacheCreationTokens,
       });
+    } finally {
+      clearInterval(inFlightPersistTimer);
+      persistIfHistoryChanged();
+      this.onSessionsChanged?.();
     }
-
-    this.onSessionsChanged?.();
   }
 
   switchTo(sessionId: string): void {
@@ -582,9 +663,21 @@ export class AgentSessionManager {
     const session = this.getForegroundSession();
     if (!session) return null;
 
+    const model = this.getModelForMode(mode);
+    const newProviderId = providerRegistry.tryResolveProvider(model)?.id;
+
+    session.model = model;
+    session.providerId = newProviderId;
+    this.applyThresholdToSession(session);
     await session.setMode(mode, opts);
+
+    this.updateConfig({
+      model,
+      autoCondenseThreshold: session.autoCondenseThreshold,
+    });
+
     this.onSessionsChanged?.();
-    this.store?.save(session);
+    this.saveSession(session.id);
     return session;
   }
 
@@ -636,6 +729,8 @@ export class AgentSessionManager {
     session.status = "streaming";
     this.onSessionsChanged?.();
 
+    let condenseSucceeded = false;
+
     try {
       for await (const event of engine.condenseSession(
         session,
@@ -643,9 +738,40 @@ export class AgentSessionManager {
         undefined,
         preservedContext,
       )) {
+        if (event.type === "condense") {
+          condenseSucceeded = true;
+        }
         this.onEvent?.(session.id, event);
       }
-      this.store?.save(session);
+      this.saveSession(session.id);
+
+      if (!isAutomatic && condenseSucceeded) {
+        try {
+          for await (const event of engine.run(session)) {
+            if (event.type === "done") {
+              this.saveSession(session.id);
+            }
+            this.onEvent?.(session.id, event);
+          }
+        } catch (err: unknown) {
+          const error = err instanceof Error ? err.message : String(err);
+          session.status = "error";
+          this.onEvent?.(session.id, {
+            type: "error",
+            error,
+            retryable: false,
+          });
+          this.saveSession(session.id);
+          this.onEvent?.(session.id, {
+            type: "done",
+            totalInputTokens: session.totalInputTokens,
+            totalOutputTokens: session.totalOutputTokens,
+            totalCacheReadTokens: session.totalCacheReadTokens,
+            totalCacheCreationTokens: session.totalCacheCreationTokens,
+          });
+          return;
+        }
+      }
     } catch (err: unknown) {
       const error = err instanceof Error ? err.message : String(err);
       this.onEvent?.(session.id, { type: "condense_error", error });
@@ -721,33 +847,58 @@ export class AgentSessionManager {
   async revertToCheckpoint(
     sessionId: string,
     checkpointId: string,
-  ): Promise<boolean> {
+  ): Promise<{ ok: boolean; restoredPrompt?: string }> {
     const checkpoint = this.findCheckpoint(sessionId, checkpointId);
-    if (!checkpoint || !this.checkpointManager) return false;
+    if (!checkpoint || !this.checkpointManager) return { ok: false };
 
     const session = this.sessions.get(sessionId);
 
     const ok = await this.checkpointManager.revertToCheckpoint(checkpoint);
-    if (!ok) return false;
+    if (!ok) return { ok: false };
 
-    // Truncate conversation history to the turn that was checkpointed
+    let restoredPrompt: string | undefined;
+
+    // Truncate conversation history to the selected checkpoint snapshot.
+    // `checkpoint.turnIndex` is the count of visible user turns already committed
+    // at that snapshot, so we keep everything before the user message at that
+    // position and restore that discarded message into the composer.
     if (session) {
       const allMessages = session.getAllMessages();
-      // Keep messages up to (but not including) the user message at turnIndex
-      const truncated = allMessages.slice(0, checkpoint.turnIndex);
+      let userCount = 0;
+      let keepUntil = allMessages.length;
+      for (let i = 0; i < allMessages.length; i++) {
+        const message = allMessages[i];
+        if (message.role === "user" && typeof message.content === "string") {
+          if (userCount === checkpoint.turnIndex) {
+            restoredPrompt = message.content;
+            keepUntil = i;
+            break;
+          }
+          userCount++;
+        }
+      }
+      if (keepUntil === allMessages.length) {
+        // turnIndex points past the current transcript, so this checkpoint is stale or corrupt.
+        return { ok: false };
+      }
+      const truncated = allMessages.slice(0, keepUntil);
       session.replaceMessages(truncated);
       session.status = "idle";
     }
 
-    // Remove checkpoints created after this one
+    // Remove checkpoints created after this one.
     const existingCheckpoints = this.checkpoints.get(sessionId) ?? [];
     const idx = existingCheckpoints.findIndex((c) => c.id === checkpointId);
     if (idx !== -1) {
       this.checkpoints.set(sessionId, existingCheckpoints.slice(0, idx + 1));
     }
 
+    if (session) {
+      this.saveSession(session.id);
+    }
+
     this.onSessionsChanged?.();
-    return true;
+    return { ok: true, restoredPrompt };
   }
 
   /**
@@ -818,6 +969,8 @@ export class AgentSessionManager {
       this.onSessionsChanged?.();
       return this.sessions.get(sessionId)!;
     }
+
+    this.checkpoints.set(sessionId, metadata?.checkpoints ?? []);
 
     // Reconstruct session from persisted data
     const providerId = providerRegistry.tryResolveProvider(summary.model)?.id;
@@ -1220,6 +1373,15 @@ export class AgentSessionManager {
     // auto-condensing to manage context. The foreground agent can kill
     // a background agent via the kill_background_agent tool if needed.
     void (async () => {
+      let lastPersistedActiveAt = session.lastActiveAt;
+      const persistIfHistoryChanged = () => {
+        if (session.lastActiveAt !== lastPersistedActiveAt) {
+          this.saveSession(session.id);
+          lastPersistedActiveAt = session.lastActiveAt;
+        }
+      };
+      const inFlightPersistTimer = setInterval(persistIfHistoryChanged, 1000);
+
       try {
         for await (const event of bgEngine.run(session, {
           isBackground: true,
@@ -1256,6 +1418,9 @@ export class AgentSessionManager {
           totalCacheReadTokens: session.totalCacheReadTokens,
           totalCacheCreationTokens: session.totalCacheCreationTokens,
         });
+      } finally {
+        clearInterval(inFlightPersistTimer);
+        persistIfHistoryChanged();
       }
 
       // Mark completion time for auto-dismiss

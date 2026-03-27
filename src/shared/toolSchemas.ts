@@ -273,12 +273,14 @@ export const executeCommandSchema = {
     .string()
     .optional()
     .describe(
-      "Run in a specific terminal by ID (returned from previous commands)",
+      "Run in a specific terminal by ID (returned from previous commands). Prefer omitting this for normal sequential commands so execute_command can reuse the default terminal automatically.",
     ),
   terminal_name: z
     .string()
     .optional()
-    .describe("Run in a named terminal, creating it if needed."),
+    .describe(
+      "Run in a named terminal, creating it if needed. Only set this when you intentionally need a separate terminal (parallel/background work or temporary environment isolation).",
+    ),
   split_from: z
     .string()
     .optional()

@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import * as vscode from "vscode";
 
 vi.mock("vscode", () => ({
   workspace: {
@@ -391,7 +392,66 @@ describe("semantic search auth", () => {
       files: [],
       error:
         "OpenAI API key not configured for embeddings. Semantic search and indexing require an API key (set OPENAI_API_KEY or run 'AgentLink: Set OpenAI API Key for Embeddings'). Model chat can still use OpenAI/Codex OAuth.",
+      reason: "missing_embeddings_auth",
+      readiness_message:
+        "OpenAI API key not configured for embeddings. Semantic search and indexing require an API key (set OPENAI_API_KEY or run 'AgentLink: Set OpenAI API Key for Embeddings'). Model chat can still use OpenAI/Codex OAuth.",
+      next_steps: [
+        "Run 'AgentLink: Set OpenAI API Key for Embeddings'.",
+        "Or run 'AgentLink: Set Up Semantic Search' and choose API-key setup.",
+      ],
     });
+  });
+
+  it("returns structured readiness fields when semantic search is disabled", async () => {
+    const getConfigurationMock = vscode.workspace
+      .getConfiguration as ReturnType<typeof vi.fn>;
+    const originalImpl = getConfigurationMock.getMockImplementation();
+
+    getConfigurationMock.mockImplementation(() => ({
+      get: vi.fn((key: string, fallback?: unknown) => {
+        if (key === "semanticSearchEnabled") return false;
+        if (key === "qdrantUrl") return "http://localhost:6333";
+        return fallback;
+      }),
+    }));
+
+    try {
+      const result = await semanticSearch("/workspace", "disabled", 5);
+      const first = result.content[0];
+      expect(first?.type).toBe("text");
+      if (!first || first.type !== "text") {
+        throw new Error("Expected text response");
+      }
+
+      const payload = JSON.parse(first.text);
+      expect(payload.reason).toBe("disabled");
+      expect(payload.readiness_message).toContain(
+        "Semantic search is not enabled",
+      );
+      expect(Array.isArray(payload.next_steps)).toBe(true);
+    } finally {
+      if (originalImpl) {
+        getConfigurationMock.mockImplementation(originalImpl);
+      }
+    }
+  });
+
+  it("returns structured readiness fields when embeddings auth is missing", async () => {
+    resolveEmbeddingAuth.mockResolvedValue(null);
+
+    const result = await semanticSearch("/workspace", "missing auth", 5);
+    const first = result.content[0];
+    expect(first?.type).toBe("text");
+    if (!first || first.type !== "text") {
+      throw new Error("Expected text response");
+    }
+
+    const payload = JSON.parse(first.text);
+    expect(payload.reason).toBe("missing_embeddings_auth");
+    expect(payload.readiness_message).toContain(
+      "OpenAI API key not configured",
+    );
+    expect(Array.isArray(payload.next_steps)).toBe(true);
   });
 
   it("uses the resolved bearer token for embeddings", async () => {

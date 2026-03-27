@@ -200,10 +200,11 @@ describe("AgentSession", () => {
     it("keeps runtime errors in full history but excludes them from provider history", async () => {
       const session = await makeSession();
       session.addUserMessage("user msg");
-      session.appendRuntimeError(
-        "Codex API error: An error occurred while processing your request.",
-        true,
-      );
+      session.appendRuntimeError({
+        message:
+          "Codex API error: An error occurred while processing your request.",
+        retryable: true,
+      });
 
       expect(session.getAllMessages()).toHaveLength(2);
       expect(session.getAllMessages()[1]?.runtimeError).toEqual({
@@ -219,8 +220,8 @@ describe("AgentSession", () => {
 
     it("dedupes consecutive identical runtime errors", async () => {
       const session = await makeSession();
-      session.appendRuntimeError("same error", false);
-      session.appendRuntimeError("same error", true);
+      session.appendRuntimeError({ message: "same error", retryable: false });
+      session.appendRuntimeError({ message: "same error", retryable: true });
 
       expect(session.getAllMessages()).toHaveLength(1);
       expect(session.getAllMessages()[0]?.runtimeError).toEqual({

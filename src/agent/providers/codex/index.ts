@@ -7,6 +7,9 @@ export {
   CodexOAuthManager,
   codexOAuthManager,
   type CodexCredentials,
+  type CodexOAuthAccountInfo,
+  type SaveOAuthAccountOptions,
+  type SaveOAuthAccountResult,
 } from "./CodexOAuthManager.js";
 export {
   OpenAiCodexAuthManager,

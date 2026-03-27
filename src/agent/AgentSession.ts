@@ -1,6 +1,11 @@
 import { randomUUID } from "crypto";
 import type { ContentBlock, TextBlock } from "./providers/types.js";
-import type { SessionStatus, AgentConfig, AgentMessage } from "./types.js";
+import type {
+  SessionStatus,
+  AgentConfig,
+  AgentMessage,
+  AgentRuntimeError,
+} from "./types.js";
 import { buildPromptArtifacts } from "./systemPrompt.js";
 import type { AgentMode } from "./modes.js";
 import type { SkillEntry } from "./skillLoader.js";
@@ -105,6 +110,8 @@ export class AgentSession {
     text: string;
     queueId: string;
     displayText?: string;
+    isSlashCommand?: boolean;
+    slashCommandLabel?: string;
     attachments?: string[];
     images?: Array<{ name: string; mimeType: string; base64: string }>;
     documents?: Array<{ name: string; mimeType: string; base64: string }>;
@@ -257,22 +264,52 @@ export class AgentSession {
     return this.messages.length;
   }
 
-  addUserMessage(text: string): void {
-    this.messages.push({ role: "user", content: text } as AgentMessage);
+  addUserMessage(
+    text: string,
+    opts?: {
+      displayText?: string;
+      isSlashCommand?: boolean;
+      slashCommandLabel?: string;
+    },
+  ): void {
+    this.messages.push({
+      role: "user",
+      content: text,
+      ...(opts && (opts.displayText || opts.isSlashCommand)
+        ? {
+            uiHint: {
+              userMessage: {
+                ...(opts.displayText ? { displayText: opts.displayText } : {}),
+                ...(opts.isSlashCommand ? { isSlashCommand: true } : {}),
+                ...(opts.slashCommandLabel
+                  ? { slashCommandLabel: opts.slashCommandLabel }
+                  : {}),
+              },
+            },
+          }
+        : {}),
+    } as AgentMessage);
     this.lastActiveAt = Date.now();
   }
 
-  appendRuntimeError(message: string, retryable: boolean): void {
+  appendRuntimeError(error: AgentRuntimeError): void {
     const last = this.messages[this.messages.length - 1];
-    if (last?.runtimeError?.message === message) {
-      last.runtimeError.retryable = retryable;
+    if (last?.runtimeError?.message === error.message) {
+      last.runtimeError.retryable = error.retryable;
+      last.runtimeError.code = error.code;
+      last.runtimeError.actions = error.actions;
       this.lastActiveAt = Date.now();
       return;
     }
     this.messages.push({
       role: "assistant",
-      content: [{ type: "text", text: message }],
-      runtimeError: { message, retryable },
+      content: [{ type: "text", text: error.message }],
+      runtimeError: {
+        message: error.message,
+        retryable: error.retryable,
+        code: error.code,
+        actions: error.actions,
+      },
     } as AgentMessage);
     this.lastActiveAt = Date.now();
   }
@@ -442,6 +479,8 @@ export class AgentSession {
     text: string,
     queueId: string,
     displayText?: string,
+    isSlashCommand?: boolean,
+    slashCommandLabel?: string,
     attachments?: string[],
     images?: Array<{ name: string; mimeType: string; base64: string }>,
     documents?: Array<{ name: string; mimeType: string; base64: string }>,
@@ -452,6 +491,8 @@ export class AgentSession {
         text,
         queueId,
         displayText,
+        isSlashCommand,
+        slashCommandLabel,
         attachments,
         images,
         documents,
@@ -466,6 +507,8 @@ export class AgentSession {
     updates: {
       text: string;
       displayText?: string;
+      isSlashCommand?: boolean;
+      slashCommandLabel?: string;
       attachments?: string[];
       images?: Array<{ name: string; mimeType: string; base64: string }>;
       documents?: Array<{ name: string; mimeType: string; base64: string }>;
@@ -480,6 +523,8 @@ export class AgentSession {
     text: string;
     queueId: string;
     displayText?: string;
+    isSlashCommand?: boolean;
+    slashCommandLabel?: string;
     attachments?: string[];
     images?: Array<{ name: string; mimeType: string; base64: string }>;
     documents?: Array<{ name: string; mimeType: string; base64: string }>;
@@ -505,6 +550,8 @@ export class AgentSession {
     text: string;
     queueId: string;
     displayText?: string;
+    isSlashCommand?: boolean;
+    slashCommandLabel?: string;
     attachments?: string[];
     images?: Array<{ name: string; mimeType: string; base64: string }>;
     documents?: Array<{ name: string; mimeType: string; base64: string }>;

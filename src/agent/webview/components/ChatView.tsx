@@ -23,6 +23,8 @@ interface ChatViewProps {
   ) => void;
   onRetry?: () => void;
   onSignIn?: () => void;
+  onSignInAnotherAccount?: () => void;
+  onCondense?: () => void;
   bgSessions?: BgSessionInfoProps[];
   onStopBackground?: (sessionId: string) => void;
   onOpenTranscript?: (sessionId: string) => void;
@@ -38,6 +40,8 @@ export function ChatView({
   onViewCheckpointDiff,
   onRetry,
   onSignIn,
+  onSignInAnotherAccount,
+  onCondense,
   bgSessions,
   onStopBackground,
   onOpenTranscript,
@@ -193,6 +197,16 @@ export function ChatView({
                 onSignIn={
                   msg === messages[messages.length - 1] && msg.error
                     ? onSignIn
+                    : undefined
+                }
+                onSignInAnotherAccount={
+                  msg === messages[messages.length - 1] && msg.error
+                    ? onSignInAnotherAccount
+                    : undefined
+                }
+                onCondense={
+                  msg === messages[messages.length - 1] && msg.error
+                    ? onCondense
                     : undefined
                 }
                 bgSessions={bgSessions}

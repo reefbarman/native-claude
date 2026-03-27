@@ -11,7 +11,14 @@ export interface Checkpoint {
   id: string;
   /** The shadow repo commit SHA at this point */
   commitHash: string;
-  /** Conversation turn index (number of user messages sent before this checkpoint) */
+  /**
+   * Number of visible user turns already in the transcript at this snapshot.
+   *
+   * Example: a checkpoint created immediately before the second user message has
+   * turnIndex = 1. In the UI that checkpoint is shown on the first user message,
+   * and reverting to it truncates the transcript before the user message at
+   * index 1 (the second user message).
+   */
   turnIndex: number;
   /** Timestamp when the checkpoint was created */
   createdAt: number;
@@ -206,6 +213,9 @@ export class CheckpointManager {
 
   /**
    * Create a checkpoint at the current workspace state.
+   *
+   * `turnIndex` is the number of visible user turns already committed at this
+   * snapshot, not the index of the message that should display the badge.
    * Returns null if checkpoints are not initialized or creation fails.
    */
   async createCheckpoint(turnIndex: number): Promise<Checkpoint | null> {

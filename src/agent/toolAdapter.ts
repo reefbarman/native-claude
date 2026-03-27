@@ -83,7 +83,6 @@ export const READ_ONLY_TOOLS = new Set([
   "show_notification",
   "get_terminal_output",
   "ask_user",
-  "switch_mode",
   "spawn_background_agent",
   "get_background_status",
   "get_background_result",

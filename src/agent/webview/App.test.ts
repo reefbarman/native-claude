@@ -297,6 +297,22 @@ describe("webview App reducer background agent launch blocks", () => {
     ]);
   });
 
+  it("preserves slash command label alongside attachment indicators", () => {
+    const state = reducer(initialState, {
+      type: "ADD_USER_MESSAGE",
+      text: "[1 image attached]\nplease inspect this",
+      isSlashCommand: true,
+      slashCommandLabel: "/snapshot latest",
+    });
+
+    expect(state.messages[0]).toMatchObject({
+      role: "user",
+      content: "[1 image attached]\nplease inspect this",
+      isSlashCommand: true,
+      slashCommandLabel: "/snapshot latest",
+    });
+  });
+
   it("clears slash-command metadata when an enqueued message is edited", () => {
     let state = reducer(initialState, {
       type: "ENQUEUE_MESSAGE",
@@ -320,6 +336,60 @@ describe("webview App reducer background agent launch blocks", () => {
         isSlashCommand: false,
       },
     ]);
+  });
+
+  it("maps checkpoint turn indices to the preceding user message", () => {
+    let state = reducer(initialState, {
+      type: "ADD_USER_MESSAGE",
+      text: "first prompt",
+    });
+    state = reducer(state, { type: "DONE" });
+    state = reducer(state, {
+      type: "ADD_USER_MESSAGE",
+      text: "second prompt",
+    });
+    state = reducer(state, { type: "DONE" });
+
+    state = reducer(state, {
+      type: "SET_CHECKPOINT",
+      checkpointId: "cp-live",
+      turnIndex: 1,
+    });
+
+    expect(state.messages[0]).toMatchObject({
+      role: "user",
+      content: "first prompt",
+      checkpointId: "cp-live",
+    });
+    expect(state.messages[2]).toMatchObject({
+      role: "user",
+      content: "second prompt",
+    });
+    expect(state.messages[2]).not.toHaveProperty("checkpointId");
+
+    const restored = reducer(initialState, {
+      type: "LOAD_SESSION",
+      sessionId: "session-1",
+      title: "Checkpoint session",
+      mode: "code",
+      messages: state.messages.map(
+        ({ checkpointId: _checkpointId, ...message }) => message,
+      ),
+      checkpoints: [{ turnIndex: 1, checkpointId: "cp-restored" }],
+      lastInputTokens: 0,
+      lastOutputTokens: 0,
+    });
+
+    expect(restored.messages[0]).toMatchObject({
+      role: "user",
+      content: "first prompt",
+      checkpointId: "cp-restored",
+    });
+    expect(restored.messages[2]).toMatchObject({
+      role: "user",
+      content: "second prompt",
+    });
+    expect(restored.messages[2]).not.toHaveProperty("checkpointId");
   });
 
   it("restores persisted condense summaries even when they are stored as user messages", async () => {
@@ -350,6 +420,89 @@ describe("webview App reducer background agent launch blocks", () => {
         text: '## Resume Anchor (deterministic)\n- Continue from this task: "Investigate condense"## Conversation Summary\n\nSummary body',
       },
     ]);
+  });
+
+  it("restores condense row metadata from persisted uiHint", async () => {
+    const { agentMessagesToChatMessages } = await import("./App");
+
+    const restored = agentMessagesToChatMessages([
+      { role: "user", content: "Investigate condense" },
+      {
+        role: "assistant",
+        isSummary: true,
+        content: [{ type: "text", text: "Summary body" }],
+        uiHint: {
+          condense: {
+            prevInputTokens: 12000,
+            newInputTokens: 4200,
+            durationMs: 950,
+            validationWarnings: ["retry used"],
+          },
+        },
+      },
+    ] as unknown[]);
+
+    expect(restored).toHaveLength(3);
+    expect(restored[1]?.role).toBe("condense");
+    expect(restored[1]?.condenseInfo).toEqual({
+      prevInputTokens: 12000,
+      newInputTokens: 4200,
+      durationMs: 950,
+      validationWarnings: ["retry used"],
+      errorMessage: undefined,
+      condensing: undefined,
+    });
+  });
+
+  it("restores slash-command display text and pill metadata from persisted uiHint", async () => {
+    const { agentMessagesToChatMessages } = await import("./App");
+
+    const restored = agentMessagesToChatMessages([
+      {
+        role: "user",
+        content: "expanded slash command body",
+        uiHint: {
+          userMessage: {
+            displayText: "/review",
+            isSlashCommand: true,
+          },
+        },
+      },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "ok" }],
+      },
+    ] as unknown[]);
+
+    expect(restored).toHaveLength(2);
+    expect(restored[0]?.role).toBe("user");
+    expect(restored[0]?.content).toBe("/review");
+    expect(restored[0]?.isSlashCommand).toBe(true);
+    expect(restored[0]?.slashCommandLabel).toBe("/review");
+  });
+
+  it("preserves user context text around persisted slash commands", async () => {
+    const { agentMessagesToChatMessages } = await import("./App");
+
+    const restored = agentMessagesToChatMessages([
+      {
+        role: "user",
+        content: "Please do this before sending",
+        uiHint: {
+          userMessage: {
+            displayText: "Please do this before sending",
+            isSlashCommand: true,
+            slashCommandLabel: "/snapshot important state",
+          },
+        },
+      },
+    ] as unknown[]);
+
+    expect(restored).toHaveLength(1);
+    expect(restored[0]?.role).toBe("user");
+    expect(restored[0]?.content).toBe("Please do this before sending");
+    expect(restored[0]?.isSlashCommand).toBe(true);
+    expect(restored[0]?.slashCommandLabel).toBe("/snapshot important state");
   });
 
   it("restores persisted load_skill tool calls as skill_load blocks", async () => {
@@ -408,7 +561,7 @@ describe("webview App reducer background agent launch blocks", () => {
     ]);
   });
 
-  it("restores persisted runtime errors as warning rows with retry metadata", async () => {
+  it("restores persisted runtime errors on assistant messages with retry metadata", async () => {
     const { agentMessagesToChatMessages } = await import("./App");
 
     const restored = agentMessagesToChatMessages([
@@ -431,14 +584,97 @@ describe("webview App reducer background agent launch blocks", () => {
 
     expect(restored).toHaveLength(2);
     expect(restored[0]?.role).toBe("user");
-    expect(restored[1]?.role).toBe("warning");
-    expect(restored[1]?.warningMessage).toBe(
-      "Codex API error: An error occurred while processing your request.",
-    );
+    expect(restored[1]?.role).toBe("assistant");
+    expect(restored[1]?.blocks).toEqual([
+      {
+        type: "text",
+        text: "Codex API error: An error occurred while processing your request.",
+      },
+    ]);
     expect(restored[1]?.error).toEqual({
       message:
         "Codex API error: An error occurred while processing your request.",
       retryable: true,
+    });
+  });
+
+  it("restores oauth usage-limit exhausted runtime error action metadata on assistant messages", async () => {
+    const { agentMessagesToChatMessages } = await import("./App");
+
+    const restored = agentMessagesToChatMessages([
+      { role: "user", content: "Try Codex again" },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "Codex API error 429" }],
+        runtimeError: {
+          message: "Codex API error 429: The usage limit has been reached.",
+          retryable: true,
+          code: "oauth_usage_limit_exhausted",
+          actions: {
+            signInAnotherAccount: true,
+          },
+        },
+      },
+    ] as unknown[]);
+
+    expect(restored).toHaveLength(2);
+    expect(restored[1]?.role).toBe("assistant");
+    expect(restored[1]?.error).toEqual({
+      message: "Codex API error 429: The usage limit has been reached.",
+      retryable: true,
+      code: "oauth_usage_limit_exhausted",
+      actions: {
+        signInAnotherAccount: true,
+      },
+    });
+  });
+
+  it("restores runtime errors even when assistant content is empty", async () => {
+    const { agentMessagesToChatMessages } = await import("./App");
+
+    const restored = agentMessagesToChatMessages([
+      { role: "user", content: "Try again" },
+      {
+        role: "assistant",
+        content: [],
+        runtimeError: {
+          message: "Codex API error: timeout",
+          retryable: true,
+        },
+      },
+    ] as unknown[]);
+
+    expect(restored).toHaveLength(2);
+    expect(restored[1]?.role).toBe("assistant");
+    expect(restored[1]?.blocks).toEqual([]);
+    expect(restored[1]?.error).toEqual({
+      message: "Codex API error: timeout",
+      retryable: true,
+    });
+  });
+
+  it("maps condense errors with metadata into a standard error block", () => {
+    let state = reducer(initialState, {
+      type: "CONDENSE_START",
+    });
+
+    state = reducer(state, {
+      type: "ADD_CONDENSE_ERROR",
+      errorMessage:
+        "Condensing API call failed: Codex API error 429: The usage limit has been reached",
+      retryable: true,
+      code: "oauth_usage_limit_exhausted",
+      actions: { signInAnotherAccount: true },
+    });
+
+    const last = state.messages[state.messages.length - 1];
+    expect(last?.role).toBe("assistant");
+    expect(last?.error).toEqual({
+      message:
+        "Condensing API call failed: Codex API error 429: The usage limit has been reached",
+      retryable: true,
+      code: "oauth_usage_limit_exhausted",
+      actions: { signInAnotherAccount: true },
     });
   });
 });

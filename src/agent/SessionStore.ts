@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import type { AgentMessage, SessionInfo } from "./types.js";
+import type { Checkpoint } from "./CheckpointManager.js";
 
 /**
  * Persisted session index entry — lightweight metadata kept in sessions.json.
@@ -35,6 +36,7 @@ interface MetadataFile {
   lastInputTokens?: number;
   lastCacheReadTokens?: number;
   loadedSkills?: string[];
+  checkpoints?: Checkpoint[];
 }
 
 const SCHEMA_VERSION = 1;
@@ -113,6 +115,7 @@ export class SessionStore {
     lastCacheReadTokens: number;
     getLoadedSkills?(): string[];
     getAllMessages(): AgentMessage[];
+    checkpoints?: Checkpoint[];
   }): void {
     const sessionDir = path.join(this.historyDir, session.id);
     this.ensureDir(sessionDir);
@@ -140,6 +143,7 @@ export class SessionStore {
       lastInputTokens: session.lastInputTokens,
       lastCacheReadTokens: session.lastCacheReadTokens,
       loadedSkills: session.getLoadedSkills?.() ?? [],
+      checkpoints: session.checkpoints,
     };
     fs.writeFileSync(
       path.join(sessionDir, "metadata.json"),
@@ -196,7 +200,9 @@ export class SessionStore {
   /**
    * Load metadata for a session.
    */
-  loadMetadata(sessionId: string): MetadataFile | null {
+  loadMetadata(
+    sessionId: string,
+  ): (MetadataFile & { checkpoints?: Checkpoint[] }) | null {
     const file = path.join(this.historyDir, sessionId, "metadata.json");
     try {
       const raw = fs.readFileSync(file, "utf-8");

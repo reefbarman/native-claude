@@ -14,15 +14,60 @@ function formatPath(path?: string): string {
   return parts.length <= 3 ? path : `…/${parts.slice(-3).join("/")}`;
 }
 
+function parseResultStatus(result: string): string | null {
+  try {
+    const parsed = JSON.parse(result) as { status?: unknown };
+    return typeof parsed.status === "string"
+      ? parsed.status.toLowerCase()
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseHasError(result: string): boolean {
+  try {
+    const parsed = JSON.parse(result) as { error?: unknown };
+    return typeof parsed.error === "string" && parsed.error.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
 export function SkillLoadBlock({ block }: SkillLoadBlockProps) {
   const [expanded, setExpanded] = useState(false);
   const summary =
     (block.skillName ?? formatPath(block.path)) || "Loading skill…";
 
+  const status = block.complete ? parseResultStatus(block.result) : null;
+  const hasError = block.complete && parseHasError(block.result);
+  const isError = hasError || status === "error" || status === "failed";
+  const isWarning =
+    !isError &&
+    (status === "stopped" ||
+      status === "cancelled" ||
+      status === "rejected" ||
+      status === "rejected_by_user" ||
+      status === "timed_out" ||
+      status === "force-completed");
+
+  const statusClass = !block.complete
+    ? "tool-running"
+    : isError
+      ? "tool-error"
+      : isWarning
+        ? "tool-warning"
+        : "tool-success";
+  const statusIconClass = !block.complete
+    ? "codicon-loading codicon-modifier-spin"
+    : isError
+      ? "codicon-error"
+      : isWarning
+        ? "codicon-warning"
+        : "codicon-library";
+
   return (
-    <div
-      class={`tool-call-block ${block.complete ? "tool-success" : "tool-running"}`}
-    >
+    <div class={`tool-call-block ${statusClass}`}>
       <button
         class="tool-call-header"
         onClick={() => setExpanded(!expanded)}
@@ -31,13 +76,7 @@ export function SkillLoadBlock({ block }: SkillLoadBlockProps) {
         <i
           class={`codicon codicon-chevron-${expanded ? "down" : "right"} tool-call-chevron`}
         />
-        <i
-          class={`codicon tool-call-status-icon ${
-            block.complete
-              ? "codicon-library"
-              : "codicon-loading codicon-modifier-spin"
-          }`}
-        />
+        <i class={`codicon tool-call-status-icon ${statusIconClass}`} />
         <span class="tool-call-name">load_skill</span>
         <span class="tool-call-summary">{summary}</span>
         {block.complete && block.durationMs != null && (

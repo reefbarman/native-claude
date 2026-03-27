@@ -242,7 +242,10 @@ export async function handleFindAndReplace(
       .get<boolean>("masterBypass", false);
 
     const canAutoApprove =
-      masterBypass || approvalManager.isAgentWriteApproved(sessionId);
+      masterBypass ||
+      fileReplacements.every((fr) =>
+        approvalManager.isAgentWriteApproved(sessionId, fr.uri.fsPath),
+      );
     let followUp: string | undefined;
     let acceptedIds: Set<string> | undefined;
 

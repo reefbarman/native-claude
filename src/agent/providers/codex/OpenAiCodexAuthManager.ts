@@ -3,6 +3,8 @@ import * as vscode from "vscode";
 import {
   CodexOAuthManager,
   type CodexCredentials,
+  type CodexOAuthAccountInfo,
+  type SaveOAuthAccountOptions,
 } from "./CodexOAuthManager.js";
 
 const OPENAI_API_KEY_SECRET = "openaiApiKey";
@@ -21,7 +23,12 @@ export interface OpenAiApiKeyCredential {
 export interface OpenAiCodexResolvedAuth {
   method: OpenAiCodexAuthMethod;
   bearerToken: string;
+  /** ChatGPT account header value for Codex OAuth endpoint. */
   accountId?: string;
+  /** Local OAuth pool account identity. */
+  oauthAccountPoolId?: string;
+  oauthAccountLabel?: string;
+  oauthAccountEmail?: string;
   canRefresh: boolean;
 }
 
@@ -48,7 +55,7 @@ export class OpenAiCodexAuthManager {
   }
 
   async hasOAuth(): Promise<boolean> {
-    return this.oauthManager.isAuthenticated();
+    return this.oauthManager.hasAccounts();
   }
 
   async hasApiKey(scope: "any" | OpenAiApiKeyScope = "any"): Promise<boolean> {
@@ -64,19 +71,32 @@ export class OpenAiCodexAuthManager {
     return null;
   }
 
+  private buildOAuthResolvedAuth(
+    account: CodexOAuthAccountInfo,
+    bearerToken: string,
+  ): OpenAiCodexResolvedAuth {
+    return {
+      method: "oauth",
+      bearerToken,
+      accountId: account.chatgptAccountId ?? undefined,
+      oauthAccountPoolId: account.id,
+      oauthAccountLabel: account.label,
+      oauthAccountEmail: account.email,
+      canRefresh: true,
+    };
+  }
+
   async resolveModelAuth(): Promise<OpenAiCodexResolvedAuth | null> {
-    if (await this.hasOAuth()) {
-      const accessToken = await this.oauthManager.getAccessToken();
-      if (!accessToken) {
-        return null;
+    const active = await this.oauthManager.getActiveAccount();
+    if (active) {
+      const accessToken = await this.oauthManager.getAccessTokenByAccountId(
+        active.id,
+      );
+      if (accessToken) {
+        const refreshedActive =
+          (await this.oauthManager.getAccountById(active.id)) ?? active;
+        return this.buildOAuthResolvedAuth(refreshedActive, accessToken);
       }
-      const accountId = await this.oauthManager.getAccountId();
-      return {
-        method: "oauth",
-        bearerToken: accessToken,
-        accountId: accountId ?? undefined,
-        canRefresh: true,
-      };
     }
 
     const apiKeyCred = await this.getApiKeyCredential();
@@ -105,19 +125,36 @@ export class OpenAiCodexAuthManager {
 
   async forceRefreshModelAuth(
     previousMethod: OpenAiCodexAuthMethod,
+    options?: { oauthAccountPoolId?: string },
   ): Promise<OpenAiCodexResolvedAuth | null> {
     if (previousMethod === "oauth") {
-      const refreshed = await this.oauthManager.forceRefreshAccessToken();
-      if (!refreshed) {
+      const accountId = options?.oauthAccountPoolId;
+      let refreshedToken: string | null = null;
+      let account: CodexOAuthAccountInfo | null = null;
+
+      if (accountId) {
+        refreshedToken =
+          await this.oauthManager.forceRefreshAccessTokenByAccountId(accountId);
+        account = refreshedToken
+          ? await this.oauthManager.getAccountById(accountId)
+          : null;
+      } else {
+        const active = await this.oauthManager.getActiveAccount();
+        if (!active) {
+          return null;
+        }
+        refreshedToken =
+          await this.oauthManager.forceRefreshAccessTokenByAccountId(active.id);
+        account = refreshedToken
+          ? ((await this.oauthManager.getAccountById(active.id)) ?? active)
+          : null;
+      }
+
+      if (!refreshedToken || !account) {
         return null;
       }
-      const accountId = await this.oauthManager.getAccountId();
-      return {
-        method: "oauth",
-        bearerToken: refreshed,
-        accountId: accountId ?? undefined,
-        canRefresh: true,
-      };
+
+      return this.buildOAuthResolvedAuth(account, refreshedToken);
     }
 
     const apiKeyCred = await this.getApiKeyCredential();
@@ -129,6 +166,64 @@ export class OpenAiCodexAuthManager {
       bearerToken: apiKeyCred.apiKey,
       canRefresh: false,
     };
+  }
+
+  async resolveModelAuthForOAuthAccount(
+    accountId: string,
+  ): Promise<OpenAiCodexResolvedAuth | null> {
+    const account = await this.oauthManager.getAccountById(accountId);
+    if (!account) return null;
+    const accessToken =
+      await this.oauthManager.getAccessTokenByAccountId(accountId);
+    if (!accessToken) return null;
+    const refreshedAccount =
+      (await this.oauthManager.getAccountById(accountId)) ?? account;
+    return this.buildOAuthResolvedAuth(refreshedAccount, accessToken);
+  }
+
+  async listOAuthAccounts(): Promise<CodexOAuthAccountInfo[]> {
+    return this.oauthManager.listAccounts();
+  }
+
+  async getActiveOAuthAccount(): Promise<CodexOAuthAccountInfo | null> {
+    return this.oauthManager.getActiveAccount();
+  }
+
+  async setActiveOAuthAccount(
+    accountId: string,
+  ): Promise<CodexOAuthAccountInfo | null> {
+    return this.oauthManager.setActiveAccount(accountId, { notify: true });
+  }
+
+  async removeOAuthAccount(accountId: string): Promise<boolean> {
+    return this.oauthManager.removeAccount(accountId);
+  }
+
+  async updateOAuthAccountLabel(
+    accountId: string,
+    label: string,
+  ): Promise<CodexOAuthAccountInfo | null> {
+    return this.oauthManager.updateAccountLabel(accountId, label);
+  }
+
+  async saveOAuthCredentials(
+    credentials: CodexCredentials,
+    options?: SaveOAuthAccountOptions,
+  ): Promise<{
+    account: CodexOAuthAccountInfo;
+    action: "added" | "updated" | "replaced";
+  }> {
+    return this.oauthManager.saveOAuthAccount(credentials, options);
+  }
+
+  async markOAuthUsageLimit(accountId: string): Promise<void> {
+    await this.oauthManager.markUsageLimit(accountId);
+  }
+
+  async getOAuthRoundRobinAccountIds(
+    startAfterAccountId?: string,
+  ): Promise<string[]> {
+    return this.oauthManager.getRoundRobinAccountIds(startAfterAccountId);
   }
 
   async getApiKeyCredential(): Promise<OpenAiApiKeyCredential | null> {

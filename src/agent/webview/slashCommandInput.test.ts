@@ -50,6 +50,8 @@ describe("slashCommandInput", () => {
       command: commands[1],
       args: "this diff",
       displayText: "/review this diff",
+      userText: "please run /review this diff",
+      prefixText: "please run",
     });
   });
 

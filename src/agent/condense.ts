@@ -24,9 +24,12 @@ import type {
   ModelProvider,
   MessageParam,
 } from "./providers/types.js";
-import { CODEX_CONDENSE_MODEL_FALLBACKS } from "./providers/index.js";
+import {
+  CODEX_CONDENSE_MODEL,
+  CODEX_CONDENSE_MODEL_FALLBACKS,
+} from "./providers/index.js";
 
-import type { AgentMessage } from "./types.js";
+import type { AgentErrorActions, AgentMessage } from "./types.js";
 import {
   initTreeSitter,
   treeSitterChunkFile,
@@ -478,6 +481,7 @@ export async function generateFoldedFileContext(
 export interface SummarizeOptions {
   messages: AgentMessage[];
   provider: ModelProvider;
+  activeModel?: string;
   systemPrompt: string;
   isAutomatic: boolean;
   filesRead?: string[];
@@ -508,6 +512,10 @@ export interface SummarizeResult {
     providerId: string;
     condenseModel: string;
     modelCandidates: string[];
+    skippedModelCandidates?: Array<{
+      model: string;
+      reason: string;
+    }>;
     selectedModel: string;
     latestUserMessage: string;
     currentTask: string;
@@ -518,6 +526,9 @@ export interface SummarizeResult {
     effectiveHistoryRoles: string[];
   };
   error?: string;
+  errorRetryable?: boolean;
+  errorCode?: string;
+  errorActions?: AgentErrorActions;
 }
 
 function extractCanonicalUserMessages(messages: AgentMessage[]): string[] {
@@ -789,19 +800,159 @@ function extractSummaryText(raw: string): string {
   return summaryMatch ? summaryMatch[1].trim() : summary;
 }
 
+function estimateMessageTextChars(messages: MessageParam[]): number {
+  return messages.reduce<number>((total, msg) => {
+    if (typeof msg.content === "string") {
+      return total + msg.content.length;
+    }
+
+    return (
+      total +
+      msg.content.reduce<number>((acc, block) => {
+        switch (block.type) {
+          case "text":
+            return acc + block.text.length;
+          case "tool_use":
+            return (
+              acc + block.name.length + JSON.stringify(block.input).length + 32
+            );
+          case "tool_result":
+            return (
+              acc +
+              (typeof block.content === "string"
+                ? block.content.length
+                : Array.isArray(block.content)
+                  ? block.content.reduce(
+                      (inner, contentBlock) =>
+                        inner +
+                        (contentBlock.type === "text"
+                          ? contentBlock.text.length
+                          : 16),
+                      0,
+                    )
+                  : 0) +
+              32
+            );
+          case "thinking":
+            return acc + block.thinking.length;
+          case "image":
+          case "document":
+            return acc + 256;
+        }
+      }, 0)
+    );
+  }, 0);
+}
+
+function estimateCondenseInputTokens(args: {
+  systemPrompt: string;
+  messages: MessageParam[];
+}): number {
+  return Math.ceil(
+    (args.systemPrompt.length + estimateMessageTextChars(args.messages)) / 4,
+  );
+}
+
+function shrinkCondenseSourceWindow(
+  messages: AgentMessage[],
+  fraction: number,
+): AgentMessage[] {
+  if (messages.length <= 2) return messages;
+  const keepCount = Math.max(2, Math.ceil(messages.length * fraction));
+  return messages.slice(-keepCount);
+}
+
+function isContextWindowExceededError(message: string): boolean {
+  return /context window|maximum context length|input (exceeds|is too long)|maximum context/i.test(
+    message,
+  );
+}
+
+function getCodexCondenseModelCandidates(args: {
+  activeModel?: string;
+  provider: ModelProvider;
+  requestMessages: MessageParam[];
+  systemPrompt: string;
+}): {
+  modelCandidates: string[];
+  skippedModelCandidates: Array<{ model: string; reason: string }>;
+} {
+  const unique = (models: Array<string | undefined>) =>
+    [...new Set(models)].filter((model): model is string => Boolean(model));
+  const skippedModelCandidates: Array<{ model: string; reason: string }> = [];
+  const estimatedInputTokens = estimateCondenseInputTokens({
+    systemPrompt: args.systemPrompt,
+    messages: args.requestMessages,
+  });
+
+  const activeModel =
+    args.activeModel && args.activeModel.startsWith("gpt-")
+      ? args.activeModel
+      : undefined;
+
+  const miniModel = CODEX_CONDENSE_MODEL;
+  const miniWindow = args.provider.getCapabilities(miniModel).contextWindow;
+  const estimatedRequestTokens = estimatedInputTokens + 8192;
+  const miniSafeLimit = Math.floor(miniWindow * 0.8);
+  const miniFitsSafely = estimatedRequestTokens <= miniSafeLimit;
+
+  if (!miniFitsSafely) {
+    skippedModelCandidates.push({
+      model: miniModel,
+      reason: `Estimated condense request ~${estimatedRequestTokens.toLocaleString()} tokens exceeds safe budget for ${miniModel} (${miniSafeLimit.toLocaleString()} tokens).`,
+    });
+  }
+
+  const ordered = miniFitsSafely
+    ? unique([miniModel, activeModel, ...CODEX_CONDENSE_MODEL_FALLBACKS])
+    : unique([
+        activeModel,
+        ...CODEX_CONDENSE_MODEL_FALLBACKS.filter(
+          (model) => model !== miniModel,
+        ),
+      ]);
+
+  const modelCandidates = ordered.filter((model) => {
+    if (model !== miniModel) return true;
+    return miniFitsSafely;
+  });
+
+  return {
+    modelCandidates,
+    skippedModelCandidates,
+  };
+}
+
 export async function summarizeConversation(
   options: SummarizeOptions,
   prevInputTokens = 0,
 ): Promise<SummarizeResult> {
-  const { messages, provider, systemPrompt, filesRead, cwd, preservedContext } =
-    options;
+  const {
+    messages,
+    provider,
+    activeModel,
+    systemPrompt,
+    filesRead,
+    cwd,
+    preservedContext,
+  } = options;
 
-  const errorResult = (error: string): SummarizeResult => ({
+  const errorResult = (
+    error: string,
+    options?: {
+      retryable?: boolean;
+      code?: string;
+      actions?: AgentErrorActions;
+    },
+  ): SummarizeResult => ({
     messages,
     summary: "",
     prevInputTokens,
     newInputTokens: prevInputTokens,
     error,
+    errorRetryable: options?.retryable,
+    errorCode: options?.code,
+    errorActions: options?.actions,
   });
 
   const toSummarize = getMessagesSinceLastSummary(messages);
@@ -827,18 +978,23 @@ export async function summarizeConversation(
     preservedContext,
   });
 
-  const withSyntheticResults = injectSyntheticToolResults(toSummarize);
-  const transformed = transformMessagesForCondensing(withSyntheticResults);
-
   const finalMsg: MessageParam = {
     role: "user",
     content: `${CONDENSE_INSTRUCTIONS}\n\n${deterministicSections}`,
   };
 
-  const requestMessages: MessageParam[] = [
-    ...transformed.map(({ role, content }) => ({ role, content })),
-    finalMsg,
-  ];
+  const buildRequestMessages = (
+    sourceMessages: AgentMessage[],
+  ): MessageParam[] => {
+    const withSyntheticResults = injectSyntheticToolResults(sourceMessages);
+    const transformed = transformMessagesForCondensing(withSyntheticResults);
+    return [
+      ...transformed.map(({ role, content }) => ({ role, content })),
+      finalMsg,
+    ];
+  };
+
+  let requestMessages: MessageParam[] = buildRequestMessages(toSummarize);
 
   const fileContextPromise =
     filesRead && filesRead.length > 0 && cwd
@@ -846,18 +1002,38 @@ export async function summarizeConversation(
       : Promise.resolve([] as string[]);
 
   const validationWarnings: string[] = [];
+  let condenseSourceMessages = toSummarize;
   let retryUsed = false;
   let validatorErrors: string[] = [];
   let summaryText = "";
-  const modelCandidates =
+  const getModelSelection = (messagesForRequest: MessageParam[]) =>
     provider.id === "codex"
-      ? [...CODEX_CONDENSE_MODEL_FALLBACKS]
-      : [provider.condenseModel];
-  let selectedModel = modelCandidates[0];
+      ? getCodexCondenseModelCandidates({
+          activeModel,
+          provider,
+          requestMessages: messagesForRequest,
+          systemPrompt: CONDENSE_SYSTEM_PROMPT,
+        })
+      : {
+          modelCandidates: [provider.condenseModel],
+          skippedModelCandidates: [] as Array<{
+            model: string;
+            reason: string;
+          }>,
+        };
+  let { modelCandidates, skippedModelCandidates } =
+    getModelSelection(requestMessages);
+  let selectedModel = modelCandidates[0] ?? provider.condenseModel;
 
   const completeOnce = async (
     extraInstruction?: string,
-  ): Promise<{ text: string; error?: string }> => {
+  ): Promise<{
+    text: string;
+    error?: string;
+    retryable?: boolean;
+    code?: string;
+    actions?: AgentErrorActions;
+  }> => {
     const adjustedMessages =
       extraInstruction && requestMessages.length > 0
         ? [
@@ -870,6 +1046,13 @@ export async function summarizeConversation(
         : requestMessages;
 
     let lastError = "";
+    let lastErrorMeta:
+      | {
+          retryable?: boolean;
+          code?: string;
+          actions?: AgentErrorActions;
+        }
+      | undefined;
 
     for (const model of modelCandidates) {
       try {
@@ -885,19 +1068,63 @@ export async function summarizeConversation(
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         lastError = msg;
+        const errObj = err as {
+          retryable?: boolean;
+          code?: string;
+          actions?: AgentErrorActions;
+        };
+        lastErrorMeta = {
+          retryable: errObj.retryable,
+          code: errObj.code,
+          actions: errObj.actions,
+        };
         const shouldRetry =
-          provider.id === "codex" && isUnsupportedCodexModelError(msg);
+          provider.id === "codex" &&
+          (isUnsupportedCodexModelError(msg) ||
+            isContextWindowExceededError(msg));
         if (!shouldRetry) {
-          return { text: "", error: `Condensing API call failed: ${msg}` };
+          return {
+            text: "",
+            error: `Condensing API call failed: ${msg}`,
+            ...lastErrorMeta,
+          };
         }
       }
     }
 
-    return { text: "", error: `Condensing API call failed: ${lastError}` };
+    return {
+      text: "",
+      error: `Condensing API call failed: ${lastError}`,
+      ...lastErrorMeta,
+    };
   };
 
-  const first = await completeOnce();
-  if (first.error) return errorResult(first.error);
+  let first = await completeOnce();
+  if (first.error && isContextWindowExceededError(first.error)) {
+    for (const fraction of [0.75, 0.5, 0.33]) {
+      const shrunk = shrinkCondenseSourceWindow(toSummarize, fraction);
+      if (shrunk.length >= condenseSourceMessages.length) continue;
+      condenseSourceMessages = shrunk;
+      requestMessages = buildRequestMessages(condenseSourceMessages);
+      ({ modelCandidates, skippedModelCandidates } =
+        getModelSelection(requestMessages));
+      selectedModel = modelCandidates[0] ?? provider.condenseModel;
+      validationWarnings.push(
+        `Condense request exceeded context window; retried with newest ${Math.round(fraction * 100)}% of unsummarized messages.`,
+      );
+      first = await completeOnce();
+      if (!first.error || !isContextWindowExceededError(first.error)) {
+        break;
+      }
+    }
+  }
+  if (first.error) {
+    return errorResult(first.error, {
+      retryable: first.retryable,
+      code: first.code,
+      actions: first.actions,
+    });
+  }
   summaryText = extractSummaryText(first.text);
   if (!summaryText) return errorResult("Condensing produced no output.");
 
@@ -1014,6 +1241,8 @@ export async function summarizeConversation(
       providerId: provider.id,
       condenseModel: provider.condenseModel,
       modelCandidates,
+      skippedModelCandidates:
+        skippedModelCandidates.length > 0 ? skippedModelCandidates : undefined,
       selectedModel,
       latestUserMessage: resumeAnchor.latestUserMessage,
       currentTask: resumeAnchor.currentTask,

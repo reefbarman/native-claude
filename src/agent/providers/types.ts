@@ -197,7 +197,12 @@ export interface CompleteRequest {
 
 export interface CompleteResult {
   text: string;
-  usage?: { inputTokens: number; outputTokens: number };
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens?: number;
+    cacheCreationTokens?: number;
+  };
   providerResponseId?: string;
 }
 

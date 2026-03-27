@@ -368,24 +368,7 @@ body {
   position: relative;
 }
 
-.slash-cmd-message {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 8px;
-  opacity: 0.6;
-  font-size: 12px;
-  color: var(--vscode-descriptionForeground);
-}
 
-.slash-cmd-msg-icon {
-  font-size: 11px;
-  flex-shrink: 0;
-}
-
-.slash-cmd-msg-name {
-  font-family: var(--vscode-editor-font-family, monospace);
-}
 
 .user-content {
   background: var(--vscode-input-background);
@@ -445,6 +428,12 @@ body {
 .user-attachment-media .codicon {
   color: var(--vscode-terminal-ansiYellow, #e5c07b);
 }
+
+.user-attachment-slash-command .codicon {
+  color: var(--vscode-terminal-ansiBlue, #61afef);
+}
+
+
 
 .annotation-follow-up,
 .annotation-rejection {
@@ -889,6 +878,42 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
   min-width: 0;
+}
+
+.slash-standalone-command-block {
+  margin: 0;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  background: var(--vscode-editorWidget-background);
+  padding: 8px 10px;
+}
+
+.slash-standalone-command-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.slash-standalone-command-icon {
+  color: var(--vscode-terminal-ansiGreen, #98c379);
+  font-size: 12px;
+  margin-top: 1px;
+  flex-shrink: 0;
+}
+
+.slash-standalone-command-name {
+  color: var(--vscode-foreground);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.slash-standalone-command-args {
+  color: var(--vscode-descriptionForeground);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .tool-call-duration {

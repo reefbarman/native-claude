@@ -11,6 +11,19 @@ import type { MessageParam } from "./providers/types.js";
  * - condenseParent: UUID of the summary that replaced this message
  *   (messages with condenseParent are filtered from API history when their summary exists)
  */
+export interface AgentErrorActions {
+  signIn?: boolean;
+  signInAnotherAccount?: boolean;
+  condense?: boolean;
+}
+
+export interface AgentRuntimeError {
+  message: string;
+  retryable: boolean;
+  code?: string;
+  actions?: AgentErrorActions;
+}
+
 export type AgentMessage = MessageParam & {
   isSummary?: boolean;
   isResumeContext?: boolean;
@@ -21,9 +34,21 @@ export type AgentMessage = MessageParam & {
     mcpServerNames?: string[];
     activeSkills?: string[];
   };
-  runtimeError?: {
-    message: string;
-    retryable: boolean;
+  runtimeError?: AgentRuntimeError;
+  uiHint?: {
+    userMessage?: {
+      displayText?: string;
+      isSlashCommand?: boolean;
+      slashCommandLabel?: string;
+    };
+    condense?: {
+      prevInputTokens?: number;
+      newInputTokens?: number;
+      durationMs?: number;
+      validationWarnings?: string[];
+      errorMessage?: string;
+      condensing?: boolean;
+    };
   };
 };
 
@@ -52,6 +77,7 @@ export type AgentEvent =
   | {
       type: "checkpoint_created";
       checkpointId: string;
+      /** Number of visible user turns already committed at the checkpoint snapshot. */
       turnIndex: number;
     }
   | { type: "condense_start"; isAutomatic: boolean }
@@ -63,6 +89,8 @@ export type AgentEvent =
       prevInputTokens: number;
       /** Estimated input tokens after condensing */
       newInputTokens: number;
+      /** Duration in ms for this condense operation */
+      durationMs?: number;
       /** Non-fatal validator/retry warnings for this condense run */
       validationWarnings?: string[];
       metadata?: {
@@ -88,6 +116,9 @@ export type AgentEvent =
   | {
       type: "condense_error";
       error: string;
+      retryable?: boolean;
+      code?: string;
+      actions?: AgentErrorActions;
     }
   | {
       type: "api_request";
@@ -109,7 +140,13 @@ export type AgentEvent =
     }
   | { type: "warning"; message: string }
   | { type: "status_update"; message: string }
-  | { type: "error"; error: string; retryable: boolean }
+  | {
+      type: "error";
+      error: string;
+      retryable: boolean;
+      code?: string;
+      actions?: AgentErrorActions;
+    }
   | {
       type: "done";
       totalInputTokens: number;
@@ -122,6 +159,8 @@ export type AgentEvent =
       text: string;
       queueId: string;
       displayText?: string;
+      isSlashCommand?: boolean;
+      slashCommandLabel?: string;
     };
 
 // --- Session types ---

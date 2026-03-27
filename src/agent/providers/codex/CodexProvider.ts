@@ -220,6 +220,7 @@ function buildStreamRequestBody(args: {
   input: CodexInputItem[];
   instructions: string;
   store: boolean;
+  maxTokens?: number;
   reasoning?: Reasoning;
   previousResponseId?: string;
   tools?: OpenAIResponses.Tool[];
@@ -232,6 +233,9 @@ function buildStreamRequestBody(args: {
     instructions: args.instructions,
     stream: true,
     store: args.store,
+    ...(typeof args.maxTokens === "number"
+      ? ({ max_output_tokens: args.maxTokens } as Record<string, unknown>)
+      : {}),
     ...(args.reasoning ? { reasoning: args.reasoning } : {}),
     ...(args.previousResponseId
       ? { previous_response_id: args.previousResponseId }
@@ -241,7 +245,7 @@ function buildStreamRequestBody(args: {
     ...(args.promptCacheRetention
       ? { prompt_cache_retention: args.promptCacheRetention }
       : {}),
-  };
+  } as CodexRequestBody;
 }
 
 function sortObjectKeys(value: unknown): unknown {
@@ -315,7 +319,64 @@ function sanitizeSchemaForCodex(
 
 // ── Provider ──
 
-type CodexSdkError = Error & { status?: number };
+interface CodexSdkError extends Error {
+  status?: number;
+  rawMessage?: string;
+  rawCode?: string;
+  body?: unknown;
+  code?: string;
+  retryable?: boolean;
+  actions?: {
+    signIn?: boolean;
+    signInAnotherAccount?: boolean;
+    condense?: boolean;
+  };
+  metadata?: Record<string, unknown>;
+}
+
+class CodexRequestError extends Error implements CodexSdkError {
+  readonly status?: number;
+  readonly rawMessage?: string;
+  readonly rawCode?: string;
+  readonly body?: unknown;
+  readonly code?: string;
+  readonly retryable?: boolean;
+  readonly actions?: {
+    signIn?: boolean;
+    signInAnotherAccount?: boolean;
+    condense?: boolean;
+  };
+  readonly metadata?: Record<string, unknown>;
+
+  constructor(
+    message: string,
+    options?: {
+      status?: number;
+      rawMessage?: string;
+      rawCode?: string;
+      body?: unknown;
+      code?: string;
+      retryable?: boolean;
+      actions?: {
+        signIn?: boolean;
+        signInAnotherAccount?: boolean;
+        condense?: boolean;
+      };
+      metadata?: Record<string, unknown>;
+    },
+  ) {
+    super(message);
+    this.name = "CodexRequestError";
+    this.status = options?.status;
+    this.rawMessage = options?.rawMessage;
+    this.rawCode = options?.rawCode;
+    this.body = options?.body;
+    this.code = options?.code;
+    this.retryable = options?.retryable;
+    this.actions = options?.actions;
+    this.metadata = options?.metadata;
+  }
+}
 
 function isAuthError(error: unknown): boolean {
   if (error && typeof error === "object" && "status" in error) {
@@ -327,6 +388,100 @@ function isAuthError(error: unknown): boolean {
 
   const msg = error instanceof Error ? error.message : String(error);
   return /unauthorized|invalid token|401|authentication/i.test(msg);
+}
+
+function extractErrorText(error: CodexSdkError): string {
+  return [error.rawMessage, error.message]
+    .filter((v): v is string => !!v)
+    .join(" ")
+    .toLowerCase();
+}
+
+function isUsageLimit429(error: CodexSdkError): boolean {
+  if (error.status !== 429) return false;
+
+  const text = extractErrorText(error);
+  if (text.includes("usage limit has been reached")) {
+    return true;
+  }
+
+  if (error.rawCode && /usage.*limit|insufficient_quota/i.test(error.rawCode)) {
+    return true;
+  }
+
+  if (error.body && typeof error.body === "object") {
+    const bodyText = JSON.stringify(error.body).toLowerCase();
+    if (
+      bodyText.includes("usage limit") ||
+      bodyText.includes("insufficient_quota")
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function isContextWindowExceeded(error: CodexSdkError): boolean {
+  const text = extractErrorText(error);
+  if (
+    text.includes("exceeds the context window") ||
+    text.includes("exceeded the context window") ||
+    text.includes("context length exceeded") ||
+    text.includes("maximum context length")
+  ) {
+    return true;
+  }
+
+  if (
+    error.rawCode &&
+    /context_length_exceeded|context_window_exceeded/i.test(error.rawCode)
+  ) {
+    return true;
+  }
+
+  if (error.body && typeof error.body === "object") {
+    const bodyText = JSON.stringify(error.body).toLowerCase();
+    if (
+      bodyText.includes("context window") ||
+      bodyText.includes("context length exceeded")
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function toCodexSdkError(error: unknown): CodexSdkError {
+  if (error instanceof CodexRequestError) {
+    return error;
+  }
+  if (error instanceof APIError) {
+    const status = error.status;
+    const message = error.message || "Unknown OpenAI error";
+    const body = (error as unknown as { error?: unknown; body?: unknown })
+      .error;
+    const rawCode =
+      (error as unknown as { code?: string }).code ??
+      ((body as Record<string, unknown> | undefined)?.code as
+        | string
+        | undefined);
+
+    return new CodexRequestError(
+      `Codex API error ${status ?? "unknown"}: ${message}`,
+      {
+        status,
+        rawMessage: message,
+        rawCode,
+        body,
+      },
+    );
+  }
+  if (error instanceof Error) {
+    return error as CodexSdkError;
+  }
+  return new Error(String(error)) as CodexSdkError;
 }
 
 export class CodexProvider implements ModelProvider {
@@ -360,13 +515,128 @@ export class CodexProvider implements ModelProvider {
     return listCodexModels(this.id);
   }
 
+  private async getModelAuthOrThrow(): Promise<OpenAiCodexResolvedAuth> {
+    const auth = await this.authManager.resolveModelAuth();
+    if (!auth) {
+      throw new CodexRequestError(
+        "OpenAI/Codex authentication is required. Sign in with ChatGPT/Codex or configure an OpenAI API key to use models, semantic search, and indexing.",
+        {
+          code: "auth_required",
+          retryable: true,
+          actions: { signIn: true },
+        },
+      );
+    }
+    return auth;
+  }
+
+  private getClient(auth: OpenAiCodexResolvedAuth): OpenAI {
+    const endpoint = getCodexEndpointConfig(auth, this.sessionId);
+    const tokenFingerprint = crypto
+      .createHash("sha256")
+      .update(auth.bearerToken)
+      .digest("hex")
+      .slice(0, 12);
+    const key = `${auth.method}:${auth.accountId ?? ""}:${endpoint.baseURL}:${tokenFingerprint}`;
+
+    const existing = this.clients.get(key);
+    if (existing) return existing;
+
+    const client = createOpenAiResponsesClient(auth, endpoint);
+    this.clients.set(key, client);
+    return client;
+  }
+
+  private buildRequestBody(params: {
+    model: string;
+    codexInput: CodexInputItem[];
+    systemPrompt: string;
+    maxTokens?: number;
+    state?: { store?: boolean; previousResponseId?: string };
+    cache?: { key?: string; retention?: "in_memory" | "24h" };
+    reasoningEffort?: string;
+    tools?: OpenAIResponses.Tool[];
+    auth: OpenAiCodexResolvedAuth;
+  }): CodexRequestBody {
+    const caps = getEndpointCaps(params.auth);
+    return buildStreamRequestBody({
+      model: params.model,
+      input: params.codexInput,
+      instructions: params.systemPrompt,
+      store: params.state?.store ?? false,
+      maxTokens: caps.supportsMaxOutputTokens ? params.maxTokens : undefined,
+      reasoning: params.reasoningEffort
+        ? buildReasoning(params.reasoningEffort)
+        : undefined,
+      previousResponseId: caps.supportsPreviousResponseId
+        ? params.state?.previousResponseId
+        : undefined,
+      tools: params.tools,
+      promptCacheKey: caps.supportsPromptCacheKey
+        ? params.cache?.key
+        : undefined,
+      promptCacheRetention:
+        params.cache?.retention === "24h" && caps.supportsPromptCacheRetention
+          ? "24h"
+          : undefined,
+    });
+  }
+
+  private async rotateOAuthAuth(
+    attemptedOAuthAccountIds: Set<string>,
+    currentAuth: OpenAiCodexResolvedAuth,
+  ): Promise<OpenAiCodexResolvedAuth | null> {
+    if (currentAuth.method !== "oauth") return null;
+    const currentAccountId = currentAuth.oauthAccountPoolId;
+    if (!currentAccountId) return null;
+
+    const ordered =
+      await this.authManager.getOAuthRoundRobinAccountIds(currentAccountId);
+    for (const accountId of ordered) {
+      if (attemptedOAuthAccountIds.has(accountId)) continue;
+      const auth =
+        await this.authManager.resolveModelAuthForOAuthAccount(accountId);
+      if (!auth || auth.method !== "oauth") continue;
+      attemptedOAuthAccountIds.add(accountId);
+      await this.authManager.setActiveOAuthAccount(accountId);
+      this.log(
+        `[codex] Rotated OAuth account: ${currentAuth.oauthAccountLabel ?? currentAccountId} -> ${auth.oauthAccountLabel ?? accountId}`,
+      );
+      return auth;
+    }
+
+    return null;
+  }
+
+  private buildUsageLimitExhaustedError(
+    attemptedOAuthAccountIds: Set<string>,
+    sourceError: CodexSdkError,
+  ): CodexRequestError {
+    return new CodexRequestError(
+      sourceError.message ||
+        "Codex API error 429: The usage limit has been reached on all signed-in accounts.",
+      {
+        status: sourceError.status,
+        rawMessage: sourceError.rawMessage,
+        rawCode: sourceError.rawCode,
+        body: sourceError.body,
+        code: "oauth_usage_limit_exhausted",
+        retryable: true,
+        actions: { signInAnotherAccount: true },
+        metadata: {
+          attemptedOAuthAccountIds: [...attemptedOAuthAccountIds],
+        },
+      },
+    );
+  }
+
   async *stream(request: StreamRequest): AsyncGenerator<ProviderStreamEvent> {
     const {
       model,
       systemPrompt,
       messages,
       tools,
-      maxTokens: _maxTokens,
+      maxTokens,
       thinking,
       cache,
       state,
@@ -376,53 +646,151 @@ export class CodexProvider implements ModelProvider {
     const codexInput = translateMessages(messages);
     const codexTools = tools ? translateTools(tools) : undefined;
 
+    // Log image presence in the translated input
+    {
+      let imageCount = 0;
+      let totalInputItems = 0;
+      for (const item of codexInput) {
+        if (
+          "content" in item &&
+          Array.isArray((item as { content?: unknown }).content)
+        ) {
+          const content = (
+            item as { content: Array<{ type: string; image_url?: string }> }
+          ).content;
+          for (const c of content) {
+            totalInputItems++;
+            if (c.type === "input_image") {
+              imageCount++;
+              const urlPreview = c.image_url
+                ? `${c.image_url.slice(0, 30)}...(${c.image_url.length} chars)`
+                : "MISSING";
+              this.log(`[codex:image] input_image found: url=${urlPreview}`);
+            }
+          }
+        }
+      }
+      this.log(
+        `[codex] stream() translated ${messages.length} messages → ${codexInput.length} input items (${totalInputItems} content parts, ${imageCount} images)`,
+      );
+    }
+
     const modelDef = CODEX_MODEL_MAP.get(model);
     const reasoningEffort = thinking
       ? "high"
       : (modelDef?.defaultReasoningEffort ?? "medium");
 
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const auth =
-        attempt === 0
-          ? await this.getModelAuthOrThrow()
-          : await this.authManager.forceRefreshModelAuth("oauth");
-      if (!auth) {
-        throw new Error(
-          "OpenAI/Codex authentication is required. Sign in with ChatGPT/Codex or configure an OpenAI API key to use models, semantic search, and indexing.",
+    let auth = await this.getModelAuthOrThrow();
+    const attemptedOAuthAccountIds = new Set<string>();
+    const refreshedOAuthAccountIds = new Set<string>();
+    if (auth.method === "oauth" && auth.oauthAccountPoolId) {
+      attemptedOAuthAccountIds.add(auth.oauthAccountPoolId);
+    }
+
+    while (true) {
+      const requestBody = this.buildRequestBody({
+        model,
+        codexInput,
+        systemPrompt,
+        maxTokens,
+        state,
+        cache,
+        reasoningEffort,
+        tools: codexTools,
+        auth,
+      });
+
+      // Log the request shape (not the full body — base64 data can be huge)
+      {
+        const inputItems = requestBody.input;
+        const inputSummary = Array.isArray(inputItems)
+          ? `${inputItems.length} items`
+          : "string";
+        const body = requestBody as unknown as Record<string, unknown>;
+        this.log(
+          `[codex] request: model=${requestBody.model} auth=${auth.method} input=${inputSummary} tools=${requestBody.tools?.length ?? 0} store=${requestBody.store} previousResponseId=${body.previous_response_id ?? "none"} cacheKey=${body.prompt_cache_key ?? "none"}`,
         );
       }
 
-      const caps = getEndpointCaps(auth);
-      const requestBody = buildStreamRequestBody({
-        model,
-        input: codexInput,
-        instructions: systemPrompt,
-        store: state?.store ?? false,
-        reasoning: buildReasoning(reasoningEffort),
-        previousResponseId: caps.supportsPreviousResponseId
-          ? state?.previousResponseId
-          : undefined,
-        tools: codexTools,
-        promptCacheKey: caps.supportsPromptCacheKey ? cache?.key : undefined,
-        promptCacheRetention:
-          cache?.retention === "24h" && caps.supportsPromptCacheRetention
-            ? "24h"
-            : undefined,
-      });
-
+      const streamState = { outputStarted: false };
       try {
-        yield* this.executeStream(requestBody, auth, model, signal);
+        const result = await this.executeStream(
+          requestBody,
+          auth,
+          model,
+          signal,
+          streamState,
+        );
+        yield* result;
         return;
       } catch (err) {
-        if (attempt === 0 && isAuthError(err) && auth.canRefresh) {
-          this.log("[codex] Auth failure, attempting token refresh...");
-          continue;
+        const sdkErr = toCodexSdkError(err);
+
+        if (auth.method === "oauth" && isAuthError(sdkErr) && auth.canRefresh) {
+          const refreshAccountId = auth.oauthAccountPoolId;
+          if (
+            refreshAccountId &&
+            refreshedOAuthAccountIds.has(refreshAccountId)
+          ) {
+            this.log(
+              `[codex] OAuth auth failure persists after refresh for account ${auth.oauthAccountLabel ?? refreshAccountId}`,
+            );
+          } else {
+            const refreshed = await this.authManager.forceRefreshModelAuth(
+              "oauth",
+              {
+                oauthAccountPoolId: refreshAccountId,
+              },
+            );
+            if (refreshAccountId) {
+              refreshedOAuthAccountIds.add(refreshAccountId);
+            }
+            if (refreshed) {
+              this.log("[codex] Auth failure, refreshed active OAuth account");
+              auth = refreshed;
+              continue;
+            }
+          }
         }
-        throw err;
+
+        if (
+          auth.method === "oauth" &&
+          isUsageLimit429(sdkErr) &&
+          auth.oauthAccountPoolId
+        ) {
+          await this.authManager.markOAuthUsageLimit(auth.oauthAccountPoolId);
+          if (!streamState.outputStarted) {
+            const nextAuth = await this.rotateOAuthAuth(
+              attemptedOAuthAccountIds,
+              auth,
+            );
+            if (nextAuth) {
+              auth = nextAuth;
+              continue;
+            }
+          }
+
+          throw this.buildUsageLimitExhaustedError(
+            attemptedOAuthAccountIds,
+            sdkErr,
+          );
+        }
+
+        if (isContextWindowExceeded(sdkErr)) {
+          throw new CodexRequestError(sdkErr.message, {
+            status: sdkErr.status,
+            rawMessage: sdkErr.rawMessage,
+            rawCode: sdkErr.rawCode,
+            body: sdkErr.body,
+            code: "context_window_exceeded",
+            retryable: true,
+            actions: { condense: true },
+          });
+        }
+
+        throw sdkErr;
       }
     }
-
-    throw new Error("Codex stream() failed unexpectedly");
   }
 
   async complete(request: CompleteRequest): Promise<CompleteResult> {
@@ -430,49 +798,41 @@ export class CodexProvider implements ModelProvider {
       model,
       systemPrompt,
       messages,
-      maxTokens: _maxTokens,
+      maxTokens,
       temperature: _temperature,
       cache,
       state,
     } = request;
+
     const codexInput = translateMessages(messages);
 
-    // Keep complete() intentionally minimal. The OAuth-backed Codex endpoint
-    // requires SSE even for non-interactive calls, and we aggregate the stream.
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const auth =
-        attempt === 0
-          ? await this.getModelAuthOrThrow()
-          : await this.authManager.forceRefreshModelAuth("oauth");
-      if (!auth) {
-        throw new Error(
-          "OpenAI/Codex authentication is required. Sign in with ChatGPT/Codex or configure an OpenAI API key to use models, semantic search, and indexing.",
-        );
-      }
+    let auth = await this.getModelAuthOrThrow();
+    const attemptedOAuthAccountIds = new Set<string>();
+    const refreshedOAuthAccountIds = new Set<string>();
+    if (auth.method === "oauth" && auth.oauthAccountPoolId) {
+      attemptedOAuthAccountIds.add(auth.oauthAccountPoolId);
+    }
 
-      const caps = getEndpointCaps(auth);
-      const requestBody = buildStreamRequestBody({
+    while (true) {
+      const requestBody = this.buildRequestBody({
         model,
-        input: codexInput,
-        instructions: systemPrompt,
-        store: state?.store ?? false,
-        previousResponseId: caps.supportsPreviousResponseId
-          ? state?.previousResponseId
-          : undefined,
-        promptCacheKey: caps.supportsPromptCacheKey ? cache?.key : undefined,
-        promptCacheRetention:
-          cache?.retention === "24h" && caps.supportsPromptCacheRetention
-            ? "24h"
-            : undefined,
+        codexInput,
+        systemPrompt,
+        maxTokens,
+        state,
+        cache,
+        auth,
       });
 
       let text = "";
       let inputTokens = 0;
       let outputTokens = 0;
+      let cacheReadTokens = 0;
+      let cacheCreationTokens = 0;
       let providerResponseId: string | undefined;
 
       try {
-        for await (const event of this.executeStream(
+        for await (const event of await this.executeStream(
           requestBody,
           auth,
           model,
@@ -482,68 +842,101 @@ export class CodexProvider implements ModelProvider {
           } else if (event.type === "usage") {
             inputTokens = event.inputTokens;
             outputTokens = event.outputTokens;
+            cacheReadTokens = event.cacheReadTokens ?? 0;
+            cacheCreationTokens = event.cacheCreationTokens ?? 0;
             providerResponseId = event.providerResponseId;
           }
         }
 
         return {
           text,
-          usage: { inputTokens, outputTokens },
+          usage: {
+            inputTokens,
+            outputTokens,
+            cacheReadTokens,
+            cacheCreationTokens,
+          },
           providerResponseId,
         };
       } catch (err) {
-        if (attempt === 0 && isAuthError(err) && auth.canRefresh) {
-          this.log(
-            "[codex] complete() auth failure, attempting token refresh...",
-          );
-          continue;
+        const sdkErr = toCodexSdkError(err);
+
+        if (auth.method === "oauth" && isAuthError(sdkErr) && auth.canRefresh) {
+          const refreshAccountId = auth.oauthAccountPoolId;
+          if (
+            refreshAccountId &&
+            refreshedOAuthAccountIds.has(refreshAccountId)
+          ) {
+            this.log(
+              `[codex] complete() OAuth auth failure persists after refresh for account ${auth.oauthAccountLabel ?? refreshAccountId}`,
+            );
+          } else {
+            const refreshed = await this.authManager.forceRefreshModelAuth(
+              "oauth",
+              {
+                oauthAccountPoolId: refreshAccountId,
+              },
+            );
+            if (refreshAccountId) {
+              refreshedOAuthAccountIds.add(refreshAccountId);
+            }
+            if (refreshed) {
+              this.log(
+                "[codex] complete() auth failure, refreshed OAuth token",
+              );
+              auth = refreshed;
+              continue;
+            }
+          }
         }
-        throw err;
+
+        if (
+          auth.method === "oauth" &&
+          isUsageLimit429(sdkErr) &&
+          auth.oauthAccountPoolId
+        ) {
+          await this.authManager.markOAuthUsageLimit(auth.oauthAccountPoolId);
+          const nextAuth = await this.rotateOAuthAuth(
+            attemptedOAuthAccountIds,
+            auth,
+          );
+          if (nextAuth) {
+            if (text.length > 0) {
+              this.log(
+                "[codex] complete() encountered usage-limit 429 after partial output; retrying with next OAuth account and discarding partial text",
+              );
+            }
+            auth = nextAuth;
+            continue;
+          }
+          throw this.buildUsageLimitExhaustedError(
+            attemptedOAuthAccountIds,
+            sdkErr,
+          );
+        }
+
+        if (isContextWindowExceeded(sdkErr)) {
+          throw new CodexRequestError(sdkErr.message, {
+            status: sdkErr.status,
+            rawMessage: sdkErr.rawMessage,
+            rawCode: sdkErr.rawCode,
+            body: sdkErr.body,
+            code: "context_window_exceeded",
+            retryable: true,
+            actions: { condense: true },
+          });
+        }
+
+        throw sdkErr;
       }
     }
-
-    throw new Error("Codex complete() failed unexpectedly");
   }
 
-  // ── Internal ──
-
-  private async getModelAuthOrThrow(): Promise<OpenAiCodexResolvedAuth> {
-    const auth = await this.authManager.resolveModelAuth();
-    if (!auth) {
-      throw new Error(
-        "OpenAI/Codex authentication is required. Sign in with ChatGPT/Codex or configure an OpenAI API key to use models, semantic search, and indexing.",
-      );
-    }
-    return auth;
-  }
-
-  private getClient(auth: OpenAiCodexResolvedAuth): OpenAI {
-    const endpoint = getCodexEndpointConfig(auth, this.sessionId);
-    const key = `${auth.method}:${auth.accountId ?? ""}:${endpoint.baseURL}`;
-
-    const client = createOpenAiResponsesClient(auth, endpoint);
-    this.clients.set(key, client);
-    return client;
-  }
-
-  private normalizeSdkError(error: unknown): CodexSdkError {
-    if (error instanceof APIError) {
-      const status = error.status;
-      const message = error.message || "Unknown OpenAI error";
-      const normalized = new Error(
-        `Codex API error ${status ?? "unknown"}: ${message}`,
-      ) as CodexSdkError;
-      normalized.status = status;
-      return normalized;
-    }
-    if (error instanceof Error) {
-      return error as CodexSdkError;
-    }
-    return new Error(String(error)) as CodexSdkError;
-  }
+  // ── Internal streaming parser ──
 
   private async *processResponseStreamEvents(
     events: AsyncIterable<Record<string, unknown>>,
+    state?: { outputStarted: boolean },
   ): AsyncGenerator<ProviderStreamEvent> {
     const contentBlocks: ContentBlock[] = [];
     let currentText = "";
@@ -558,6 +951,7 @@ export class CodexProvider implements ModelProvider {
     let inputTokens = 0;
     let outputTokens = 0;
     let cacheReadTokens = 0;
+    let cacheCreationTokens = 0;
     let providerResponseId: string | undefined;
 
     for await (const event of events) {
@@ -572,6 +966,7 @@ export class CodexProvider implements ModelProvider {
         const delta = event.delta as string | undefined;
         if (delta) {
           currentText += delta;
+          if (state) state.outputStarted = true;
           yield { type: "text_delta", text: delta };
         }
         continue;
@@ -588,9 +983,11 @@ export class CodexProvider implements ModelProvider {
         if (delta) {
           if (!thinkingId) {
             thinkingId = randomUUID();
+            if (state) state.outputStarted = true;
             yield { type: "thinking_start", thinkingId };
           }
           currentThinking += delta;
+          if (state) state.outputStarted = true;
           yield { type: "thinking_delta", thinkingId, text: delta };
         }
         continue;
@@ -602,6 +999,7 @@ export class CodexProvider implements ModelProvider {
         if (delta) {
           const refusalText = `[Refusal] ${delta}`;
           currentText += refusalText;
+          if (state) state.outputStarted = true;
           yield { type: "text_delta", text: refusalText };
         }
         continue;
@@ -620,6 +1018,7 @@ export class CodexProvider implements ModelProvider {
           const pending = pendingToolCalls.get(callId);
           if (pending) {
             pending.arguments += delta;
+            if (state) state.outputStarted = true;
             yield {
               type: "tool_input_delta",
               toolCallId: callId,
@@ -641,10 +1040,12 @@ export class CodexProvider implements ModelProvider {
             item.tool_call_id ??
             item.id) as string;
           const name = (item.name ??
-            (item.function as Record<string, unknown> | undefined)
-              ?.name) as string;
+            (item.function as Record<string, unknown> | undefined)?.name) as
+            | string
+            | undefined;
           if (callId && name) {
             pendingToolCalls.set(callId, { name, arguments: "" });
+            if (state) state.outputStarted = true;
             yield { type: "tool_start", toolCallId: callId, toolName: name };
           }
         }
@@ -662,8 +1063,9 @@ export class CodexProvider implements ModelProvider {
             item.tool_call_id ??
             item.id) as string;
           const name = (item.name ??
-            (item.function as Record<string, unknown> | undefined)
-              ?.name) as string;
+            (item.function as Record<string, unknown> | undefined)?.name) as
+            | string
+            | undefined;
           const argsRaw = item.arguments ?? item.input;
           const argsStr =
             typeof argsRaw === "string"
@@ -672,7 +1074,6 @@ export class CodexProvider implements ModelProvider {
                 ? JSON.stringify(argsRaw)
                 : "";
 
-          // Use accumulated args from deltas if available, fall back to done-event args
           const pending = pendingToolCalls.get(callId);
           const finalArgs = pending?.arguments || argsStr;
           const finalName = pending?.name ?? name;
@@ -692,6 +1093,7 @@ export class CodexProvider implements ModelProvider {
               input: parsed as Record<string, unknown>,
             });
 
+            if (state) state.outputStarted = true;
             yield {
               type: "tool_done",
               toolCallId: callId,
@@ -711,7 +1113,10 @@ export class CodexProvider implements ModelProvider {
           (errObj?.message as string) ??
           (event.message as string) ??
           "Unknown Codex API error";
-        throw new Error(`Codex API error: ${msg}`);
+        throw new CodexRequestError(`Codex API error: ${msg}`, {
+          rawMessage: msg,
+          body: errObj,
+        });
       }
       if (eventType === "response.failed") {
         const errObj = event.error as Record<string, unknown> | undefined;
@@ -719,7 +1124,10 @@ export class CodexProvider implements ModelProvider {
           (errObj?.message as string) ??
           (event.message as string) ??
           "Request failed";
-        throw new Error(`Codex request failed: ${msg}`);
+        throw new CodexRequestError(`Codex request failed: ${msg}`, {
+          rawMessage: msg,
+          body: errObj,
+        });
       }
 
       // ── Response done — extract usage and finalize ──
@@ -754,25 +1162,30 @@ export class CodexProvider implements ModelProvider {
             (usage.cache_read_input_tokens as number) ??
             0;
 
-          // OpenAI reports input/prompt tokens as the total prompt size, with
-          // cached tokens surfaced as a breakdown in input_tokens_details.
-          // Normalize to our internal convention where inputTokens is the
-          // uncached portion and cacheReadTokens is additive for total context.
+          cacheCreationTokens =
+            (inputDetails?.cache_creation_tokens as number) ??
+            (inputDetails?.cache_write_tokens as number) ??
+            (promptDetails?.cache_creation_tokens as number) ??
+            (promptDetails?.cache_write_tokens as number) ??
+            (usage.cache_creation_input_tokens as number) ??
+            (usage.cache_write_input_tokens as number) ??
+            (usage.cache_write_tokens as number) ??
+            0;
+
           inputTokens = Math.max(0, totalInputTokens - cacheReadTokens);
         }
 
-        // Extract any text from done response that wasn't streamed
         if (!currentText && Array.isArray(resp?.output)) {
           for (const item of resp.output as Array<Record<string, unknown>>) {
             if (item.type === "message" && Array.isArray(item.content)) {
               for (const c of item.content as Array<Record<string, unknown>>) {
                 if (c.type === "output_text" && typeof c.text === "string") {
                   currentText += c.text;
+                  if (state) state.outputStarted = true;
                   yield { type: "text_delta", text: c.text as string };
                 }
               }
             }
-            // Extract reasoning summaries from done event — only if not already streamed via deltas
             if (
               item.type === "reasoning" &&
               Array.isArray(item.summary) &&
@@ -782,9 +1195,11 @@ export class CodexProvider implements ModelProvider {
                 if (s?.type === "summary_text" && typeof s.text === "string") {
                   if (!thinkingId) {
                     thinkingId = randomUUID();
+                    if (state) state.outputStarted = true;
                     yield { type: "thinking_start", thinkingId };
                   }
                   currentThinking += s.text;
+                  if (state) state.outputStarted = true;
                   yield {
                     type: "thinking_delta",
                     thinkingId,
@@ -795,24 +1210,19 @@ export class CodexProvider implements ModelProvider {
             }
           }
         }
-        // Don't break — there might be more events in the stream
         continue;
       }
     }
 
-    // ── Finalize ──
-
-    // Close thinking block if open
     if (thinkingId) {
       yield { type: "thinking_end", thinkingId };
       contentBlocks.unshift({
         type: "thinking",
         thinking: currentThinking,
-        signature: "", // Codex doesn't use signatures
+        signature: "",
       } satisfies ThinkingBlock);
     }
 
-    // Add text block if any text was accumulated
     if (currentText) {
       contentBlocks.push({ type: "text", text: currentText });
     }
@@ -822,18 +1232,20 @@ export class CodexProvider implements ModelProvider {
       inputTokens,
       outputTokens,
       cacheReadTokens: cacheReadTokens || undefined,
+      cacheCreationTokens: cacheCreationTokens || undefined,
       providerResponseId,
     };
     yield { type: "content_blocks", blocks: contentBlocks };
     yield { type: "done" };
   }
 
-  private async *executeStream(
+  private async executeStream(
     requestBody: CodexRequestBody,
     auth: OpenAiCodexResolvedAuth,
     _model: string,
     signal?: AbortSignal,
-  ): AsyncGenerator<ProviderStreamEvent> {
+    streamState?: { outputStarted: boolean },
+  ): Promise<AsyncGenerator<ProviderStreamEvent>> {
     try {
       const client = this.getClient(auth);
       const stream = await client.responses.create(requestBody, {
@@ -841,12 +1253,12 @@ export class CodexProvider implements ModelProvider {
         maxRetries: 0,
       });
 
-      yield* this.processResponseStreamEvents(
+      return this.processResponseStreamEvents(
         stream as AsyncIterable<Record<string, unknown>>,
+        streamState,
       );
-      return;
     } catch (error) {
-      throw this.normalizeSdkError(error);
+      throw toCodexSdkError(error);
     }
   }
 }

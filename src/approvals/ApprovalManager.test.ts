@@ -126,6 +126,51 @@ describe("ApprovalManager session approval persistence", () => {
     }
   });
 
+  it("supports file-level agent write approval when a matching write rule exists", async () => {
+    const memento = new MockMemento();
+    const sessionId = "session-file-rule";
+
+    const { approvalManager, configStore } = await createManagers(memento);
+    approvalManager.addWriteRule(
+      sessionId,
+      { pattern: "src/feature", mode: "glob" },
+      "session",
+    );
+
+    expect(
+      approvalManager.isAgentWriteApproved(sessionId, "src/feature/file.ts"),
+    ).toBe(true);
+    expect(
+      approvalManager.isAgentWriteApproved(
+        sessionId,
+        "src/feature/nested/file.ts",
+      ),
+    ).toBe(true);
+    expect(
+      approvalManager.isAgentWriteApproved(sessionId, "src/other/file.ts"),
+    ).toBe(false);
+
+    approvalManager.dispose();
+    configStore.dispose();
+  });
+
+  it("does not auto-approve agent writes without file path unless blanket trust exists", async () => {
+    const memento = new MockMemento();
+    const sessionId = "session-no-file";
+
+    const { approvalManager, configStore } = await createManagers(memento);
+    approvalManager.addWriteRule(
+      sessionId,
+      { pattern: "src/feature", mode: "glob" },
+      "session",
+    );
+
+    expect(approvalManager.isAgentWriteApproved(sessionId)).toBe(false);
+
+    approvalManager.dispose();
+    configStore.dispose();
+  });
+
   it("does not restore cleared session approval state", async () => {
     const memento = new MockMemento();
     const sessionId = "session-2";

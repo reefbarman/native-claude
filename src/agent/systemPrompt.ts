@@ -132,6 +132,8 @@ const PROVIDER_PROMPTS: Record<string, string> = {
 - **\`search_files\` for exact matches only** — Use regex search only after \`codebase_search\` has identified the relevant area, or when you need to find a specific literal string/pattern you already know.
 - **Never use \`list_files\` to explore** — Do not browse directory trees to find code. Use \`codebase_search\` to find files by meaning instead.
 - **\`read_file\` with \`query\`** — Always pass the \`query\` parameter when reading a file to jump to the relevant section rather than reading from line 1.
+- **Terminal reuse by default** — For sequential \`execute_command\` calls, omit \`terminal_name\` and \`terminal_id\` so AgentLink reuses the default terminal. Only create a separate terminal when you intentionally need isolation (parallel/background work or temporary environment changes).
+- **Close dedicated terminals when done** — If you created named/background terminals, use \`close_terminals\` for targeted cleanup instead of leaving stale terminal tabs.
 - **\`output_file\` = STOP** — When \`execute_command\` or \`get_terminal_output\` returns an \`output_file\` field, the full output is already saved to that temp file. **NEVER re-run the command** to see more output or to search with different \`output_grep\` patterns. Instead, call \`read_file(output_file)\` to read the complete output. Re-running slow commands is a costly anti-pattern.`,
 };
 

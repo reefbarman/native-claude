@@ -4,8 +4,9 @@ import * as path from "path";
 import { randomUUID } from "crypto";
 import { providerRegistry } from "./providers/index.js";
 import { getConfiguredBaseThresholdForModel } from "./modelCondenseThresholds.js";
+import { getModeModelPreferences } from "./modeModelPreferences.js";
 import type { AgentSessionManager } from "./AgentSessionManager.js";
-import type { AgentEvent } from "./types.js";
+import type { AgentErrorActions, AgentEvent } from "./types.js";
 import type { TodoItem } from "./todoTool.js";
 import { SlashCommandRegistry } from "./SlashCommandRegistry.js";
 import { McpClientHub } from "./McpClientHub.js";
@@ -92,6 +93,8 @@ export type ExtensionToWebview =
       sessionId: string;
       error: string;
       retryable: boolean;
+      code?: string;
+      actions?: AgentErrorActions;
     }
   | {
       type: "agentDone";
@@ -216,6 +219,9 @@ export type ExtensionToWebview =
       type: "agentCondenseError";
       sessionId: string;
       error: string;
+      retryable?: boolean;
+      code?: string;
+      actions?: AgentErrorActions;
     }
   | {
       type: "agentCondenseStart";
@@ -248,7 +254,10 @@ export type ExtensionToWebview =
       lastOutputTokens: number;
       /** True when this came from automatic startup restore rather than explicit user action. */
       restored?: boolean;
-      /** turnIndex → checkpointId mapping for restored sessions */
+      /**
+       * Restored checkpoints keyed by the number of visible user turns already
+       * committed at that snapshot.
+       */
       checkpoints?: Array<{ turnIndex: number; checkpointId: string }>;
     }
   | {
@@ -309,6 +318,8 @@ export type ExtensionToWebview =
       sessionId: string;
       error: string;
       retryable: boolean;
+      code?: string;
+      actions?: AgentErrorActions;
     }
   | {
       type: "agentBgDone";
@@ -325,6 +336,8 @@ export type ExtensionToWebview =
       text: string;
       queueId: string;
       displayText?: string;
+      isSlashCommand?: boolean;
+      slashCommandLabel?: string;
     }
   | {
       type: "agentDebugInfo";
@@ -360,6 +373,12 @@ export interface ChatState {
   model: string;
   streaming: boolean;
   condenseThreshold?: number;
+  contextBudget?: {
+    outputReservation: number;
+    safetyBufferTokens: number;
+    softThresholdBudget: number;
+    hardBudget: number;
+  };
   agentWriteApproval?: "prompt" | "session" | "project" | "global";
 }
 
@@ -426,6 +445,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private approvalManagerListener: vscode.Disposable | undefined;
   private toolCallTracker: ToolCallTracker | undefined;
   private specialBlockPanel: vscode.WebviewPanel | undefined;
+  private lastMcpStatuses = new Map<
+    string,
+    { status: string; error?: string }
+  >();
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -543,12 +566,46 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     await this.slashRegistry.reload();
 
     this.mcpHub.onStatusChange = (infos) => {
-      this.log(`[mcp] server status changed`);
+      if (infos.length === 0) {
+        this.log(`[mcp] status update: no configured servers`);
+      } else {
+        const transitions: string[] = [];
+        for (const info of infos) {
+          const prev = this.lastMcpStatuses.get(info.name);
+          const prevStatus = prev?.status ?? "unknown";
+          const prevErr = prev?.error ?? "";
+          const nextErr = info.error ?? "";
+          const changed = prevStatus !== info.status || prevErr !== nextErr;
+          if (changed) {
+            const errSuffix = info.error ? ` error=${info.error}` : "";
+            transitions.push(
+              `${info.name}: ${prevStatus} -> ${info.status}${errSuffix}`,
+            );
+          }
+          this.lastMcpStatuses.set(info.name, {
+            status: info.status,
+            error: info.error,
+          });
+        }
+
+        if (transitions.length > 0) {
+          this.log(`[mcp] status transition(s): ${transitions.join(" | ")}`);
+        } else {
+          const snapshot = infos
+            .map((i) => `${i.name}=${i.status}${i.error ? `(${i.error})` : ""}`)
+            .join(", ");
+          this.log(`[mcp] status update (no transition): ${snapshot}`);
+        }
+      }
+
       // Push live updates to the status panel if it's open
       this.postMessage({
         type: "agentMcpStatus",
         infos,
       } as ExtensionToWebview);
+    };
+    this.mcpHub.onLog = (message) => {
+      this.log(message);
     };
     await this.refreshMcpConnections();
 
@@ -890,6 +947,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       displayName: m.displayName,
       provider: m.provider,
       contextWindow: m.capabilities.contextWindow,
+      maxOutputTokens: m.capabilities.maxOutputTokens,
       authenticated: authStatus[m.provider] ?? false,
       condenseThreshold: getConfiguredBaseThresholdForModel(config, m.id),
     }));
@@ -1132,6 +1190,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const mode = (msg.mode as string) ?? "code";
         const sessionId = msg.sessionId as string | undefined;
         const thinkingEnabled = msg.thinkingEnabled !== false;
+        const displayText = msg.displayText as string | undefined;
+        const isSlashCommand = msg.isSlashCommand === true;
+        const slashCommandLabel = msg.slashCommandLabel as string | undefined;
         const attachments = (msg.attachments as string[]) ?? [];
         const images =
           (msg.images as
@@ -1154,8 +1215,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const resolvedText = await this.resolveAttachments(text, attachments);
 
         this.log(
-          `[send] session=${sessionId ?? "new"} mode=${mode} thinking=${thinkingEnabled} attachments=${attachments.length} text="${resolvedText.slice(0, 80)}${resolvedText.length > 80 ? "..." : ""}"`,
+          `[send] session=${sessionId ?? "new"} mode=${mode} thinking=${thinkingEnabled} attachments=${attachments.length} images=${images.length} documents=${documents.length} text="${resolvedText.slice(0, 80)}${resolvedText.length > 80 ? "..." : ""}"`,
         );
+        if (images.length > 0) {
+          for (const img of images) {
+            this.log(
+              `[send:image] name="${img.name}" mimeType="${img.mimeType}" base64Length=${img.base64?.length ?? 0}`,
+            );
+          }
+        }
 
         const mgr = this.sessionManager;
 
@@ -1183,6 +1251,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           .sendMessage(effectiveSessionId, resolvedText, mode, {
             thinkingEnabled,
             activeFilePath: vscode.window.activeTextEditor?.document.uri.fsPath,
+            displayText,
+            isSlashCommand,
+            slashCommandLabel,
             images: images.length > 0 ? images : undefined,
             documents: documents.length > 0 ? documents : undefined,
           })
@@ -1337,11 +1408,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         // Update config, session model, and rebuild system prompt if provider changed
         await this.sessionManager.setModel(model);
         // Persist to VS Code global settings so it survives restarts
-        vscode.workspace
-          .getConfiguration("agentlink")
-          .update("agentModel", model, vscode.ConfigurationTarget.Global);
+        const config = vscode.workspace.getConfiguration("agentlink");
+        await config.update(
+          "agentModel",
+          model,
+          vscode.ConfigurationTarget.Global,
+        );
+
+        // Auto-save manual model changes as the default for the current mode.
+        const fgMode =
+          this.sessionManager.getForegroundSession()?.mode ?? "code";
+        const modePrefs = getModeModelPreferences(config);
+        await config.update(
+          "modeModelPreferences",
+          {
+            ...modePrefs,
+            [fgMode]: model,
+          },
+          vscode.ConfigurationTarget.Global,
+        );
+
         this.sendInitialState();
-        this.log(`Model changed to: ${model}`);
+        this.log(`Model changed to: ${model} (saved for mode: ${fgMode})`);
         break;
       }
 
@@ -1764,6 +1852,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const text = msg.text as string;
         const queueId = msg.queueId as string;
         const displayText = msg.displayText as string | undefined;
+        const isSlashCommand = msg.isSlashCommand === true;
+        const slashCommandLabel = msg.slashCommandLabel as string | undefined;
         const attachments = (msg.attachments as string[] | undefined) ?? [];
         const images =
           (msg.images as
@@ -1787,6 +1877,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             text,
             queueId,
             displayText,
+            isSlashCommand,
+            slashCommandLabel,
             attachments.length > 0 ? attachments : undefined,
             images.length > 0 ? images : undefined,
             documents.length > 0 ? documents : undefined,
@@ -1800,6 +1892,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const text = msg.text as string;
         const queueId = msg.queueId as string;
         const displayText = msg.displayText as string | undefined;
+        const isSlashCommand = msg.isSlashCommand === true;
+        const slashCommandLabel = msg.slashCommandLabel as string | undefined;
         const attachments = (msg.attachments as string[] | undefined) ?? [];
         const images =
           (msg.images as
@@ -1822,6 +1916,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           session?.updatePendingInterjection(queueId, {
             text,
             displayText,
+            isSlashCommand,
+            slashCommandLabel,
             attachments: attachments.length > 0 ? attachments : undefined,
             images: images.length > 0 ? images : undefined,
             documents: documents.length > 0 ? documents : undefined,
@@ -1854,6 +1950,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
       case "agentCodexSignOut": {
         vscode.commands.executeCommand("agentlink.codexSignOut");
+        break;
+      }
+
+      case "agentCodexAddAccount": {
+        vscode.commands.executeCommand("agentlink.codexAddAccount");
         break;
       }
 
@@ -1984,6 +2085,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           type: "agentCheckpointCreated",
           sessionId,
           checkpointId: event.checkpointId,
+          // Snapshot user-turn count at this checkpoint.
           turnIndex: event.turnIndex,
         } as ExtensionToWebview);
         break;
@@ -2073,11 +2175,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "error": {
         this.flushDeltaBuffersNow();
         this.log(
-          `[agent] error: ${event.error} (retryable=${event.retryable})`,
+          `[agent] error: ${event.error} (retryable=${event.retryable}, code=${event.code ?? "none"})`,
         );
         const session = this.sessionManager?.getSession(sessionId);
         if (session) {
-          session.appendRuntimeError(event.error, event.retryable);
+          session.appendRuntimeError({
+            message: event.error,
+            retryable: event.retryable,
+            code: event.code,
+            actions: event.actions,
+          });
           this.sessionManager?.saveSession(sessionId);
         }
         this.postMessage({
@@ -2085,6 +2192,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           sessionId,
           error: event.error,
           retryable: event.retryable,
+          code: event.code,
+          actions: event.actions,
         });
         // Keep bg strip in sync on error (flush any pending throttled update)
         if (isBackground) {
@@ -2150,11 +2259,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
 
       case "condense_error":
-        this.log(`[agent] condense_error: ${event.error}`);
+        this.log(
+          `[agent] condense_error: ${event.error} (retryable=${event.retryable ?? false}, code=${event.code ?? "none"})`,
+        );
         this.postMessage({
           type: "agentCondenseError",
           sessionId,
           error: event.error,
+          retryable: event.retryable,
+          code: event.code,
+          actions: event.actions,
         });
         break;
 
@@ -2169,6 +2283,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             text: event.text,
             queueId: event.queueId,
             displayText: event.displayText,
+            isSlashCommand: event.isSlashCommand,
+            slashCommandLabel: event.slashCommandLabel,
           });
         }
         break;
@@ -2624,12 +2740,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     if (confirmed !== "Revert") return;
 
-    const ok = await this.sessionManager.revertToCheckpoint(
+    const result = await this.sessionManager.revertToCheckpoint(
       sessionId,
       checkpointId,
     );
 
-    if (ok) {
+    if (result.ok) {
       this.log(
         `[agent] Reverted session ${sessionId} to checkpoint ${checkpointId}`,
       );
@@ -2645,6 +2761,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           lastOutputTokens: 0,
           checkpoints: this.getSessionCheckpoints(session.id),
         });
+      }
+      if (result.restoredPrompt) {
+        this.postMessage({
+          type: "agentInjectPrompt",
+          prompt: result.restoredPrompt,
+          attachments: [],
+        } as ExtensionToWebview);
       }
       this.sendInitialState();
       vscode.window.showInformationMessage("Reverted to checkpoint.");
@@ -2877,18 +3000,50 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     const fg = this.sessionManager.getForegroundSession();
     const config = this.sessionManager.getConfig();
+    const modelId = fg?.model ?? config.model;
+    const condenseThreshold = getConfiguredBaseThresholdForModel(
+      vscode.workspace.getConfiguration("agentlink"),
+      modelId,
+    );
+    const provider = providerRegistry.tryResolveProvider(modelId);
+    const caps = provider?.getCapabilities(modelId);
+    const contextBudget = caps
+      ? {
+          outputReservation: Math.min(
+            Math.max(
+              fg?.maxTokens ?? config.maxTokens,
+              (fg?.thinkingBudget ?? config.thinkingBudget ?? 0) + 4096,
+            ),
+            caps.maxOutputTokens,
+          ),
+          safetyBufferTokens: Math.floor(caps.contextWindow * 0.05),
+          softThresholdBudget: Math.floor(
+            caps.contextWindow * condenseThreshold,
+          ),
+          hardBudget: Math.max(
+            0,
+            caps.contextWindow -
+              Math.floor(caps.contextWindow * 0.05) -
+              Math.min(
+                Math.max(
+                  fg?.maxTokens ?? config.maxTokens,
+                  (fg?.thinkingBudget ?? config.thinkingBudget ?? 0) + 4096,
+                ),
+                caps.maxOutputTokens,
+              ),
+          ),
+        }
+      : undefined;
     const state: ChatState = {
       sessionId: fg?.id ?? null,
       mode: fg?.mode ?? "code",
-      model: fg?.model ?? config.model,
+      model: modelId,
       streaming:
         fg?.status === "streaming" ||
         fg?.status === "tool_executing" ||
         fg?.status === "awaiting_approval",
-      condenseThreshold: getConfiguredBaseThresholdForModel(
-        vscode.workspace.getConfiguration("agentlink"),
-        fg?.model ?? config.model,
-      ),
+      condenseThreshold,
+      contextBudget,
       // Use the foreground session's ID so the write approval state reflects the
       // current session's trust level rather than a shared synthetic "agent" ID.
       agentWriteApproval: this.approvalManager?.getAgentWriteApprovalState(
@@ -2962,7 +3117,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** Build checkpoint mapping for a session (turnIndex → checkpointId). */
+  /**
+   * Build checkpoint mapping for a session.
+   * `turnIndex` is the count of visible user turns already committed at the
+   * checkpoint snapshot; the webview renders the badge on the preceding user row.
+   */
   private getSessionCheckpoints(
     sessionId: string,
   ): Array<{ turnIndex: number; checkpointId: string }> | undefined {

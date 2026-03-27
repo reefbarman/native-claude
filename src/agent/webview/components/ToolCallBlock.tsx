@@ -74,6 +74,10 @@ function getToolSummary(
       if (extractField(result, "error")) {
         return [filePart(path), { type: "text", text: " — error" }];
       }
+      const status = extractField(result, "status");
+      if (status) {
+        return [filePart(path), { type: "text", text: ` — ${status}` }];
+      }
       const op = extractField(result, "operation") ?? "written";
       return [filePart(path), { type: "text", text: ` (${op})` }];
     }
@@ -374,7 +378,8 @@ function hasToolWarning(payload: Record<string, unknown> | null): boolean {
     status === "rejected" ||
     status === "rejected_by_user" ||
     status === "timed_out" ||
-    status === "force-completed"
+    status === "force-completed" ||
+    status === "stopped"
   );
 }
 

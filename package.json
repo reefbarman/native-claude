@@ -2,7 +2,7 @@
   "name": "agentlink",
   "displayName": "AgentLink",
   "description": "MCP server that provides AI agents with native VS Code tools — diff-based file editing, integrated terminal, diagnostics",
-  "version": "1.7.5",
+  "version": "1.9.2",
   "publisher": "agentlink",
   "repository": {
     "type": "git",
@@ -144,6 +144,26 @@
       {
         "command": "agentlink.codexSignOut",
         "title": "AgentLink: Manage OpenAI/Codex Authentication"
+      },
+      {
+        "command": "agentlink.codexManageAccounts",
+        "title": "AgentLink: Manage ChatGPT/Codex Accounts"
+      },
+      {
+        "command": "agentlink.codexAddAccount",
+        "title": "AgentLink: Add ChatGPT/Codex Account"
+      },
+      {
+        "command": "agentlink.codexSwitchAccount",
+        "title": "AgentLink: Switch Active ChatGPT/Codex Account"
+      },
+      {
+        "command": "agentlink.codexReplaceAccount",
+        "title": "AgentLink: Re-sign In / Replace ChatGPT/Codex Account"
+      },
+      {
+        "command": "agentlink.setupSemanticSearch",
+        "title": "AgentLink: Set Up Semantic Search"
       }
     ],
     "menus": {
@@ -318,7 +338,20 @@
         "agentlink.agentModel": {
           "type": "string",
           "default": "claude-sonnet-4-6",
-          "description": "Model to use for the built-in agent chat. Use /model in the chat to see available models."
+          "description": "Legacy global fallback model for the built-in agent chat. Use agentlink.modeModelPreferences for mode-specific defaults."
+        },
+        "agentlink.modeModelPreferences": {
+          "type": "object",
+          "default": {
+            "code": "gpt-5.3-codex",
+            "architect": "gpt-5.4",
+            "ask": "gpt-5.4-mini",
+            "debug": "gpt-5.3-codex"
+          },
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Default model per chat mode, keyed by mode slug (e.g. code, architect, ask, debug, review). Manually selecting a model in a mode updates that mode's saved preference."
         },
         "agentlink.agentMaxTokens": {
           "type": "number",
@@ -425,6 +458,7 @@
     "zod-to-json-schema": "^3.25.1"
   },
   "devDependencies": {
+    "@testing-library/preact": "^3.2.4",
     "@types/dompurify": "^3.0.5",
     "@types/node": "^25.3.2",
     "@types/picomatch": "^4.0.2",

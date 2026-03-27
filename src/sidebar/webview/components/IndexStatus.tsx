@@ -1,4 +1,5 @@
 import type { SidebarState, PostCommand } from "../types.js";
+import type { SemanticReadinessReason } from "../../../shared/semanticReadiness.js";
 import { CollapsibleSection } from "./common/CollapsibleSection.js";
 
 interface Props {
@@ -44,6 +45,9 @@ export function IndexStatus({ state, postCommand }: Props) {
         : "Discovering files..."
       : completedText;
 
+  const readinessReason = status?.readinessReason;
+  const showRemediation = isError && Boolean(readinessReason);
+
   const progress =
     isIndexing && status?.current != null && status?.total
       ? Math.round((status.current / status.total) * 100)
@@ -69,7 +73,8 @@ export function IndexStatus({ state, postCommand }: Props) {
             {status.lastCompleted.errorCount != null &&
               status.lastCompleted.errorCount > 0 && (
                 <span class="index-errors">
-                  {" \u2014 "}{status.lastCompleted.errorCount} error
+                  {" \u2014 "}
+                  {status.lastCompleted.errorCount} error
                   {status.lastCompleted.errorCount > 1 ? "s" : ""} (check Output
                   panel)
                 </span>
@@ -77,34 +82,174 @@ export function IndexStatus({ state, postCommand }: Props) {
           </div>
         )}
 
-        <div class="button-group">
-          {!isIndexing && wasCancelled && (
-            <button
-              class="btn btn-secondary"
-              onClick={() => postCommand("resumeIndex")}
-            >
-              Resume
-            </button>
-          )}
-          {!isIndexing && (
-            <button
-              class="btn btn-secondary"
-              onClick={() => postCommand("rebuildIndex")}
-            >
-              {isError ? "Retry" : status?.lastCompleted && !wasCancelled ? "Rebuild Index" : "Index Codebase"}
-            </button>
-          )}
-          {isIndexing && (
-            <button
-              class="btn btn-secondary"
-              onClick={() => postCommand("cancelIndex")}
-            >
-              Cancel
-            </button>
-          )}
-        </div>
+        {showRemediation && readinessReason ? (
+          <ReadinessActions
+            readinessReason={readinessReason}
+            readinessMessage={status?.readinessMessage ?? status?.error}
+            postCommand={postCommand}
+          />
+        ) : (
+          <div class="button-group">
+            {!isIndexing && wasCancelled && (
+              <button
+                class="btn btn-secondary"
+                onClick={() => postCommand("resumeIndex")}
+              >
+                Resume
+              </button>
+            )}
+            {!isIndexing && (
+              <button
+                class="btn btn-secondary"
+                onClick={() => postCommand("rebuildIndex")}
+              >
+                {isError
+                  ? "Retry"
+                  : status?.lastCompleted && !wasCancelled
+                    ? "Rebuild Index"
+                    : "Index Codebase"}
+              </button>
+            )}
+            {isIndexing && (
+              <button
+                class="btn btn-secondary"
+                onClick={() => postCommand("cancelIndex")}
+              >
+                Cancel
+              </button>
+            )}
+          </div>
+        )}
       </div>
     </CollapsibleSection>
+  );
+}
+
+interface ReadinessActionsProps {
+  readinessReason: SemanticReadinessReason;
+  readinessMessage?: string;
+  postCommand: PostCommand;
+}
+
+function ReadinessActions({
+  readinessReason,
+  readinessMessage,
+  postCommand,
+}: ReadinessActionsProps) {
+  const message =
+    readinessMessage ??
+    "Semantic search/indexing setup is required before this action can run.";
+
+  if (readinessReason === "missing_embeddings_auth") {
+    return (
+      <div class="index-remediation">
+        <p class="help-text index-remediation-text">{message}</p>
+        <div class="button-group">
+          <button
+            class="btn btn-primary"
+            onClick={() => postCommand("setOpenaiApiKey")}
+          >
+            Set Embeddings API Key
+          </button>
+          <button
+            class="btn btn-secondary"
+            onClick={() => postCommand("setOpenaiModelsAndEmbeddingsApiKey")}
+          >
+            Set Models + Embeddings API Key
+          </button>
+          <button
+            class="btn btn-secondary"
+            onClick={() =>
+              postCommand("setupSemanticSearch", { reason: readinessReason })
+            }
+          >
+            Guided Setup
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (readinessReason === "missing_index") {
+    return (
+      <div class="index-remediation">
+        <p class="help-text index-remediation-text">{message}</p>
+        <div class="button-group">
+          <button
+            class="btn btn-primary"
+            onClick={() => postCommand("rebuildIndex")}
+          >
+            Index Codebase
+          </button>
+          <button
+            class="btn btn-secondary"
+            onClick={() =>
+              postCommand("setupSemanticSearch", { reason: readinessReason })
+            }
+          >
+            Guided Setup
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (readinessReason === "qdrant_unavailable") {
+    return (
+      <div class="index-remediation">
+        <p class="help-text index-remediation-text">{message}</p>
+        <div class="button-group">
+          <button
+            class="btn btn-primary"
+            onClick={() => postCommand("rebuildIndex")}
+          >
+            Retry
+          </button>
+          <button
+            class="btn btn-secondary"
+            onClick={() => postCommand("openSettings")}
+          >
+            Open Settings
+          </button>
+          <button
+            class="btn btn-secondary"
+            onClick={() => postCommand("openOutput")}
+          >
+            Open Output
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (readinessReason === "disabled") {
+    return (
+      <div class="index-remediation">
+        <p class="help-text index-remediation-text">{message}</p>
+        <div class="button-group">
+          <button
+            class="btn btn-primary"
+            onClick={() => postCommand("openSettings")}
+          >
+            Enable in Settings
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div class="index-remediation">
+      <p class="help-text index-remediation-text">{message}</p>
+      <div class="button-group">
+        <button
+          class="btn btn-secondary"
+          onClick={() => postCommand("rebuildIndex")}
+        >
+          Retry
+        </button>
+      </div>
+    </div>
   );
 }
 

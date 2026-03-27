@@ -130,21 +130,17 @@ function isAuthError(msg: string): boolean {
   );
 }
 
-function getContextWindow(model: string, provider: ModelProvider): number {
-  return provider.getCapabilities(model).contextWindow;
-}
+/**
+ * Safety buffer percentage subtracted from the context window when computing
+ * the hard-fit budget. This mirrors Roo Code's buffer concept and absorbs
+ * mismatch between our local estimate and the provider's real token accounting.
+ */
+const CONTEXT_WINDOW_SAFETY_BUFFER = 0.05;
 
-function isOverCondenseThresholdInternal(
-  session: AgentSession,
-  provider: ModelProvider,
+function estimatePendingToolResultTokens(
   toolResults?: ToolCallResult[],
-): boolean {
-  if (!session.autoCondense || session.lastInputTokens === 0) return false;
-  const contextWindow = getContextWindow(session.model, provider);
-  const usableWindow = contextWindow - session.maxTokens;
-  if (usableWindow <= 0) return false;
-
-  const estimatedResultTokens = toolResults
+): number {
+  return toolResults
     ? Math.ceil(
         toolResults.reduce(
           (n, tr) =>
@@ -156,15 +152,90 @@ function isOverCondenseThresholdInternal(
         ) / 4,
       )
     : 0;
-  const used =
+}
+
+/**
+ * Compute the effective output-token reservation for a model.
+ *
+ * Reserve the actual request budget (clamped to the model cap). This keeps the
+ * hard-fit guardrail aligned with what the provider request is expected to
+ * enforce server-side.
+ */
+function getOutputReservation(
+  session: AgentSession,
+  provider: ModelProvider,
+): number {
+  const caps = provider.getCapabilities(session.model);
+  return Math.min(
+    Math.max(session.maxTokens, session.thinkingBudget + 4096),
+    caps.maxOutputTokens,
+  );
+}
+
+function getCondenseBudgetSnapshot(
+  session: AgentSession,
+  provider: ModelProvider,
+  toolResults?: ToolCallResult[],
+): {
+  usedTokens: number;
+  outputReservation: number;
+  safetyBufferTokens: number;
+  softThresholdBudget: number;
+  hardBudget: number;
+  effectiveThreshold: number;
+  triggerReason: "soft_threshold" | "hard_budget" | null;
+} {
+  const caps = provider.getCapabilities(session.model);
+  const outputReservation = getOutputReservation(session, provider);
+  const safetyBufferTokens = Math.floor(
+    caps.contextWindow * CONTEXT_WINDOW_SAFETY_BUFFER,
+  );
+  const estimatedResultTokens = estimatePendingToolResultTokens(toolResults);
+  const usedTokens =
     session.lastInputTokens + session.lastOutputTokens + estimatedResultTokens;
-  const usedFraction = used / usableWindow;
-  const cacheHitRatio = session.lastCacheReadTokens / session.lastInputTokens;
+  const cacheHitRatio =
+    session.lastInputTokens > 0
+      ? session.lastCacheReadTokens / session.lastInputTokens
+      : 0;
   const effectiveThreshold = Math.min(
     session.autoCondenseThreshold + cacheHitRatio * 0.1,
     0.95,
   );
-  return usedFraction >= effectiveThreshold;
+  const softThresholdBudget = Math.floor(
+    caps.contextWindow * effectiveThreshold,
+  );
+  const hardBudget = Math.max(
+    0,
+    caps.contextWindow - safetyBufferTokens - outputReservation,
+  );
+  const triggerReason =
+    usedTokens >= hardBudget
+      ? "hard_budget"
+      : usedTokens >= softThresholdBudget
+        ? "soft_threshold"
+        : null;
+
+  return {
+    usedTokens,
+    outputReservation,
+    safetyBufferTokens,
+    softThresholdBudget,
+    hardBudget,
+    effectiveThreshold,
+    triggerReason,
+  };
+}
+
+function isOverCondenseThresholdInternal(
+  session: AgentSession,
+  provider: ModelProvider,
+  toolResults?: ToolCallResult[],
+): boolean {
+  if (!session.autoCondense || session.lastInputTokens === 0) return false;
+  return (
+    getCondenseBudgetSnapshot(session, provider, toolResults).triggerReason !==
+    null
+  );
 }
 
 function hasUnansweredUserTurn(session: AgentSession): boolean {
@@ -186,6 +257,58 @@ interface ToolCallResult {
   toolName: string;
   result: ToolResult;
   durationMs: number;
+}
+
+function parseToolResultPayload(
+  result: ToolResult,
+): Record<string, unknown> | null {
+  const text = result.content.find(
+    (c): c is { type: "text"; text: string } => c.type === "text",
+  )?.text;
+  if (!text) return null;
+  try {
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return null;
+    }
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function getSuccessfulModeSwitch(
+  result: ToolCallResult,
+): { mode?: string } | null {
+  if (result.toolName !== "switch_mode") return null;
+  const payload = parseToolResultPayload(result.result);
+  if (!payload || payload.ok !== true) return null;
+  return {
+    mode: typeof payload.mode === "string" ? payload.mode : undefined,
+  };
+}
+
+function buildModeSwitchSkippedResult(
+  call: ToolUseBlock,
+  switchedMode?: string,
+): ToolCallResult {
+  const payload: Record<string, unknown> = {
+    status: "skipped",
+    skipped_by: "mode_switch",
+    reason:
+      "Skipped because mode switched during this tool batch. Continue in the resumed turn.",
+  };
+  if (switchedMode) {
+    payload.mode = switchedMode;
+  }
+  return {
+    tool_use_id: call.id,
+    toolName: call.name,
+    result: {
+      content: [{ type: "text", text: JSON.stringify(payload) }],
+    },
+    durationMs: 0,
+  };
 }
 
 // Per-tool character limits for tool results kept in conversation history.
@@ -439,7 +562,11 @@ export class AgentEngine {
               interjection.text,
               interjection.attachments,
             );
-            session.addUserMessage(resolvedInterjectionText);
+            session.addUserMessage(resolvedInterjectionText, {
+              displayText: interjection.displayText,
+              isSlashCommand: interjection.isSlashCommand === true,
+              slashCommandLabel: interjection.slashCommandLabel,
+            });
             session.setPendingMedia(
               session.messageCount - 1,
               interjection.images,
@@ -450,6 +577,8 @@ export class AgentEngine {
               text: interjection.text,
               queueId: interjection.queueId,
               displayText: interjection.displayText,
+              isSlashCommand: interjection.isSlashCommand === true,
+              slashCommandLabel: interjection.slashCommandLabel,
             };
           }
         }
@@ -500,17 +629,66 @@ export class AgentEngine {
           // Build a copy of messages for the API call, injecting any pending
           // media (pasted images/PDFs) as content blocks alongside the text.
           // getPendingMedia() is non-destructive — safe across retries.
-          const apiMessages: MessageParam[] = session
-            .getMessages()
-            .map(({ role, content }, idx) => {
-              const media = session.getPendingMedia(idx);
-              if (media && role === "user" && typeof content === "string") {
+          //
+          // Pending media is keyed by the raw message index (from session.messages),
+          // but getMessages() returns a filtered/transformed view that may have
+          // different indices. Build a raw-index map so lookups stay aligned.
+          const rawMessages = session.getAllMessages();
+          const effectiveMessages = session.getMessages();
+
+          this.log?.(
+            `[media] building apiMessages: rawCount=${rawMessages.length} effectiveCount=${effectiveMessages.length}`,
+          );
+
+          // Map each effective message to its raw-array index by identity (===).
+          // This handles filtering (runtimeError, condensed messages) and
+          // content transforms (injectSyntheticToolResults) that change indices.
+          const rawIndexMap = new Map<object, number>();
+          for (let ri = 0; ri < rawMessages.length; ri++) {
+            rawIndexMap.set(rawMessages[ri], ri);
+          }
+
+          const apiMessages: MessageParam[] = effectiveMessages.map(
+            (msg, effectiveIdx) => {
+              const { role, content } = msg;
+              // Look up by identity first; for messages whose content was
+              // transformed by injectSyntheticToolResults (spread into a new
+              // object), fall back to undefined — those won't have pending media.
+              const rawIdx = rawIndexMap.get(msg);
+              const media =
+                rawIdx !== undefined
+                  ? session.getPendingMedia(rawIdx)
+                  : undefined;
+              if (media) {
+                this.log?.(
+                  `[media] found pending media at effectiveIdx=${effectiveIdx} rawIdx=${rawIdx} role=${role} contentType=${typeof content === "string" ? "string" : Array.isArray(content) ? `array(${content.length})` : "other"} images=${media.images.length} documents=${media.documents.length}`,
+                );
+              }
+              if (media && role === "user") {
                 const imageBlocks: ImageBlock[] = media.images
                   .map((img) => {
-                    const mediaType = toSupportedImageMediaType(img.mimeType);
+                    // Try the declared mimeType first; if empty/unsupported,
+                    // infer from the filename extension as a fallback.
+                    let mediaType = toSupportedImageMediaType(img.mimeType);
+                    if (!mediaType && img.name) {
+                      const ext = img.name.split(".").pop()?.toLowerCase();
+                      const extMap: Record<string, string> = {
+                        png: "image/png",
+                        jpg: "image/jpeg",
+                        jpeg: "image/jpeg",
+                        gif: "image/gif",
+                        webp: "image/webp",
+                      };
+                      if (ext && extMap[ext]) {
+                        mediaType = toSupportedImageMediaType(extMap[ext]);
+                        this.log?.(
+                          `[media] inferred mimeType="${extMap[ext]}" from filename "${img.name}" (original mimeType="${img.mimeType}")`,
+                        );
+                      }
+                    }
                     if (!mediaType) {
                       this.log?.(
-                        `[media] skipping unsupported image type: ${img.mimeType}`,
+                        `[media] skipping unsupported image type: "${img.mimeType}" name="${img.name}"`,
                       );
                       return null;
                     }
@@ -525,7 +703,29 @@ export class AgentEngine {
                   })
                   .filter((b): b is ImageBlock => b !== null);
 
+                const textContent =
+                  typeof content === "string"
+                    ? content
+                    : Array.isArray(content)
+                      ? content
+                          .filter(
+                            (b): b is { type: "text"; text: string } =>
+                              b.type === "text",
+                          )
+                          .map((b) => b.text)
+                          .join("\n")
+                      : "";
+
+                // Preserve any existing non-text blocks (e.g. tool_result
+                // injected by injectSyntheticToolResults) alongside new media.
+                const existingBlocks: ContentBlock[] = Array.isArray(content)
+                  ? (content.filter((b) => b.type !== "text") as ContentBlock[])
+                  : [];
+
                 const blocks: ContentBlock[] = [
+                  ...(textContent
+                    ? [{ type: "text" as const, text: textContent }]
+                    : []),
                   ...imageBlocks,
                   ...media.documents.map((doc) => ({
                     type: "document" as const,
@@ -536,12 +736,35 @@ export class AgentEngine {
                     },
                     title: doc.name,
                   })),
-                  { type: "text" as const, text: content },
+                  ...existingBlocks,
                 ];
+                this.log?.(
+                  `[media] injected media into user message: blockTypes=[${blocks.map((b) => b.type).join(",")}] imageBlocks=${imageBlocks.length} existingBlocks=${existingBlocks.length}`,
+                );
                 return { role, content: blocks };
               }
               return { role, content };
-            });
+            },
+          );
+
+          // Summary: count image/document blocks across all apiMessages
+          {
+            let imgCount = 0;
+            let docCount = 0;
+            for (const m of apiMessages) {
+              if (Array.isArray(m.content)) {
+                for (const b of m.content) {
+                  if (b.type === "image") imgCount++;
+                  if (b.type === "document") docCount++;
+                }
+              }
+            }
+            if (imgCount > 0 || docCount > 0) {
+              this.log?.(
+                `[media] final apiMessages: ${apiMessages.length} messages, ${imgCount} image(s), ${docCount} document(s)`,
+              );
+            }
+          }
 
           const isCodex = provider.id === "codex";
           const useStatefulCodex =
@@ -678,7 +901,19 @@ export class AgentEngine {
           }
 
           // Context too long: auto-condense and retry rather than failing.
-          if (streamErrMsg.includes("prompt is too long")) {
+          // Catches both Anthropic ("prompt is too long") and Codex
+          // ("exceeds the context window") errors.
+          const isContextTooLong =
+            streamErrMsg.includes("prompt is too long") ||
+            streamErrMsg.includes("exceeds the context window") ||
+            streamErrMsg.includes("context length exceeded") ||
+            streamErrMsg.includes("maximum context length") ||
+            (streamErr &&
+              typeof streamErr === "object" &&
+              "code" in streamErr &&
+              (streamErr as { code?: string }).code ===
+                "context_window_exceeded");
+          if (isContextTooLong) {
             yield {
               type: "warning",
               message:
@@ -1064,6 +1299,15 @@ export class AgentEngine {
           };
         }
 
+        const successfulModeSwitch = toolResults.find((tr) =>
+          getSuccessfulModeSwitch(tr),
+        );
+        if (successfulModeSwitch) {
+          // Enforce a hard boundary: after a successful mode switch, stop this turn
+          // before another provider round-trip under the previous request contract.
+          break;
+        }
+
         // Post-batch condense check: tool results may have added significant tokens
         // that aren't reflected in lastInputTokens yet (which still shows the count
         // from before the results were appended). Estimate the result size and
@@ -1089,7 +1333,11 @@ export class AgentEngine {
               interjection.text,
               interjection.attachments,
             );
-            session.addUserMessage(resolvedInterjectionText);
+            session.addUserMessage(resolvedInterjectionText, {
+              displayText: interjection.displayText,
+              isSlashCommand: interjection.isSlashCommand === true,
+              slashCommandLabel: interjection.slashCommandLabel,
+            });
             session.setPendingMedia(
               session.messageCount - 1,
               interjection.images,
@@ -1100,6 +1348,8 @@ export class AgentEngine {
               text: interjection.text,
               queueId: interjection.queueId,
               displayText: interjection.displayText,
+              isSlashCommand: interjection.isSlashCommand === true,
+              slashCommandLabel: interjection.slashCommandLabel,
             };
           }
         }
@@ -1115,10 +1365,48 @@ export class AgentEngine {
       const errorMessage = buildErrorMessage(err);
       const isAuth =
         err instanceof AuthenticationError || isAuthError(errorMessage);
+      const retryable =
+        isAuth ||
+        isRetryableError(errorMessage) ||
+        !!(
+          err &&
+          typeof err === "object" &&
+          "retryable" in err &&
+          (err as { retryable?: boolean }).retryable
+        );
+      const code =
+        err &&
+        typeof err === "object" &&
+        "code" in err &&
+        typeof (err as { code?: unknown }).code === "string"
+          ? ((err as { code: string }).code as string)
+          : undefined;
+      const actions =
+        err &&
+        typeof err === "object" &&
+        "actions" in err &&
+        (err as { actions?: unknown }).actions &&
+        typeof (err as { actions?: unknown }).actions === "object"
+          ? ((
+              err as {
+                actions: {
+                  signIn?: boolean;
+                  signInAnotherAccount?: boolean;
+                  condense?: boolean;
+                };
+              }
+            ).actions as {
+              signIn?: boolean;
+              signInAnotherAccount?: boolean;
+              condense?: boolean;
+            })
+          : undefined;
       yield {
         type: "error",
         error: errorMessage,
-        retryable: isAuth || isRetryableError(errorMessage),
+        retryable,
+        code,
+        actions,
       };
       return;
     } finally {
@@ -1248,7 +1536,9 @@ export class AgentEngine {
     const readOnlyIndices: number[] = [];
     const writeIndices: number[] = [];
     for (let i = 0; i < calls.length; i++) {
-      if (READ_ONLY_TOOLS.has(calls[i].name)) {
+      const name = calls[i].name;
+      const isReadOnly = READ_ONLY_TOOLS.has(name);
+      if (isReadOnly) {
         readOnlyIndices.push(i);
       } else {
         writeIndices.push(i);
@@ -1278,9 +1568,29 @@ export class AgentEngine {
     await Promise.all(readOnlyIndices.map((i) => executeAtIndex(i)));
 
     // Execute write tools sequentially
-    for (const i of writeIndices) {
+    for (let wi = 0; wi < writeIndices.length; wi++) {
+      const i = writeIndices[wi];
       if (signal.aborted) break;
       await executeAtIndex(i);
+
+      const completed = resultSlots[i];
+      if (!completed) continue;
+      const modeSwitch = getSuccessfulModeSwitch(completed);
+      if (!modeSwitch) continue;
+
+      // A successful mode switch is a turn boundary. Skip any trailing
+      // non-read-only tools from this batch so they execute in the resumed turn.
+      for (let r = wi + 1; r < writeIndices.length; r++) {
+        const skipIdx = writeIndices[r];
+        if (resultSlots[skipIdx]) continue;
+        const skipped = buildModeSwitchSkippedResult(
+          calls[skipIdx],
+          modeSwitch.mode,
+        );
+        resultSlots[skipIdx] = skipped;
+        onToolComplete?.(skipped);
+      }
+      break;
     }
 
     // Return results in original order, filling any gaps (from abort) with errors
@@ -1309,6 +1619,7 @@ export class AgentEngine {
     provider?: ModelProvider,
     preservedContext?: { toolNames: string[]; mcpServerNames?: string[] },
   ): AsyncGenerator<AgentEvent> {
+    const condenseStartedAt = Date.now();
     yield { type: "condense_start", isAutomatic };
 
     const prevInputTokens = session.lastInputTokens;
@@ -1321,6 +1632,7 @@ export class AgentEngine {
       {
         messages: session.getAllMessages(),
         provider: resolvedProvider,
+        activeModel: session.model,
         systemPrompt: session.systemPrompt,
         isAutomatic,
         filesRead: [...session.filesRead],
@@ -1331,11 +1643,35 @@ export class AgentEngine {
     );
 
     if (result.error) {
-      yield { type: "condense_error", error: result.error };
+      yield {
+        type: "condense_error",
+        error: result.error,
+        retryable: result.errorRetryable,
+        code: result.errorCode,
+        actions: result.errorActions,
+      };
       return;
     }
 
-    session.replaceMessages(result.messages);
+    const condenseDurationMs = Date.now() - condenseStartedAt;
+    const messagesWithUiHints = result.messages.map((msg) =>
+      msg.isSummary
+        ? {
+            ...msg,
+            uiHint: {
+              ...msg.uiHint,
+              condense: {
+                prevInputTokens: result.prevInputTokens,
+                newInputTokens: result.newInputTokens,
+                durationMs: condenseDurationMs,
+                validationWarnings: result.validationWarnings,
+              },
+            },
+          }
+        : msg,
+    );
+
+    session.replaceMessages(messagesWithUiHints);
     // Reset lastInputTokens to estimated post-condense value so we don't immediately re-trigger
     session.lastInputTokens = result.newInputTokens;
     // Clear output and cache-read tokens; post-condense estimates have no prior-turn component.
@@ -1349,6 +1685,7 @@ export class AgentEngine {
       newInputTokens: result.newInputTokens,
       validationWarnings: result.validationWarnings,
       metadata: result.metadata,
+      durationMs: condenseDurationMs,
     };
   }
 }

@@ -3,7 +3,7 @@ import * as vscode from "vscode";
 const LEGACY_THRESHOLD_KEY = "autoCondenseThreshold";
 export const MODEL_THRESHOLD_KEY = "modelCondenseThresholds";
 
-const SONNET_OPUS_DEFAULT_THRESHOLD = 0.6;
+const LARGE_MODEL_DEFAULT_THRESHOLD = 0.6;
 const OTHER_MODELS_DEFAULT_THRESHOLD = 0.9;
 const MIN_THRESHOLD = 0.1;
 const MAX_THRESHOLD = 1;
@@ -23,9 +23,19 @@ export function isAnthropicSonnetOrOpusModel(modelId: string): boolean {
   );
 }
 
+/** Frontier models with large context windows that benefit from earlier condensing. */
+function isLargeContextFrontierModel(modelId: string): boolean {
+  const lower = modelId.toLowerCase();
+  return (
+    isAnthropicSonnetOrOpusModel(lower) ||
+    lower === "gpt-5.4" ||
+    lower === "gpt-5.4-pro"
+  );
+}
+
 export function getDefaultAutoCondenseThreshold(modelId: string): number {
-  return isAnthropicSonnetOrOpusModel(modelId)
-    ? SONNET_OPUS_DEFAULT_THRESHOLD
+  return isLargeContextFrontierModel(modelId)
+    ? LARGE_MODEL_DEFAULT_THRESHOLD
     : OTHER_MODELS_DEFAULT_THRESHOLD;
 }
 

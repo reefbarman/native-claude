@@ -326,7 +326,10 @@ describe("AgentSessionManager background agents", () => {
 
     await mgr.sendMessage(fg.id, "plan the fix", fg.mode);
 
-    expect(addUserMessageSpy).toHaveBeenNthCalledWith(1, "plan the fix");
+    expect(addUserMessageSpy).toHaveBeenNthCalledWith(1, "plan the fix", {
+      displayText: undefined,
+      isSlashCommand: false,
+    });
     expect(addUserMessageSpy).toHaveBeenNthCalledWith(
       2,
       expect.stringContaining("You just switched this session to code mode."),

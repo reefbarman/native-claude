@@ -11,6 +11,7 @@ export interface WebviewModelInfo {
   displayName: string;
   provider: string;
   contextWindow: number;
+  maxOutputTokens?: number;
   authenticated: boolean;
   condenseThreshold?: number;
 }
@@ -115,6 +116,12 @@ export type ExtensionMessage =
       sessionId: string;
       error: string;
       retryable: boolean;
+      code?: string;
+      actions?: {
+        signIn?: boolean;
+        signInAnotherAccount?: boolean;
+        condense?: boolean;
+      };
     }
   | {
       type: "agentDone";
@@ -145,6 +152,13 @@ export type ExtensionMessage =
       type: "agentCondenseError";
       sessionId: string;
       error: string;
+      retryable?: boolean;
+      code?: string;
+      actions?: {
+        signIn?: boolean;
+        signInAnotherAccount?: boolean;
+        condense?: boolean;
+      };
     }
   | {
       type: "agentCondenseStart";
@@ -241,7 +255,10 @@ export type ExtensionMessage =
       lastOutputTokens: number;
       /** True when this came from automatic startup restore rather than explicit user action. */
       restored?: boolean;
-      /** turnIndex → checkpointId mapping for restored sessions */
+      /**
+       * Restored checkpoints keyed by the number of visible user turns already
+       * committed at that snapshot.
+       */
       checkpoints?: Array<{ turnIndex: number; checkpointId: string }>;
     }
   | {
@@ -249,8 +266,12 @@ export type ExtensionMessage =
       sessionId: string;
       text: string;
       queueId: string;
-      /** Display text for the chat bubble (e.g. "/pr") when text is the expanded body */
+      /** Display text for the chat bubble */
       displayText?: string;
+      /** Whether the interjection includes a slash command invocation */
+      isSlashCommand?: boolean;
+      /** Slash command label rendered in the inline command chip */
+      slashCommandLabel?: string;
     }
   | {
       type: "agentBgSessionsUpdate";
@@ -326,6 +347,12 @@ export type ExtensionMessage =
       sessionId: string;
       error: string;
       retryable: boolean;
+      code?: string;
+      actions?: {
+        signIn?: boolean;
+        signInAnotherAccount?: boolean;
+        condense?: boolean;
+      };
     }
   | {
       type: "agentBgDone";
@@ -371,6 +398,12 @@ export interface ChatState {
   model: string;
   streaming: boolean;
   condenseThreshold?: number;
+  contextBudget?: {
+    outputReservation: number;
+    safetyBufferTokens: number;
+    softThresholdBudget: number;
+    hardBudget: number;
+  };
   agentWriteApproval?: "prompt" | "session" | "project" | "global";
 }
 
@@ -486,11 +519,25 @@ export interface ChatMessage {
   blocks: ContentBlock[];
   /** Badge shown on approval follow-up and rejection annotation messages */
   badge?: "follow-up" | "rejection";
-  /** True when this message is a slash command invocation (renders as a compact pill) */
+  /** True when this message includes a slash command invocation */
   isSlashCommand?: boolean;
-  /** Checkpoint ID associated with this user message (set when checkpoint was created before send) */
+  /** Slash command label shown in compact command chip rendering */
+  slashCommandLabel?: string;
+  /**
+   * Checkpoint ID rendered on the user message immediately preceding that
+   * checkpoint snapshot.
+   */
   checkpointId?: string;
-  error?: { message: string; retryable: boolean };
+  error?: {
+    message: string;
+    retryable: boolean;
+    code?: string;
+    actions?: {
+      signIn?: boolean;
+      signInAnotherAccount?: boolean;
+      condense?: boolean;
+    };
+  };
   apiRequest?: {
     requestId: string;
     model: string;

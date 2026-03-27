@@ -82,6 +82,67 @@ function makeMessages(): AgentMessage[] {
   ];
 }
 
+function makeCodexProvider(
+  onComplete?: (request: CompleteRequest) => CompleteResult,
+) {
+  const complete = vi.fn(async (request: CompleteRequest) =>
+    onComplete
+      ? onComplete(request)
+      : {
+          text: `<summary>
+1. **Primary Request and Intent**: Keep working.
+2. **Key Technical Concepts**: TypeScript.
+3. **Files and Code Sections**: src/agent/condense.ts.
+4. **Errors and Fixes**: None.
+5. **Problem Solving**: Preserved context.
+6. **All User Messages**: "Investigate condense"
+7. **User Corrections & Behavioral Directives**: None.
+8. **Pending Tasks**: None.
+9. **Current Work**: Inspecting condense behavior.
+10. **Optional Next Step**: Continue.
+</summary>`,
+        },
+  );
+
+  const provider: ModelProvider = {
+    id: "codex",
+    displayName: "Codex",
+    condenseModel: "gpt-5.4-nano",
+    async isAuthenticated() {
+      return true;
+    },
+    getCapabilities() {
+      return {
+        ...TEST_CAPABILITIES,
+        contextWindow: 400_000,
+        maxOutputTokens: 128_000,
+      };
+    },
+    listModels(): ModelInfo[] {
+      return [
+        {
+          id: "gpt-5.4",
+          displayName: "GPT-5.4",
+          provider: "codex",
+          capabilities: {
+            ...TEST_CAPABILITIES,
+            contextWindow: 400_000,
+            maxOutputTokens: 128_000,
+          },
+        },
+      ];
+    },
+    async *stream(
+      _request: StreamRequest,
+    ): AsyncGenerator<ProviderStreamEvent> {
+      yield* [];
+    },
+    complete,
+  };
+
+  return { provider, complete };
+}
+
 describe("summarizeConversation", () => {
   it("passes preserved runtime context into the condense prompt", async () => {
     const { provider, complete } = makeProvider();
@@ -402,5 +463,193 @@ describe("summarizeConversation", () => {
     expect(result.metadata?.latestUserMessage).toBe(
       "Please investigate the screenshot and continue the fix.",
     );
+  });
+
+  it("prefers the mini Codex condense model when the request safely fits", async () => {
+    const { provider, complete } = makeCodexProvider();
+
+    const result = await summarizeConversation({
+      messages: makeMessages(),
+      provider,
+      activeModel: "gpt-5.4",
+      systemPrompt: "system prompt",
+      isAutomatic: true,
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(complete).toHaveBeenCalledTimes(1);
+    const request = complete.mock.calls[0][0] as CompleteRequest;
+    expect(request.model).toBe("gpt-5.4-nano");
+    expect(result.metadata?.modelCandidates[0]).toBe("gpt-5.4-nano");
+    expect(result.metadata?.selectedModel).toBe("gpt-5.4-nano");
+    expect(result.metadata?.skippedModelCandidates).toBeUndefined();
+  });
+
+  it("skips the nano Codex condense model and prefers the active model when the request is too large", async () => {
+    const { provider, complete } = makeCodexProvider();
+    // Must exceed 80% of nano's 400K context (~320K tokens ≈ 1.28M chars)
+    const largeUserMessage = "x".repeat(1_300_000);
+
+    const result = await summarizeConversation({
+      messages: [
+        { role: "user", content: largeUserMessage } as AgentMessage,
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "Looking now." }],
+        },
+      ],
+      provider,
+      activeModel: "gpt-5.4",
+      systemPrompt: "system prompt",
+      isAutomatic: true,
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(complete).toHaveBeenCalled();
+    const request = complete.mock.calls[0][0] as CompleteRequest;
+    expect(request.model).toBe("gpt-5.4");
+    expect(result.metadata?.modelCandidates[0]).toBe("gpt-5.4");
+    expect(result.metadata?.modelCandidates).not.toContain("gpt-5.4-nano");
+    expect(result.metadata?.selectedModel).toBe("gpt-5.4");
+    expect(result.metadata?.skippedModelCandidates).toEqual([
+      expect.objectContaining({ model: "gpt-5.4-nano" }),
+    ]);
+  });
+
+  it("retries the next Codex candidate after a context-window error", async () => {
+    const { provider, complete } = makeCodexProvider((request) => {
+      if (request.model === "gpt-5.4-nano") {
+        throw new Error(
+          "Codex API error unknown: Your input exceeds the context window of this model.",
+        );
+      }
+
+      return {
+        text: `<summary>
+1. **Primary Request and Intent**: Keep working.
+2. **Key Technical Concepts**: TypeScript.
+3. **Files and Code Sections**: src/agent/condense.ts.
+4. **Errors and Fixes**: None.
+5. **Problem Solving**: Preserved context.
+6. **All User Messages**: "Investigate condense"
+7. **User Corrections & Behavioral Directives**: None.
+8. **Pending Tasks**: None.
+9. **Current Work**: Inspecting condense behavior.
+10. **Optional Next Step**: Continue.
+</summary>`,
+      };
+    });
+
+    const result = await summarizeConversation({
+      messages: makeMessages(),
+      provider,
+      activeModel: "gpt-5.4",
+      systemPrompt: "system prompt",
+      isAutomatic: true,
+    });
+
+    expect(result.error).toBeUndefined();
+    // nano fails → falls through to gpt-5.4-mini, then gpt-5.4 (active model),
+    // then remaining fallbacks. The first non-nano candidate that succeeds wins.
+    expect(complete).toHaveBeenCalledTimes(2);
+    expect((complete.mock.calls[0][0] as CompleteRequest).model).toBe(
+      "gpt-5.4-nano",
+    );
+    expect((complete.mock.calls[1][0] as CompleteRequest).model).toBe(
+      "gpt-5.4",
+    );
+    expect(result.metadata?.selectedModel).toBe("gpt-5.4");
+  });
+
+  it("shrinks the condense source window after a context-window error", async () => {
+    const messages: AgentMessage[] = [
+      { role: "user", content: "Investigate condense" } as AgentMessage,
+      { role: "assistant", content: [{ type: "text", text: "Looking now." }] },
+      { role: "user", content: "Step 1" } as AgentMessage,
+      { role: "assistant", content: [{ type: "text", text: "Done 1" }] },
+      { role: "user", content: "Step 2" } as AgentMessage,
+      { role: "assistant", content: [{ type: "text", text: "Done 2" }] },
+      { role: "user", content: "Step 3" } as AgentMessage,
+      { role: "assistant", content: [{ type: "text", text: "Done 3" }] },
+    ];
+
+    let callCount = 0;
+    const { provider, complete } = makeCodexProvider(() => {
+      callCount += 1;
+      if (callCount === 1) {
+        throw new Error(
+          "Codex API error unknown: Your input exceeds the context window of this model.",
+        );
+      }
+      return {
+        text: `<summary>
+1. **Primary Request and Intent**: Keep working.
+2. **Key Technical Concepts**: TypeScript.
+3. **Files and Code Sections**: src/agent/condense.ts.
+4. **Errors and Fixes**: None.
+5. **Problem Solving**: Preserved context.
+6. **All User Messages**: "Investigate condense"
+7. **User Corrections & Behavioral Directives**: None.
+8. **Pending Tasks**: None.
+9. **Current Work**: Inspecting condense behavior.
+10. **Optional Next Step**: Continue.
+</summary>`,
+      };
+    });
+
+    const result = await summarizeConversation({
+      messages,
+      provider,
+      activeModel: "gpt-5.4",
+      systemPrompt: "system prompt",
+      isAutomatic: true,
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(complete).toHaveBeenCalledTimes(3);
+    expect(result.summary).toContain("Primary Request and Intent");
+  });
+
+  it("preserves structured error metadata for condense failures", async () => {
+    const { provider } = makeCodexProvider(() => {
+      const error = new Error(
+        "Codex API error 429: The usage limit has been reached",
+      );
+      (
+        error as Error & {
+          retryable?: boolean;
+          code?: string;
+          actions?: { signInAnotherAccount?: boolean };
+        }
+      ).retryable = true;
+      (
+        error as Error & {
+          retryable?: boolean;
+          code?: string;
+          actions?: { signInAnotherAccount?: boolean };
+        }
+      ).code = "oauth_usage_limit_exhausted";
+      (
+        error as Error & {
+          retryable?: boolean;
+          code?: string;
+          actions?: { signInAnotherAccount?: boolean };
+        }
+      ).actions = { signInAnotherAccount: true };
+      throw error;
+    });
+
+    const result = await summarizeConversation({
+      messages: makeMessages(),
+      provider,
+      activeModel: "gpt-5.4",
+      systemPrompt: "system prompt",
+      isAutomatic: true,
+    });
+
+    expect(result.error).toContain("Condensing API call failed");
+    expect(result.errorRetryable).toBe(true);
+    expect(result.errorCode).toBe("oauth_usage_limit_exhausted");
+    expect(result.errorActions).toEqual({ signInAnotherAccount: true });
   });
 });

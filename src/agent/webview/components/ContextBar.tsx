@@ -1,4 +1,4 @@
-const DEFAULT_OUTPUT_RESERVATION = 8192;
+const DEFAULT_OUTPUT_RESERVATION = 128_000;
 
 interface ContextBarProps {
   inputTokens: number;
@@ -6,6 +6,9 @@ interface ContextBarProps {
   cacheReadTokens?: number;
   maxContextWindow: number;
   outputReservation?: number;
+  safetyBufferTokens?: number;
+  softThresholdBudget?: number;
+  hardBudget?: number;
   condenseThreshold?: number;
 }
 
@@ -21,27 +24,48 @@ export function ContextBar({
   cacheReadTokens = 0,
   maxContextWindow,
   outputReservation = DEFAULT_OUTPUT_RESERVATION,
+  safetyBufferTokens = 0,
+  softThresholdBudget,
+  hardBudget,
   condenseThreshold,
 }: ContextBarProps) {
   const used = inputTokens + outputTokens;
-  const reserved = Math.min(outputReservation, maxContextWindow - used);
+  const reserved = Math.min(
+    outputReservation,
+    Math.max(0, maxContextWindow - used),
+  );
   const available = Math.max(0, maxContextWindow - used - reserved);
 
   const usedPct = maxContextWindow > 0 ? (used / maxContextWindow) * 100 : 0;
   const reservedPct =
     maxContextWindow > 0 ? (reserved / maxContextWindow) * 100 : 0;
   const thresholdPct =
-    condenseThreshold != null ? condenseThreshold * 100 : null;
+    softThresholdBudget != null
+      ? (softThresholdBudget / maxContextWindow) * 100
+      : condenseThreshold != null
+        ? condenseThreshold * 100
+        : null;
+  const hardBudgetPct =
+    hardBudget != null && maxContextWindow > 0
+      ? (hardBudget / maxContextWindow) * 100
+      : null;
 
   const tooltipParts = [
     `Used: ${used.toLocaleString()} (input ${inputTokens.toLocaleString()} + output ${outputTokens.toLocaleString()})`,
     `Reserved for response: ${reserved.toLocaleString()}`,
-    `Available: ${available.toLocaleString()}`,
+    ...(safetyBufferTokens > 0
+      ? [`Safety buffer: ${safetyBufferTokens.toLocaleString()}`]
+      : []),
+    `Available before response reserve: ${Math.max(0, maxContextWindow - used).toLocaleString()}`,
+    `Available after reserve: ${available.toLocaleString()}`,
     ...(cacheReadTokens > 0
       ? [`Cached (0.1x): ${cacheReadTokens.toLocaleString()} tokens`]
       : []),
-    ...(condenseThreshold != null
-      ? [`Auto-condense at: ${Math.round(condenseThreshold * 100)}%`]
+    ...(thresholdPct != null
+      ? [`Auto-condense target: ${Math.round(thresholdPct)}%`]
+      : []),
+    ...(hardBudgetPct != null
+      ? [`Hard fit limit: ${Math.round(hardBudgetPct)}%`]
       : []),
   ];
 
@@ -57,7 +81,11 @@ export function ContextBar({
           <div
             class="context-bar-threshold"
             style={{ left: `${thresholdPct}%` }}
-            title={`Auto-condense threshold: ${Math.round(thresholdPct)}%`}
+            title={
+              hardBudgetPct != null
+                ? `Auto-condense target: ${Math.round(thresholdPct)}% · Hard fit limit: ${Math.round(hardBudgetPct)}%`
+                : `Auto-condense target: ${Math.round(thresholdPct)}%`
+            }
           />
         )}
       </div>

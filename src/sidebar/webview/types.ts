@@ -1,6 +1,8 @@
 // Shared types between extension and webview.
 // Imported by both SidebarProvider.ts (Node) and webview components (browser).
 
+import type { SemanticReadinessReason } from "../../shared/semanticReadiness.js";
+
 export interface CommandRule {
   pattern: string;
   mode: "prefix" | "regex" | "exact";
@@ -56,6 +58,8 @@ export interface IndexStatusInfo {
     cancelled?: boolean;
   };
   error?: string;
+  readinessReason?: SemanticReadinessReason;
+  readinessMessage?: string;
 }
 
 export interface SidebarState {
@@ -118,11 +122,15 @@ export type WebviewCommand =
   | { command: "startServer" }
   | { command: "stopServer" }
   | { command: "showStatus" }
+  | { command: "openSettings" }
+  | { command: "openOutput" }
   | { command: "clearSessionApprovals" }
   | { command: "rebuildIndex" }
   | { command: "cancelIndex" }
   | { command: "resumeIndex" }
   | { command: "setOpenaiApiKey" }
+  | { command: "setOpenaiModelsAndEmbeddingsApiKey" }
+  | { command: "setupSemanticSearch"; reason?: string }
   | { command: "addTrustedCommand" }
   | { command: "configureAgents" }
   | { command: "cancelToolCall"; id: string }

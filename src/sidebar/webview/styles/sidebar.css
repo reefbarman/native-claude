@@ -651,3 +651,10 @@ h5 {
   margin-right: 4px;
   accent-color: var(--vscode-focusBorder, #007acc);
 }
+.index-remediation {
+  margin-top: 8px;
+}
+.index-remediation-text {
+  margin: 0 0 8px 0;
+  line-height: 1.35;
+}

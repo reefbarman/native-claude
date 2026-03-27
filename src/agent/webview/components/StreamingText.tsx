@@ -3,6 +3,7 @@ import { Marked } from "marked";
 import DOMPurify from "dompurify";
 import mermaid from "mermaid";
 import embed, { type VisualizationSpec } from "vega-embed";
+import { matchFilePaths } from "./filePathLinks";
 
 type SpecialBlock =
   | { kind: "mermaid"; source: string }
@@ -147,10 +148,6 @@ function parseMarkdown(text: string): {
   return { html, specialBlocks };
 }
 
-// Matches file paths like `src/foo/bar.ts`, `/abs/path.ts`, `src/foo.ts:42`
-const FILE_PATH_RE =
-  /(?<![:/])\b((?:(?:\/[\w.-]+)+|[\w][\w-]*(?:\/[\w.-]+)+)\.\w{1,8})(?::(\d+)(?:-\d+)?)?/g;
-
 function linkifyFilePathNodes(
   container: HTMLElement,
   onOpenFile: (path: string, line?: number) => void,
@@ -175,28 +172,24 @@ function linkifyFilePathNodes(
 
   for (const textNode of textNodes) {
     const text = textNode.nodeValue ?? "";
-    FILE_PATH_RE.lastIndex = 0;
-    let match: RegExpExecArray | null;
     let lastIndex = 0;
     const parts: Node[] = [];
 
-    while ((match = FILE_PATH_RE.exec(text)) !== null) {
+    for (const match of matchFilePaths(text)) {
       if (match.index > lastIndex) {
         parts.push(document.createTextNode(text.slice(lastIndex, match.index)));
       }
-      const filePath = match[1];
-      const line = match[2] ? parseInt(match[2], 10) : undefined;
       const a = document.createElement("a");
       a.className = "file-path-link";
-      a.textContent = match[0];
+      a.textContent = match.fullMatch;
       a.href = "#";
-      a.title = `Open ${filePath}${line !== undefined ? `:${line}` : ""}`;
+      a.title = `Open ${match.filePath}${match.line !== undefined ? `:${match.line}` : ""}`;
       a.addEventListener("click", (e) => {
         e.preventDefault();
-        onOpenFile(filePath, line);
+        onOpenFile(match.filePath, match.line);
       });
       parts.push(a);
-      lastIndex = match.index + match[0].length;
+      lastIndex = match.index + match.fullMatch.length;
     }
 
     if (parts.length > 0) {

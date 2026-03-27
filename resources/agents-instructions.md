@@ -34,13 +34,14 @@ If your agent has built-in filesystem tools, prefer the agentlink equivalents:
 
 ### Terminal behavior
 
-`execute_command` automatically reuses an existing idle terminal. You do NOT need to pass `terminal_name` or `terminal_id` for normal sequential commands — just omit both and the tool will reuse the default terminal.
+`execute_command` automatically reuses an existing idle terminal. For normal sequential commands, omit both `terminal_name` and `terminal_id` and let the tool reuse the default terminal.
 
-- **DO NOT** pass `terminal_name` unless you specifically need a *separate* terminal (e.g. a long-running dev server alongside normal commands, or truly parallel tasks).
-- `terminal_id` is only needed if a previous background command returned one and you need to interact with that specific terminal.
-- Use `background: true` for long-running processes (dev servers, watch modes). Returns immediately with `terminal_id`. Use `get_terminal_output` with the `terminal_id` to check on progress.
-- Use `split_from` with a `terminal_id` or `terminal_name` to create a new terminal split alongside an existing one.
-- After a session, use `close_terminals` to clean up any stale terminals.
+- **Default to terminal reuse.** Create a new terminal only when you intentionally need separation (true parallel work, long-running background process, or temporary environment isolation).
+- **DO NOT** pass `terminal_name` for one-off commands. Avoid inventing names like `Build`, `Git`, or `Lint` — this creates unnecessary terminal tabs.
+- If you created a dedicated terminal (`terminal_name` or `terminal_id`), keep reusing that same terminal for follow-up commands instead of creating more terminals.
+- Use `background: true` for long-running processes (dev servers, watch modes). Returns immediately with `terminal_id`. Use `get_terminal_output` with that `terminal_id` to check progress.
+- Use `split_from` only when you intentionally want a separate split terminal group.
+- Close terminals you no longer need. Use `close_terminals` with specific `names` for targeted cleanup; use no args only when you want to close all agentlink-managed terminals.
 - Always use non-interactive flags where available (e.g. `--yes`, `-y`, `--no-input`) as interactive commands are automatically rejected.
 - **Always set a `timeout`** for commands you expect to complete quickly (e.g. git, ls, npm test — use 10-30s). Only omit timeout for long-running processes.
 

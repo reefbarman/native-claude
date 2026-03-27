@@ -159,6 +159,7 @@ describe("READ_ONLY_TOOLS", () => {
     expect(READ_ONLY_TOOLS.has("find_and_replace")).toBe(false);
     expect(READ_ONLY_TOOLS.has("execute_command")).toBe(false);
     expect(READ_ONLY_TOOLS.has("rename_symbol")).toBe(false);
+    expect(READ_ONLY_TOOLS.has("switch_mode")).toBe(false);
   });
 });
 

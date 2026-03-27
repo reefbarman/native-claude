@@ -15,6 +15,7 @@ import {
 } from "../util/ripgrep.js";
 
 import { type ToolResult } from "../shared/types.js";
+import { getSemanticReadinessMessage } from "../shared/semanticReadiness.js";
 
 // --- Configuration helpers (exported for IndexerManager) ---
 
@@ -42,6 +43,58 @@ function isSemanticSearchEnabled(): boolean {
   return vscode.workspace
     .getConfiguration("agentlink")
     .get<boolean>("semanticSearchEnabled", false);
+}
+
+function semanticErrorPayload(
+  reason:
+    | "disabled"
+    | "missing_embeddings_auth"
+    | "no_workspace"
+    | "missing_index"
+    | "qdrant_unavailable"
+    | "generic_error",
+  options?: { detail?: string },
+): Record<string, unknown> {
+  const message = getSemanticReadinessMessage(reason);
+  return {
+    error: options?.detail ?? message,
+    reason,
+    readiness_message: message,
+    next_steps:
+      reason === "disabled"
+        ? [
+            "Set agentlink.semanticSearchEnabled to true in settings.",
+            "Run 'AgentLink: Set Up Semantic Search' for guided setup.",
+          ]
+        : reason === "missing_embeddings_auth"
+          ? [
+              "Run 'AgentLink: Set OpenAI API Key for Embeddings'.",
+              "Or run 'AgentLink: Set Up Semantic Search' and choose API-key setup.",
+            ]
+          : reason === "no_workspace"
+            ? ["Open a workspace folder and retry semantic search."]
+            : reason === "missing_index"
+              ? [
+                  "Run 'AgentLink: Rebuild Codebase Index'.",
+                  "Or click 'Index Codebase' in the AgentLink sidebar.",
+                ]
+              : reason === "qdrant_unavailable"
+                ? [
+                    "Ensure Qdrant is running at the configured agentlink.qdrantUrl.",
+                    "Check AgentLink output logs and retry semantic search.",
+                  ]
+                : [
+                    "Retry semantic search after resolving the underlying error.",
+                  ],
+  };
+}
+
+function classifySemanticReasonFromError(
+  message: string,
+): "missing_index" | "qdrant_unavailable" | undefined {
+  if (/No codebase index found/i.test(message)) return "missing_index";
+  if (/Qdrant is not reachable/i.test(message)) return "qdrant_unavailable";
+  return undefined;
 }
 
 // --- Collection name derivation ---
@@ -962,8 +1015,7 @@ export async function semanticFileList(
   if (!isSemanticSearchEnabled()) {
     return {
       files: [],
-      error:
-        "Semantic search is not enabled. Set agentlink.semanticSearchEnabled to true.",
+      ...semanticErrorPayload("disabled"),
     };
   }
 
@@ -971,15 +1023,14 @@ export async function semanticFileList(
   if (!auth) {
     return {
       files: [],
-      error:
-        "OpenAI API key not configured for embeddings. Semantic search and indexing require an API key (set OPENAI_API_KEY or run 'AgentLink: Set OpenAI API Key for Embeddings'). Model chat can still use OpenAI/Codex OAuth.",
+      ...semanticErrorPayload("missing_embeddings_auth"),
     };
   }
 
   const qdrantUrl = getQdrantUrl();
   const workspacePath = tryGetFirstWorkspaceRoot();
   if (!workspacePath) {
-    return { files: [], error: "No workspace folder open." };
+    return { files: [], ...semanticErrorPayload("no_workspace") };
   }
 
   const collectionName = getAlCollectionName(workspacePath);
@@ -1022,6 +1073,10 @@ export async function semanticFileList(
     return { files: ranked };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+    const reason = classifySemanticReasonFromError(msg);
+    if (reason) {
+      return { files: [], ...semanticErrorPayload(reason, { detail: msg }) };
+    }
     return { files: [], error: msg };
   }
 }
@@ -1039,10 +1094,7 @@ export async function semanticSearch(
       content: [
         {
           type: "text",
-          text: JSON.stringify({
-            error:
-              "Semantic search is not enabled. Set agentlink.semanticSearchEnabled to true.",
-          }),
+          text: JSON.stringify(semanticErrorPayload("disabled")),
         },
       ],
     };
@@ -1054,10 +1106,7 @@ export async function semanticSearch(
       content: [
         {
           type: "text",
-          text: JSON.stringify({
-            error:
-              "OpenAI API key not configured for embeddings. Semantic search and indexing require an API key (set OPENAI_API_KEY or run 'AgentLink: Set OpenAI API Key for Embeddings'). Model chat can still use OpenAI/Codex OAuth.",
-          }),
+          text: JSON.stringify(semanticErrorPayload("missing_embeddings_auth")),
         },
       ],
     };
@@ -1070,10 +1119,7 @@ export async function semanticSearch(
       content: [
         {
           type: "text",
-          text: JSON.stringify({
-            error:
-              "No workspace folder open. Semantic search requires a workspace.",
-          }),
+          text: JSON.stringify(semanticErrorPayload("no_workspace")),
         },
       ],
     };
@@ -1133,6 +1179,18 @@ export async function semanticSearch(
           ],
         };
       }
+    }
+
+    const reason = classifySemanticReasonFromError(msg);
+    if (reason) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(semanticErrorPayload(reason, { detail: msg })),
+          },
+        ],
+      };
     }
 
     return {

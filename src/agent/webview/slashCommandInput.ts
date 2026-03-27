@@ -3,7 +3,12 @@ import type { SlashCommandInfo } from "./types";
 export interface MatchedSlashCommand {
   command: SlashCommandInfo;
   args: string;
+  /** Slash command label shown in command chips/pills (e.g. /review diff) */
   displayText: string;
+  /** Full user-authored message text (trimmed), including surrounding context */
+  userText: string;
+  /** User-authored text that appears before the slash command */
+  prefixText: string;
 }
 
 function isWhitespace(char: string | undefined): boolean {
@@ -65,12 +70,13 @@ export function parseMatchedSlashCommand(
   text: string,
   slashCommands: readonly SlashCommandInfo[],
 ): MatchedSlashCommand | null {
-  const slashStart = findSlashCommandStart(text);
+  const userText = text.trim();
+  const slashStart = findSlashCommandStart(userText);
   if (slashStart < 0) {
     return null;
   }
 
-  const slashText = text.slice(slashStart).trim();
+  const slashText = userText.slice(slashStart).trim();
   if (!slashText.startsWith("/")) {
     return null;
   }
@@ -91,10 +97,15 @@ export function parseMatchedSlashCommand(
 
   const args =
     firstWhitespace >= 0 ? slashText.slice(firstWhitespace).trim() : "";
+  const displayText = args ? `/${name} ${args}` : `/${name}`;
+  const prefixText = userText.slice(0, slashStart).trim();
+
   return {
     command,
     args,
-    displayText: args ? `/${name} ${args}` : `/${name}`,
+    displayText,
+    userText,
+    prefixText,
   };
 }
 

@@ -118,7 +118,12 @@ describe("CodexProvider.complete", () => {
     expect(requestBody).not.toHaveProperty("temperature");
     expect(result).toEqual({
       text: "hello",
-      usage: { inputTokens: 12, outputTokens: 3 },
+      usage: {
+        inputTokens: 12,
+        outputTokens: 3,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+      },
     });
   });
 
@@ -152,6 +157,90 @@ describe("CodexProvider.complete", () => {
 
     expect(authManager.forceRefreshModelAuth).toHaveBeenCalledTimes(1);
     expect(createMock).toHaveBeenCalledTimes(2);
+    expect(result.text).toBe("ok");
+  });
+
+  it("does not refresh the same oauth account repeatedly on persistent 401", async () => {
+    createMock
+      .mockRejectedValueOnce(new Error("401 unauthorized"))
+      .mockRejectedValueOnce(new Error("401 unauthorized"));
+
+    const authManager = makeAuthManager({
+      resolveModelAuth: vi.fn().mockResolvedValue({
+        method: "oauth",
+        bearerToken: "token",
+        accountId: "acct",
+        canRefresh: true,
+        oauthAccountPoolId: "pool-1",
+      }),
+      forceRefreshModelAuth: vi.fn().mockResolvedValue({
+        method: "oauth",
+        bearerToken: "refreshed-token",
+        accountId: "acct",
+        canRefresh: true,
+        oauthAccountPoolId: "pool-1",
+      }),
+    });
+
+    const provider = new CodexProvider(authManager as never);
+    await expect(
+      provider.complete({
+        model: "gpt-5.2-codex",
+        systemPrompt: "system",
+        messages: [{ role: "user", content: "ping" }],
+        maxTokens: 64,
+      }),
+    ).rejects.toThrow(/401 unauthorized/i);
+
+    expect(authManager.forceRefreshModelAuth).toHaveBeenCalledTimes(1);
+    expect(createMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("recreates OpenAI client when oauth token changes after refresh", async () => {
+    createMock
+      .mockRejectedValueOnce(new Error("401 unauthorized"))
+      .mockImplementationOnce(async () => {
+        return (async function* () {
+          yield { type: "response.output_text.delta", delta: "ok" };
+          yield {
+            type: "response.done",
+            response: {
+              usage: {
+                input_tokens: 5,
+                output_tokens: 1,
+              },
+            },
+          };
+        })();
+      });
+
+    const authManager = makeAuthManager({
+      resolveModelAuth: vi.fn().mockResolvedValue({
+        method: "oauth",
+        bearerToken: "token-a",
+        accountId: "acct",
+        canRefresh: true,
+        oauthAccountPoolId: "pool-1",
+      }),
+      forceRefreshModelAuth: vi.fn().mockResolvedValue({
+        method: "oauth",
+        bearerToken: "token-b",
+        accountId: "acct",
+        canRefresh: true,
+        oauthAccountPoolId: "pool-1",
+      }),
+    });
+
+    const provider = new CodexProvider(authManager as never);
+    const result = await provider.complete({
+      model: "gpt-5.2-codex",
+      systemPrompt: "system",
+      messages: [{ role: "user", content: "ping" }],
+      maxTokens: 64,
+    });
+
+    expect(authManager.forceRefreshModelAuth).toHaveBeenCalledTimes(1);
+    expect(openAiConstructorMock).toHaveBeenCalledTimes(2);
     expect(result.text).toBe("ok");
   });
 
@@ -240,7 +329,12 @@ describe("CodexProvider.complete", () => {
 
     expect(result).toEqual({
       text: "api",
-      usage: { inputTokens: 176, outputTokens: 40 },
+      usage: {
+        inputTokens: 176,
+        outputTokens: 40,
+        cacheReadTokens: 1024,
+        cacheCreationTokens: 0,
+      },
       providerResponseId: "resp_123",
     });
   });
@@ -283,7 +377,60 @@ describe("CodexProvider.complete", () => {
 
     expect(result).toEqual({
       text: "api",
-      usage: { inputTokens: 0, outputTokens: 5 },
+      usage: {
+        inputTokens: 0,
+        outputTokens: 5,
+        cacheReadTokens: 150,
+        cacheCreationTokens: 0,
+      },
+    });
+  });
+
+  it("captures cache creation/write tokens from OpenAI usage details", async () => {
+    createMock.mockImplementationOnce(async () => {
+      return (async function* () {
+        yield { type: "response.output_text.delta", delta: "api" };
+        yield {
+          type: "response.done",
+          response: {
+            usage: {
+              input_tokens: 200,
+              output_tokens: 10,
+              input_tokens_details: {
+                cached_tokens: 120,
+                cache_creation_tokens: 30,
+              },
+            },
+          },
+        };
+      })();
+    });
+
+    const authManager = makeAuthManager({
+      resolveModelAuth: vi.fn().mockResolvedValue({
+        method: "apiKey",
+        bearerToken: "sk-test",
+        canRefresh: false,
+      }),
+      forceRefreshModelAuth: vi.fn().mockResolvedValue(null),
+    });
+
+    const provider = new CodexProvider(authManager as never);
+    const result = await provider.complete({
+      model: "gpt-5.4",
+      systemPrompt: "system",
+      messages: [{ role: "user", content: "ping" }],
+      maxTokens: 64,
+    });
+
+    expect(result).toEqual({
+      text: "api",
+      usage: {
+        inputTokens: 80,
+        outputTokens: 10,
+        cacheReadTokens: 120,
+        cacheCreationTokens: 30,
+      },
     });
   });
 
@@ -326,7 +473,74 @@ describe("CodexProvider.complete", () => {
       prompt_cache_key: "codex:test:thread",
       prompt_cache_retention: "24h",
       previous_response_id: "resp_prev",
+      max_output_tokens: 64,
       store: true,
+    });
+  });
+
+  it("serializes mixed text and pasted-image input with text first for gpt-5.4", async () => {
+    let requestBody: Record<string, unknown> | undefined;
+    createMock.mockImplementationOnce(async (body: Record<string, unknown>) => {
+      requestBody = body;
+      return (async function* () {
+        yield { type: "response.output_text.delta", delta: "seen" };
+        yield {
+          type: "response.done",
+          response: {
+            usage: { input_tokens: 10, output_tokens: 2 },
+          },
+        };
+      })();
+    });
+
+    const authManager = makeAuthManager({
+      resolveModelAuth: vi.fn().mockResolvedValue({
+        method: "apiKey",
+        bearerToken: "sk-test",
+        canRefresh: false,
+      }),
+      forceRefreshModelAuth: vi.fn().mockResolvedValue(null),
+    });
+
+    const provider = new CodexProvider(authManager as never);
+    await provider.complete({
+      model: "gpt-5.4",
+      systemPrompt: "system",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "what's in this image?" },
+            {
+              type: "image",
+              source: {
+                type: "base64",
+                media_type: "image/png",
+                data: "abc123",
+              },
+            },
+          ],
+        },
+      ],
+      maxTokens: 64,
+    });
+
+    expect(requestBody).toMatchObject({
+      model: "gpt-5.4",
+      max_output_tokens: 64,
+      input: [
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: "what's in this image?" },
+            {
+              type: "input_image",
+              image_url: "data:image/png;base64,abc123",
+              detail: "auto",
+            },
+          ],
+        },
+      ],
     });
   });
 
@@ -356,6 +570,7 @@ describe("CodexProvider.complete", () => {
     expect(requestBody).not.toHaveProperty("prompt_cache_key");
     expect(requestBody).not.toHaveProperty("prompt_cache_retention");
     expect(requestBody).not.toHaveProperty("previous_response_id");
+    expect(requestBody).not.toHaveProperty("max_output_tokens");
   });
 
   it("canonicalizes top-level and nested tool schema key ordering", async () => {
@@ -444,7 +659,7 @@ describe("CodexProvider.complete", () => {
     expect(zetaProperty?.format).toBeUndefined();
   });
 
-  it("throws when oauth refresh returns null", async () => {
+  it("propagates oauth auth failure when refresh returns null", async () => {
     createMock.mockRejectedValueOnce(new Error("401 unauthorized"));
 
     const authManager = makeAuthManager({
@@ -459,8 +674,10 @@ describe("CodexProvider.complete", () => {
         messages: [{ role: "user", content: "ping" }],
         maxTokens: 64,
       }),
-    ).rejects.toThrow(/OpenAI\/Codex authentication is required/i);
-    expect(authManager.forceRefreshModelAuth).toHaveBeenCalledWith("oauth");
+    ).rejects.toThrow(/401 unauthorized/i);
+    expect(authManager.forceRefreshModelAuth).toHaveBeenCalledWith("oauth", {
+      oauthAccountPoolId: undefined,
+    });
   });
 
   it("does not retry api-key auth failures", async () => {
@@ -579,6 +796,7 @@ describe("CodexProvider.stream", () => {
         inputTokens: 11,
         outputTokens: 4,
         cacheReadTokens: undefined,
+        cacheCreationTokens: undefined,
         providerResponseId: "resp_tool",
       },
       {
@@ -657,6 +875,7 @@ describe("CodexProvider.stream", () => {
         inputTokens: 8,
         outputTokens: 3,
         cacheReadTokens: undefined,
+        cacheCreationTokens: undefined,
         providerResponseId: "resp_reasoning",
       },
       {
@@ -714,6 +933,7 @@ describe("CodexProvider.stream", () => {
         inputTokens: 6,
         outputTokens: 2,
         cacheReadTokens: undefined,
+        cacheCreationTokens: undefined,
         providerResponseId: "resp_text",
       },
       {
@@ -747,6 +967,38 @@ describe("CodexProvider.stream", () => {
         }
       })(),
     ).rejects.toThrow(/Codex API error: boom/);
+  });
+
+  it("marks context-window overflow as a condense-action retryable error", async () => {
+    createMock.mockImplementationOnce(async () => {
+      return (async function* () {
+        yield {
+          type: "response.error",
+          error: {
+            message:
+              "Your input exceeds the context window of this model. Please adjust your input and try again.",
+          },
+        };
+      })();
+    });
+
+    const provider = new CodexProvider(makeAuthManager() as never);
+    await expect(
+      (async () => {
+        for await (const _event of provider.stream({
+          model: "gpt-5.2-codex",
+          systemPrompt: "system",
+          messages: [{ role: "user", content: "ping" }],
+          maxTokens: 64,
+        })) {
+          // drain
+        }
+      })(),
+    ).rejects.toMatchObject({
+      code: "context_window_exceeded",
+      retryable: true,
+      actions: { condense: true },
+    });
   });
 
   it("propagates response.failed events as request failures", async () => {

@@ -69,4 +69,17 @@ describe("getToolCallVisualState", () => {
     expect(state.statusClass).toBe("tool-warning");
     expect(state.statusIconClass).toBe("codicon-warning");
   });
+
+  it("marks stopped status as warning", () => {
+    const state = getToolCallVisualState({
+      name: "write_file",
+      complete: true,
+      result: JSON.stringify({
+        status: "stopped",
+      }),
+    });
+
+    expect(state.statusClass).toBe("tool-warning");
+    expect(state.statusIconClass).toBe("codicon-warning");
+  });
 });

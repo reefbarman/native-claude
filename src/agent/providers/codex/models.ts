@@ -23,14 +23,17 @@ export interface ResponsesCaps {
   supportsPreviousResponseId: boolean;
   supportsPromptCacheKey: boolean;
   supportsPromptCacheRetention: boolean;
+  supportsMaxOutputTokens: boolean;
 }
 
 /** The preferred cheap/fast model for condensing on Codex. */
-export const CODEX_CONDENSE_MODEL = "gpt-5.1-codex-mini";
+export const CODEX_CONDENSE_MODEL = "gpt-5.4-nano";
 
 /** Ordered fallback chain for condensing when account entitlements vary. */
 export const CODEX_CONDENSE_MODEL_FALLBACKS = [
   CODEX_CONDENSE_MODEL,
+  "gpt-5.4-mini",
+  "gpt-5.1-codex-mini",
   "gpt-5.2-codex",
   "gpt-5.3-codex",
 ] as const;
@@ -39,6 +42,33 @@ export const CODEX_MODELS: CodexModelDef[] = [
   {
     id: "gpt-5.4",
     displayName: "GPT-5.4",
+    contextWindow: 1_050_000,
+    maxOutputTokens: 128_000,
+    supportsImages: true,
+    supportsThinking: true,
+    defaultReasoningEffort: "medium",
+  },
+  {
+    id: "gpt-5.4-pro",
+    displayName: "GPT-5.4 Pro",
+    contextWindow: 1_050_000,
+    maxOutputTokens: 128_000,
+    supportsImages: true,
+    supportsThinking: true,
+    defaultReasoningEffort: "high",
+  },
+  {
+    id: "gpt-5.4-mini",
+    displayName: "GPT-5.4 Mini",
+    contextWindow: 400_000,
+    maxOutputTokens: 128_000,
+    supportsImages: true,
+    supportsThinking: true,
+    defaultReasoningEffort: "medium",
+  },
+  {
+    id: "gpt-5.4-nano",
+    displayName: "GPT-5.4 Nano",
     contextWindow: 400_000,
     maxOutputTokens: 128_000,
     supportsImages: true,
@@ -75,9 +105,9 @@ export const CODEX_MODELS: CodexModelDef[] = [
   {
     id: "gpt-5.1-codex-mini",
     displayName: "GPT-5.1 Codex Mini",
-    contextWindow: 128_000,
-    maxOutputTokens: 8_192,
-    supportsImages: false,
+    contextWindow: 400_000,
+    maxOutputTokens: 128_000,
+    supportsImages: true,
     supportsThinking: true,
     defaultReasoningEffort: "medium",
   },
@@ -102,6 +132,7 @@ export function getEndpointCaps(auth: OpenAiCodexResolvedAuth): ResponsesCaps {
       supportsPreviousResponseId: true,
       supportsPromptCacheKey: true,
       supportsPromptCacheRetention: true,
+      supportsMaxOutputTokens: true,
     };
   }
 
@@ -109,6 +140,7 @@ export function getEndpointCaps(auth: OpenAiCodexResolvedAuth): ResponsesCaps {
     supportsPreviousResponseId: false,
     supportsPromptCacheKey: false,
     supportsPromptCacheRetention: false,
+    supportsMaxOutputTokens: false,
   };
 }
 

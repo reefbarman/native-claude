@@ -38,6 +38,9 @@ export {
   OpenAiCodexAuthManager,
   openAiCodexAuthManager,
   type CodexCredentials,
+  type CodexOAuthAccountInfo,
+  type SaveOAuthAccountOptions,
+  type SaveOAuthAccountResult,
   type OpenAiCodexAuthMethod,
   type OpenAiCodexResolvedAuth,
   type OpenAiApiKeyCredential,
@@ -117,15 +120,7 @@ export class ProviderRegistry {
     );
     return Object.fromEntries(entries);
   }
-
-  getProvider(id: string): ModelProvider | undefined {
-    return this.providers.get(id);
-  }
-
-  getAllProviders(): ModelProvider[] {
-    return Array.from(this.providers.values());
-  }
 }
 
-/** Singleton registry. Providers are registered during extension activation. */
+/** Singleton registry used by the agent runtime. */
 export const providerRegistry = new ProviderRegistry();
