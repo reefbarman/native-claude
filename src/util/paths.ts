@@ -98,7 +98,7 @@ export function getRelativePath(absolutePath: string): string {
   const roots = getWorkspaceRoots();
   for (const root of roots) {
     if (pathStartsWith(absolutePath, root) || pathsEqual(absolutePath, root)) {
-      return path.relative(root, absolutePath);
+      return path.relative(root, absolutePath).replace(/\\/g, "/");
     }
   }
   return absolutePath;

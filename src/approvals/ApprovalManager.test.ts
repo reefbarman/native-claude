@@ -247,7 +247,30 @@ describe("ApprovalManager session approval persistence", () => {
       expect.arrayContaining([
         expect.objectContaining({
           id: sessionId,
+          writeApproved: false,
+          agentWriteApproved: false,
           writeRuleCount: 1,
+        }),
+      ]),
+    );
+
+    approvalManager.dispose();
+    configStore.dispose();
+  });
+
+  it("surfaces session agent write approval in active session state", async () => {
+    const memento = new MockMemento();
+    const sessionId = "session-agent-approval";
+
+    const { approvalManager, configStore } = await createManagers(memento);
+    approvalManager.setAgentWriteApproval(sessionId, "session");
+
+    expect(approvalManager.getActiveSessions()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: sessionId,
+          writeApproved: false,
+          agentWriteApproved: true,
         }),
       ]),
     );

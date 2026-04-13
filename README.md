@@ -71,7 +71,7 @@ flowchart LR
 - **Inline approvals in chat** — command, write, rename, MCP, and mode-switch approvals render in the built-in chat UI. The separate approval panel is mainly for external MCP agents.
 - **Session history and restore** — chat sessions are persisted and restored across VS Code reloads/startup.
 - **Checkpoints and revert** — create workspace checkpoints and revert later. Checkpoints are stored in AgentLink’s own shadow git repo under `.agentlink/checkpoints/`, separate from your project’s real git history.
-- **Slash commands** — built-ins include `/new`, `/mode`, `/model`, `/condense`, `/checkpoint`, `/revert`, `/help`, `/mcp`, `/mcp-status`, `/mcp-refresh`, and `/btw`.
+- **Slash commands** — built-ins include `/new`, `/mode`, `/model`, `/condense`, `/checkpoint`, `/revert`, `/help`, `/mcp`, `/mcp-config`, `/mcp-refresh`, and `/btw`.
 - **Background agents** — spawn parallel sub-agents for review and research, then inspect their result/transcript from the foreground session.
 - **Auto-condense** — when context fills up, AgentLink can condense the conversation and continue without losing task continuity.
 - **Model picker + auth-aware UX** — model selection is built into the chat UI and can prompt for Anthropic or OpenAI/Codex auth as needed.
@@ -410,6 +410,9 @@ Read file contents with line numbers. Returns rich metadata that built-in read t
 | `limit`           | number?  | Maximum lines to read (default: 2000)                                                                                                              |
 | `include_symbols` | boolean? | Include top-level symbol outline (default: true)                                                                                                   |
 | `query`           | string?  | Semantic search query to jump to the most relevant section. Auto-sets offset using the codebase index. Ignored if `offset` is explicitly provided. |
+| `anchor`          | string?  | Literal anchor text to locate and jump near. Ignored if `offset` is explicitly provided.                                                           |
+| `anchor_regex`    | string?  | Regex anchor pattern to locate and jump near. Ignored if `offset` is explicitly provided.                                                          |
+| `anchor_offset`   | number?  | Line offset applied after anchor/semantic match (e.g. `-20` for context above).                                                                    |
 
 **Response includes:**
 
@@ -421,10 +424,11 @@ Read file contents with line numbers. Returns rich metadata that built-in read t
 - `symbols` — top-level symbols grouped by kind (e.g. `{ "function": ["foo (line 1)"], "class": ["Bar (line 20)"] }`). Automatically skipped for JSON/JSONC files.
 - `content` — numbered lines in `line_number | content` format
 - `semantic_match` — when `query` is used: `{ query, startLine, endLine }` showing the matched chunk
+- `anchor_match` — when `anchor`/`anchor_regex` is used: match metadata (or `status: "not_found"`)
 
 Fields like `git_status`, `diagnostics`, and `symbols` are omitted when not available rather than returned as null.
 
-**Image support:** Image files (PNG, JPEG, GIF, WebP, BMP, ICO, AVIF) are returned as base64-encoded `image` content that the agent can view directly. Max image size: 10 MB.
+**Image support:** Local image files (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`) are returned as base64-encoded `image` content that the agent can view directly. Max image size: 10 MB.
 
 **Friendly errors:** `ENOENT` → `"File not found: {path}. Working directory: {root}"`, `EACCES` → `"Permission denied"`, `EISDIR` → `"Use list_files instead"`.
 
@@ -670,13 +674,14 @@ Rename a symbol across the workspace using VS Code's language server. Updates al
 
 Bulk find-and-replace across **multiple files**. Opens a rich preview panel showing each match in context with inline diffs — users can toggle individual matches on/off before accepting.
 
-| Parameter | Type     | Description                                                                                              |
-| --------- | -------- | -------------------------------------------------------------------------------------------------------- |
-| `find`    | string   | Text to find. Treated as a literal string unless `regex=true`.                                           |
-| `replace` | string   | Replacement text                                                                                         |
-| `path`    | string?  | Single file path to search in. Mutually exclusive with `glob`.                                           |
-| `glob`    | string?  | Glob pattern to match files (e.g. `src/**/*.ts`). Mutually exclusive with `path`.                        |
-| `regex`   | boolean? | Treat `find` as a regular expression. Supports capture groups (`$1`, `$2`) in `replace`. Default: false. |
+| Parameter          | Type     | Description                                                                                                   |
+| ------------------ | -------- | ------------------------------------------------------------------------------------------------------------- |
+| `find`             | string   | Text to find. Treated as a literal string unless `regex=true`.                                                |
+| `replace`          | string   | Replacement text                                                                                              |
+| `path`             | string?  | Single file path to search in. Mutually exclusive with `glob`.                                                |
+| `glob`             | string?  | Glob pattern to match files (e.g. `src/**/*.ts`). Mutually exclusive with `path`.                             |
+| `regex`            | boolean? | Treat `find` as a regular expression. Supports capture groups (`$1`, `$2`) in `replace`. Default: false.      |
+| `max_replacements` | number?  | Maximum allowed matches. If exceeded, no edits are applied and the tool returns `status: "too_many_matches"`. |
 
 For single-file edits, prefer `apply_diff` — it provides better diff review and format-on-save.
 
@@ -895,6 +900,8 @@ If you pass `kill: true`, AgentLink sends Ctrl+C to the terminal and reports whe
 | `output_offset`       | number?  | Skip first N lines before applying head/tail                              |
 | `output_grep`         | string?  | Filter output to lines matching this regex                                |
 | `output_grep_context` | number?  | Context lines around each grep match                                      |
+
+When a command is still running and the captured tail appears to include an interactive prompt, responses include `blocked_on_prompt: true` with a `prompt_hint` to distinguish likely prompt stalls from active progress.
 
 ## Built-in Agent UI Surfaces
 

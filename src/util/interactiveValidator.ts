@@ -254,6 +254,10 @@ const SCAFFOLDING_PREFIXES: Array<{
 
 const PASSWORD_COMMANDS = new Set(["passwd", "chpasswd", "su"]);
 
+// ── Strict shell options that mutate persistent shell state ───────────
+
+const UNSAFE_STRICT_SHELL_OPTIONS = new Set(["nounset"]);
+
 /**
  * Validate a command for known interactive patterns.
  * Returns null if the command appears safe, or a result with a rejection message.
@@ -316,6 +320,16 @@ function checkSingleCommand(command: string): InteractiveViolation | null {
 
   const args = tokens.slice(argsStart);
 
+  if (hasUnsafeStrictShellOptions(cmd, args)) {
+    return {
+      command,
+      reason:
+        '"set -u" / nounset modifies the persistent shell session and can terminate output capture.',
+      suggestion:
+        "Run strict mode in an isolated shell instead: bash -lc 'set -euo pipefail; <commands>' or ( set -euo pipefail; <commands> ).",
+    };
+  }
+
   // ── Check interactive editors ─────────────────────────────────
   if (INTERACTIVE_EDITORS.has(cmd)) {
     return {
@@ -356,8 +370,10 @@ function checkSingleCommand(command: string): InteractiveViolation | null {
   const replInfo = REPL_COMMANDS[cmd];
   if (replInfo) {
     // If there are no args at all, or only flags but no script file / -c / -e
+    const universalInfoFlags = ["-v", "--version", "-h", "--help"];
     const hasNonInteractiveArg =
       replInfo.nonInteractiveFlags.some((f) => args.includes(f)) ||
+      universalInfoFlags.some((f) => args.includes(f)) ||
       args.some((a) => !a.startsWith("-") && a !== cmd);
     if (!hasNonInteractiveArg) {
       return {
@@ -556,8 +572,7 @@ function opensGitEditorWithoutMessage(args: string[]): boolean {
     ["-m", "--message", "-F", "--file", "--fixup", "--squash"].includes(arg),
   );
   const hasNoEdit = args.includes("--no-edit");
-  const isAmend = args.includes("--amend");
-  return !hasMessageFlag && !(isAmend && hasNoEdit);
+  return !hasMessageFlag && !hasNoEdit;
 }
 
 function opensAnnotatedTagEditor(args: string[]): boolean {
@@ -569,6 +584,45 @@ function opensAnnotatedTagEditor(args: string[]): boolean {
 
 function opensGitEditorWithoutNoEdit(args: string[]): boolean {
   return !args.includes("--no-edit");
+}
+
+function hasUnsafeStrictShellOptions(cmd: string, args: string[]): boolean {
+  if (cmd === "set") {
+    for (let i = 0; i < args.length; i++) {
+      const arg = args[i];
+
+      // End of options: `set -- -u` sets positional args, does not enable nounset
+      if (arg === "--") break;
+
+      // `set -u`, `set -eu`, `set -euo`, etc.
+      if (/^-[A-Za-z]+$/.test(arg) && arg.includes("u")) {
+        return true;
+      }
+
+      // `set -o nounset`
+      if (arg === "-o") {
+        const next = args[i + 1];
+        if (next && UNSAFE_STRICT_SHELL_OPTIONS.has(next)) {
+          return true;
+        }
+      }
+
+      // `set -o=nounset` style
+      if (arg.startsWith("-o=")) {
+        const opt = arg.slice(3);
+        if (UNSAFE_STRICT_SHELL_OPTIONS.has(opt)) {
+          return true;
+        }
+      }
+    }
+  }
+
+  // zsh style: `setopt nounset`
+  if (cmd === "setopt") {
+    return args.some((arg) => UNSAFE_STRICT_SHELL_OPTIONS.has(arg));
+  }
+
+  return false;
 }
 
 /**

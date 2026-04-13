@@ -324,7 +324,7 @@ const BG_AGENT_TOOLS: ToolDefinition[] = [
   {
     name: "spawn_background_agent",
     description:
-      "Spawn a background agent to work in parallel with the current session. Returns immediately with a sessionId; call get_background_result when you need the result.",
+      "Spawn a background agent to work in parallel with the current session. Returns immediately with a sessionId. Completed results are often pushed back automatically; call get_background_result only when you explicitly need to wait for the final output.",
     input_schema: {
       type: "object",
       properties: {
@@ -367,7 +367,7 @@ const BG_AGENT_TOOLS: ToolDefinition[] = [
   {
     name: "get_background_status",
     description:
-      "Non-blocking check on a background agent's progress. Use this only when you have other work to do in parallel; otherwise call get_background_result directly.",
+      "Non-blocking check on a background agent's progress. Use this when you have other work to do in parallel. If no push-style completion is available for your flow, call get_background_result when you need the final output.",
     input_schema: {
       type: "object",
       properties: {
@@ -382,7 +382,7 @@ const BG_AGENT_TOOLS: ToolDefinition[] = [
   {
     name: "get_background_result",
     description:
-      "Wait for a background agent to finish and return its final response. Call this when you are ready to use the result.",
+      "Wait for a background agent to finish and return its final response. Use this for explicit pull/wait flows; skip it when a completion result was already pushed into context.",
     input_schema: {
       type: "object",
       properties: {
@@ -425,6 +425,8 @@ export interface BgStatusResult {
     | "idle"
     | "error";
   currentTool?: string;
+  /** UI-ready status label derived from heuristics (and later model enrichment). */
+  displayStatus?: string;
   done: boolean;
   /** Last assistant message text, only present when done=true. */
   partialOutput?: string;

@@ -38,6 +38,7 @@ export async function handleFindAndReplace(
     path?: string;
     glob?: string;
     regex?: boolean;
+    max_replacements?: number;
   },
   approvalManager: ApprovalManager,
   approvalPanel: ApprovalPanelProvider,
@@ -223,6 +224,37 @@ export async function handleFindAndReplace(
           },
         ],
       };
+    }
+
+    if (params.max_replacements != null) {
+      const maxReplacements = Number(params.max_replacements);
+      if (
+        !Number.isFinite(maxReplacements) ||
+        !Number.isInteger(maxReplacements) ||
+        maxReplacements <= 0
+      ) {
+        return error(
+          `'max_replacements' must be a positive integer. Received: ${params.max_replacements}`,
+        );
+      }
+      if (totalChanges > maxReplacements) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                status: "too_many_matches",
+                find: findStr,
+                max_replacements: maxReplacements,
+                total_matches: totalChanges,
+                files_matched: fileReplacements.length,
+                message:
+                  "Match count exceeds max_replacements guardrail; no edits were applied.",
+              }),
+            },
+          ],
+        };
+      }
     }
 
     // Build preview and approval data

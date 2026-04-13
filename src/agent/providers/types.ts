@@ -191,8 +191,11 @@ export interface CompleteRequest {
   maxTokens: number;
   /** Optional sampling temperature. Use 0 for deterministic tasks like condensing. */
   temperature?: number;
+  /** Override reasoning effort. If omitted, the provider uses the model's default. */
+  reasoningEffort?: "low" | "medium" | "high" | "none";
   cache?: ProviderCacheOptions;
   state?: ProviderStateOptions;
+  signal?: AbortSignal;
 }
 
 export interface CompleteResult {

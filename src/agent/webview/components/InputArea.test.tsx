@@ -38,8 +38,8 @@ describe("InputArea slash popup", () => {
         builtin: true,
       },
       {
-        name: "mcp-status",
-        description: "Show MCP status",
+        name: "mcp-config",
+        description: "Open MCP config",
         source: "builtin",
         builtin: true,
       },

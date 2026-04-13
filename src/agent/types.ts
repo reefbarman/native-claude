@@ -97,8 +97,6 @@ export type AgentEvent =
         inputMessageCount: number;
         sourceUserMessageCount: number;
         hadPriorSummaryInInput: boolean;
-        retryUsed: boolean;
-        validatorErrors: string[];
         sourceHash: string;
         providerId: string;
         condenseModel: string;

@@ -148,6 +148,18 @@ describe("validateInteractiveCommand", () => {
       expect(validateInteractiveCommand("ruby")).not.toBeNull();
     });
 
+    it("allows node -v", () => {
+      expect(validateInteractiveCommand("node -v")).toBeNull();
+    });
+
+    it("allows node --version", () => {
+      expect(validateInteractiveCommand("node --version")).toBeNull();
+    });
+
+    it("allows python --help", () => {
+      expect(validateInteractiveCommand("python --help")).toBeNull();
+    });
+
     it("allows ruby -e", () => {
       expect(validateInteractiveCommand('ruby -e "puts 1"')).toBeNull();
     });
@@ -206,6 +218,10 @@ describe("validateInteractiveCommand", () => {
       const result = validateInteractiveCommand("git commit --amend");
       expect(result).not.toBeNull();
       expect(result!.message).toContain("may open an editor");
+    });
+
+    it("allows git commit --no-edit", () => {
+      expect(validateInteractiveCommand("git commit --no-edit")).toBeNull();
     });
 
     it("allows git commit --amend --no-edit", () => {
@@ -359,6 +375,50 @@ describe("validateInteractiveCommand", () => {
     it("rejects npm create without flags", () => {
       const result = validateInteractiveCommand("npm create vite@latest myapp");
       expect(result).not.toBeNull();
+    });
+  });
+
+  // ── Strict shell option handling ─────────────────────────────────
+
+  describe("strict shell option handling", () => {
+    it("rejects set -euo pipefail", () => {
+      const result = validateInteractiveCommand("set -euo pipefail");
+      expect(result).not.toBeNull();
+      expect(result!.message).toContain("nounset modifies");
+    });
+
+    it("rejects set -o nounset", () => {
+      expect(validateInteractiveCommand("set -o nounset")).not.toBeNull();
+    });
+
+    it("rejects setopt nounset", () => {
+      expect(validateInteractiveCommand("setopt nounset")).not.toBeNull();
+    });
+
+    it("rejects env-prefixed nounset", () => {
+      expect(
+        validateInteractiveCommand("FOO=bar set -euo pipefail && echo ok"),
+      ).not.toBeNull();
+    });
+
+    it("allows set -- -u", () => {
+      expect(validateInteractiveCommand("set -- -u")).toBeNull();
+    });
+
+    it("allows set +u", () => {
+      expect(validateInteractiveCommand("set +u")).toBeNull();
+    });
+
+    it("allows isolated strict mode via bash -lc", () => {
+      expect(
+        validateInteractiveCommand("bash -lc 'set -euo pipefail; echo ok'"),
+      ).toBeNull();
+    });
+
+    it("allows isolated strict mode via subshell", () => {
+      expect(
+        validateInteractiveCommand("( set -euo pipefail; echo ok )"),
+      ).toBeNull();
     });
   });
 

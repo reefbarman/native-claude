@@ -166,6 +166,12 @@ export type ExtensionMessage =
       isAutomatic: boolean;
     }
   | {
+      type: "agentTokenEstimate";
+      sessionId: string;
+      /** Running estimate of total context window usage (tokens). */
+      estimatedTotalUsed: number;
+    }
+  | {
       type: "agentWarning";
       sessionId: string;
       message: string;
@@ -260,6 +266,20 @@ export type ExtensionMessage =
        * committed at that snapshot.
        */
       checkpoints?: Array<{ turnIndex: number; checkpointId: string }>;
+      /** Number of user turns before the first message in this chunk. */
+      userTurnOffset?: number;
+      /** True when older messages still exist before this chunk. */
+      hasMoreBefore?: boolean;
+    }
+  | {
+      type: "agentSessionChunk";
+      sessionId: string;
+      messages: unknown[];
+      /** Number of user turns before the first message in this chunk. */
+      userTurnOffset: number;
+      /** True when older messages still exist before this chunk. */
+      hasMoreBefore: boolean;
+      checkpoints?: Array<{ turnIndex: number; checkpointId: string }>;
     }
   | {
       type: "agentInterjection";
@@ -286,6 +306,8 @@ export type ExtensionMessage =
           | "error"
           | "cancelled";
         currentTool?: string;
+        displayStatus?: string;
+        displayStatusSource?: "terminal" | "model" | "heuristic";
         resolvedMode?: string;
         resolvedModel?: string;
         resolvedProvider?: string;
@@ -297,6 +319,16 @@ export type ExtensionMessage =
         errorMessage?: string;
         completedAt?: number;
         fullTranscript?: string;
+        summaryMeta?: {
+          inFlight: boolean;
+          generatedAt?: number;
+          sourceModel?: string;
+          fallbackUsed?: boolean;
+          confidence?: number;
+          lastAttemptAt?: number;
+          lastFailureAt?: number;
+          lastFailureReason?: string;
+        };
       }>;
     }
   | { type: "agentBgThinkingStart"; sessionId: string; thinkingId: string }
@@ -362,6 +394,8 @@ export type ExtensionMessage =
       totalCacheReadTokens: number;
       totalCacheCreationTokens: number;
       resultText?: string;
+      /** Concise summary for collapsed background-result UI */
+      resultSummary?: string;
     }
   | {
       type: "agentBgQuestion";
@@ -488,6 +522,8 @@ export type ContentBlock =
       status: "completed" | "error" | "cancelled";
       /** The final result text from the background agent */
       resultText?: string;
+      /** Optional concise summary for collapsed rendering */
+      summary?: string;
     }
   | {
       type: "bg_question";

@@ -633,18 +633,37 @@ export class DiffViewProvider {
   }
 
   private async closeAllDiffViews(): Promise<void> {
-    const tabs = vscode.window.tabGroups.all
-      .flatMap((tg) => tg.tabs)
-      .filter((tab) => {
-        if (tab.input instanceof vscode.TabInputTextDiff) {
-          // Only close diff tabs for THIS file, not all agentlink diffs
-          return tab.input.modified.fsPath === this.absolutePath;
-        }
-        return false;
-      });
+    if (!this.absolutePath) return;
+    await closeDiffTabsForFile(this.absolutePath);
+  }
+}
 
-    for (const tab of tabs) {
+export function isIgnorableTabCloseError(err: unknown): boolean {
+  // VS Code can race between tab enumeration and close(), returning
+  // "Invalid tab not found". Match this known transient case only.
+  const message = err instanceof Error ? err.message : String(err);
+  return /invalid tab not found/i.test(message);
+}
+
+export async function closeDiffTabsForFile(
+  absolutePath: string,
+): Promise<void> {
+  const tabs = vscode.window.tabGroups.all
+    .flatMap((tg) => tg.tabs)
+    .filter((tab) => {
+      if (tab.input instanceof vscode.TabInputTextDiff) {
+        return tab.input.modified.fsPath === absolutePath;
+      }
+      return false;
+    });
+
+  for (const tab of tabs) {
+    try {
       await vscode.window.tabGroups.close(tab);
+    } catch (err) {
+      if (!isIgnorableTabCloseError(err)) {
+        throw err;
+      }
     }
   }
 }

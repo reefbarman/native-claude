@@ -650,6 +650,14 @@ export async function handleApplyDiff(
     }
 
     if (blocks.length === 0) {
+      const formatExample = [
+        "<<<<<<< SEARCH",
+        "exact text to find",
+        "======= DIVIDER =======",
+        "replacement text",
+        ">>>>>>> REPLACE",
+      ].join("\n");
+
       return {
         content: [
           {
@@ -659,8 +667,9 @@ export async function handleApplyDiff(
               path: params.path,
               hint:
                 malformedBlocks > 0
-                  ? "Some blocks were missing a >>>>>>> REPLACE marker"
-                  : "Ensure marker lines are on their own lines: <<<<<<< SEARCH / ======= DIVIDER ======= / >>>>>>> REPLACE",
+                  ? "One or more blocks were malformed. Ensure every block has all three marker lines in order: SEARCH, DIVIDER, REPLACE."
+                  : "Ensure marker lines are on their own lines and use exact markers: <<<<<<< SEARCH / ======= DIVIDER ======= / >>>>>>> REPLACE",
+              expected_format: formatExample,
               ...(malformedBlocks > 0 && {
                 malformed_blocks: malformedBlocks,
               }),

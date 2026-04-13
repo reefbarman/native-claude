@@ -34,7 +34,7 @@ When the `agentlink` MCP server is available inside VS Code, NEVER use built-in 
 
 These MCP tools open diff views for user review, run commands in visible terminals, and return VS Code diagnostics.
 
-**Exception — non-text files:** The built-in `Read` tool may be used for file types that `read_file` cannot handle: **images** (PNG, JPG, GIF, etc. — Claude is multimodal), **PDFs** (with the `pages` parameter), and **Jupyter notebooks** (`.ipynb` — rendered with cells + outputs). A PreToolUse hook enforces this automatically.
+**Exception — non-text files:** Use `read_file` for local image files too — it supports provider-safe image formats (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`) and returns them as inspectable image content. The built-in `Read` tool is only still allowed for file types `read_file` does not handle yet: **PDFs** (with the `pages` parameter) and **Jupyter notebooks** (`.ipynb` — rendered with cells + outputs). A PreToolUse hook enforces this automatically.
 
 ### Regex escaping — IMPORTANT
 
@@ -46,7 +46,7 @@ These are the most frequent violations. Check yourself before every tool call:
 
 - **DO NOT use `Bash` to run builds, tests, git commands, or any shell command.** Use `execute_command`. If `execute_command` fails (e.g. parameter validation error), fix the parameters and retry — do NOT fall back to `Bash`.
 - **DO NOT use `Grep` to search code.** Use `search_files`. If you need to search the workspace root, pass `path: "."`.
-- **DO NOT use `Read` to read files.** Use `read_file`. **Exception:** built-in `Read` is allowed for images, PDFs, and Jupyter notebooks (file types `read_file` cannot handle).
+- **DO NOT use `Read` to read files.** Use `read_file` for text files and local image files. **Exception:** built-in `Read` is allowed only for PDFs and Jupyter notebooks (file types `read_file` does not handle yet).
 - **DO NOT use `Edit` or `Write` to modify files.** Use `apply_diff`, `write_file`, or `find_and_replace`. The built-in `Edit` tool's `replace_all` feature is NOT a reason to use it — use `find_and_replace` instead.
 - **DO NOT use `Glob` to find files.** Use `list_files`.
 - **DO NOT fall back to built-in tools when a agentlink tool returns an error.** Fix the issue (wrong parameter type, missing required param, etc.) and retry with the agentlink tool.
@@ -55,7 +55,7 @@ These are the most frequent violations. Check yourself before every tool call:
 
 | Instead of (built-in) | Use (agentlink MCP)         | Why                                                                                                                                          |
 | --------------------- | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Read`                | `read_file`                 | Returns line numbers, file metadata, git status, and diagnostics summary. Supports `query` param for semantic offset.                        |
+| `Read`                | `read_file`                 | Returns line numbers, file metadata, git status, diagnostics summary, and local image content. Supports `query` param for semantic offset.   |
 | `Edit` / `Write`      | `apply_diff` / `write_file` | Opens a diff view for user review. Format-on-save applies automatically. Returns user edits and diagnostics.                                 |
 | `Bash`                | `execute_command`           | Runs in VS Code's integrated terminal (visible to user). Captures output via shell integration. Supports named terminals for parallel tasks. |
 | `Glob`                | `list_files`                | Lists files with optional recursive + depth control. Supports `query` param for semantic file discovery.                                     |
@@ -90,7 +90,7 @@ These are the most frequent violations. Check yourself before every tool call:
 
 When the codebase index is available, `read_file` and `list_files` both accept an optional `query` parameter for semantic navigation:
 
-- **`read_file` with `query`** — Jumps to the most relevant section of a file. Instead of reading from line 1 or guessing an offset, pass a natural language query (e.g. `read_file("src/server.ts", query: "error handling middleware")`) and the tool auto-sets the offset to the best matching chunk. Ignored if `offset` is explicitly provided. The response includes a `semantic_match` field showing the matched line range.
+- **`read_file` with `query`** — Jumps to the most relevant section of a file. Instead of reading from line 1 or guessing an offset, pass a natural language query (e.g. `read_file("src/server.ts", query: "error handling middleware")`) and the tool auto-sets the offset to the best matching chunk. Ignored if `offset` is explicitly provided. The response includes a `semantic_match` field showing the matched line range. You can also use `anchor` or `anchor_regex` plus optional `anchor_offset` for deterministic jumps in very large files.
 - **`list_files` with `query`** — Finds files by meaning, not name. Pass a natural language query (e.g. `list_files("src/", query: "authentication")`) and get files ranked by semantic relevance. Other params (`recursive`, `depth`, `pattern`) are ignored when `query` is provided.
 
 Use these to reduce context-gathering round-trips: `list_files` with `query` to find relevant files, then `read_file` with `query` to land on the right section.
@@ -150,5 +150,5 @@ agentlink also provides tools that Claude Code doesn't have natively. Use these 
 - **`rename_symbol`** — Rename a symbol across the entire workspace using the language server. Updates all references, imports, and re-exports.
 - **`open_file`** — Open a file in the VS Code editor, optionally scrolling to a specific line. Supports range selection with `end_line`/`end_column` to highlight code.
 - **`show_notification`** — Show a notification in VS Code. Use sparingly for important status updates.
-- **`find_and_replace`** — Bulk find-and-replace across **multiple files** using a glob pattern (e.g. `src/**/*.ts`). Supports literal strings and regex with capture groups. Opens a rich preview panel showing each match in context with inline diffs — the user can toggle individual matches on/off before accepting. **For single-file edits, prefer `apply_diff`** — it provides better diff review and format-on-save. Only use `find_and_replace` on a single file when making many identical replacements (e.g. renaming a variable throughout a file).
-- **`get_terminal_output`** — Check on a background or timed-out command. Pass the `terminal_id` returned by `execute_command`. Works for both `background: true` commands and foreground commands that timed out (indicated by `timed_out: true` in the response). Returns accumulated output, whether the command is still running, and the exit code when finished. Use `wait_seconds` to poll for new output (avoids needing two calls when a command was just started). Use `kill: true` to send Ctrl+C (SIGINT) and stop the command. Supports the same output filtering params as `execute_command` (`output_head`, `output_tail`, `output_grep`, etc.).
+- **`find_and_replace`** — Bulk find-and-replace across **multiple files** using a glob pattern (e.g. `src/**/*.ts`). Supports literal strings and regex with capture groups. Opens a rich preview panel showing each match in context with inline diffs — the user can toggle individual matches on/off before accepting. Optional `max_replacements` adds a safety guardrail that aborts without applying edits when total matches exceed the threshold. **For single-file edits, prefer `apply_diff`** — it provides better diff review and format-on-save. Only use `find_and_replace` on a single file when making many identical replacements (e.g. renaming a variable throughout a file).
+- **`get_terminal_output`** — Check on a background or timed-out command. Pass the `terminal_id` returned by `execute_command`. Works for both `background: true` commands and foreground commands that timed out (indicated by `timed_out: true` in the response). Returns accumulated output, whether the command is still running, and the exit code when finished. Use `wait_seconds` to poll for new output (avoids needing two calls when a command was just started). Use `kill: true` to send Ctrl+C (SIGINT) and stop the command. Supports the same output filtering params as `execute_command` (`output_head`, `output_tail`, `output_grep`, etc.). When a running command appears stalled on an interactive prompt, responses include `blocked_on_prompt` with a prompt hint.

@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { render, screen } from "@testing-library/preact";
+import { describe, expect, it, vi } from "vitest";
+import { render, screen, fireEvent } from "@testing-library/preact";
 
 import { MessageBubble } from "./MessageBubble";
 import type { ChatMessage } from "../types";
@@ -48,5 +48,62 @@ describe("MessageBubble slash-command rendering", () => {
     ).toBeTruthy();
     expect(screen.getByText("/snapshot latest")).toBeTruthy();
     expect(container.querySelector(".user-slash-command-tool-call")).toBeNull();
+  });
+
+  it("renders attachment markers as basename chips and removes them from the message body", () => {
+    const message: ChatMessage = {
+      id: "user-3",
+      role: "user",
+      content:
+        "Please inspect this file\n[Attached: src/agent/webview/App.tsx]",
+      timestamp: Date.now(),
+      blocks: [],
+    };
+
+    const { container } = render(
+      <MessageBubble message={message} streaming={false} />,
+    );
+
+    expect(container.querySelector(".user-attachments")).toBeTruthy();
+    expect(screen.getByText("App.tsx")).toBeTruthy();
+    expect(
+      screen.queryByText("[Attached: src/agent/webview/App.tsx]"),
+    ).toBeNull();
+    expect(screen.getByText("Please inspect this file")).toBeTruthy();
+  });
+
+  it("renders detected question fallback options and dispatches selected payload", () => {
+    const onAnswer = vi.fn();
+    const onDismiss = vi.fn();
+    const message: ChatMessage = {
+      id: "assistant-1",
+      role: "assistant",
+      content: "",
+      timestamp: Date.now(),
+      blocks: [{ type: "text", text: "Proceed?" }],
+    };
+
+    render(
+      <MessageBubble
+        message={message}
+        streaming={false}
+        detectedQuestion={{
+          messageId: "assistant-1",
+          kind: "yes_no",
+          prompt: "Proceed?",
+          options: [
+            { label: "Yes", payload: "Yes, proceed with test updates." },
+            { label: "No", payload: "No" },
+          ],
+        }}
+        onDetectedQuestionAnswer={onAnswer}
+        onDismissDetectedQuestion={onDismiss}
+      />,
+    );
+
+    expect(screen.getByText("Detected choice prompt")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Yes" }));
+    expect(onAnswer).toHaveBeenCalledWith("Yes, proceed with test updates.");
+    expect(onDismiss).toHaveBeenCalledWith("assistant-1");
   });
 });

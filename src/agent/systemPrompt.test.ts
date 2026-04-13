@@ -154,6 +154,16 @@ describe("buildSystemPrompt", () => {
     );
   });
 
+  it("requires ask_user for bounded choices and confirmations", async () => {
+    const result = await buildSystemPrompt("code", tmpDir);
+    expect(result).toContain(
+      "If you need a bounded choice, confirmation, or yes/no decision, always use `ask_user`.",
+    );
+    expect(result).toContain(
+      "Use inline plain-text questions only for genuinely open-ended free-form responses where structured UI would not help.",
+    );
+  });
+
   it("includes code mode technical judgment guidance", async () => {
     const result = await buildSystemPrompt("code", tmpDir);
     expect(result).toContain(

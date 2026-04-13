@@ -61,6 +61,10 @@ export class AgentSession {
   /** Cache-read tokens from the most recent API response (used for cache-aware condense threshold) */
   lastCacheReadTokens = 0;
 
+  /** Estimated tokens accumulated since the last API response (tool results, user messages, etc.).
+   *  Reset to 0 when addUsage() receives fresh API data. */
+  estimatedAccumulatedTokens = 0;
+
   /** Active file path at session creation — used for subfolder AGENTS.md and hot-reload. */
   activeFilePath: string | undefined;
 
@@ -265,6 +269,18 @@ export class AgentSession {
     return this.messages.length;
   }
 
+  /**
+   * Remove the last message if it matches the given role.
+   * Returns the removed message, or undefined if the last message didn't match.
+   */
+  popLastMessage(role: "user" | "assistant"): AgentMessage | undefined {
+    const last = this.messages[this.messages.length - 1];
+    if (last?.role === role) {
+      return this.messages.pop();
+    }
+    return undefined;
+  }
+
   addUserMessage(
     text: string,
     opts?: {
@@ -420,6 +436,29 @@ export class AgentSession {
     this.lastInputTokens = inputTokens + cacheReadTokens + cacheCreationTokens;
     this.lastOutputTokens = outputTokens;
     this.lastCacheReadTokens = cacheReadTokens;
+    // Fresh API data replaces any local estimates.
+    this.estimatedAccumulatedTokens = 0;
+  }
+
+  /**
+   * Add an estimated token count for content added since the last API response
+   * (e.g. tool results, user messages). Uses the same 4-bytes-per-token
+   * heuristic as Codex CLI.
+   */
+  addEstimatedTokens(chars: number): void {
+    this.estimatedAccumulatedTokens += Math.ceil(chars / 4);
+  }
+
+  /**
+   * Running estimate of total context window usage:
+   * last API total + estimated new content since then.
+   */
+  get estimatedTotalUsed(): number {
+    return (
+      this.lastInputTokens +
+      this.lastOutputTokens +
+      this.estimatedAccumulatedTokens
+    );
   }
 
   /** Return the text content of the last assistant message, if any. */

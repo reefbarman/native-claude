@@ -1,12 +1,17 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 
-import { TerminalManager } from "./TerminalManager.js";
+import {
+  TerminalManager,
+  escapeHistoryExpansion,
+  shouldEscapeHistoryExpansion,
+} from "./TerminalManager.js";
 
 type MockManagedTerminal = {
   id: string;
   name: string;
   cwd: string;
   busy: boolean;
+  envKey?: string;
   backgroundRunning: boolean;
   lastCommandEndedAt: number;
   outputBuffer: string;
@@ -23,6 +28,64 @@ type MockManagedTerminal = {
     };
   };
 };
+
+describe("shouldEscapeHistoryExpansion", () => {
+  it("always escapes on non-windows platforms", () => {
+    expect(shouldEscapeHistoryExpansion("linux", "/usr/bin/bash")).toBe(true);
+    expect(shouldEscapeHistoryExpansion("darwin", "/bin/zsh")).toBe(true);
+    expect(shouldEscapeHistoryExpansion("linux", undefined)).toBe(true);
+  });
+
+  it("escapes on windows only for bash-like shells", () => {
+    expect(
+      shouldEscapeHistoryExpansion(
+        "win32",
+        "C:\\Program Files\\Git\\bin\\bash.exe",
+      ),
+    ).toBe(true);
+    expect(
+      shouldEscapeHistoryExpansion("win32", "C:/msys64/usr/bin/bash.exe"),
+    ).toBe(true);
+    expect(shouldEscapeHistoryExpansion("win32", "C:/tools/zsh.exe")).toBe(
+      true,
+    );
+  });
+
+  it("does not escape on windows powershell/cmd or unknown shell", () => {
+    expect(
+      shouldEscapeHistoryExpansion(
+        "win32",
+        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+      ),
+    ).toBe(false);
+    expect(
+      shouldEscapeHistoryExpansion("win32", "C:\\Windows\\System32\\cmd.exe"),
+    ).toBe(false);
+    expect(shouldEscapeHistoryExpansion("win32", undefined)).toBe(false);
+  });
+});
+
+describe("escapeHistoryExpansion", () => {
+  it("escapes unquoted and double-quoted exclamation marks", () => {
+    expect(escapeHistoryExpansion("echo wow!")).toBe("echo wow\\!");
+    expect(escapeHistoryExpansion('echo "wow!"')).toBe('echo "wow\\!"');
+  });
+
+  it("does not escape inside single quotes", () => {
+    expect(escapeHistoryExpansion("echo 'wow!'")).toBe("echo 'wow!'");
+  });
+
+  it("preserves already escaped exclamation marks", () => {
+    expect(escapeHistoryExpansion("echo wow\\!")).toBe("echo wow\\!");
+  });
+
+  it("handles windows git bash patterns used to wrap powershell", () => {
+    const input =
+      'powershell -NoProfile -Command "if (!(Test-Path $bashrc)) { Write-Output ok }"';
+    const output = escapeHistoryExpansion(input);
+    expect(output).toContain("if (\\!(Test-Path $bashrc))");
+  });
+});
 
 describe("TerminalManager terminal selection", () => {
   beforeEach(() => {
@@ -96,7 +159,11 @@ describe("TerminalManager terminal selection", () => {
       cwd: "/workspace",
     });
 
-    expect(createTerminalSpy).toHaveBeenCalledWith("/workspace", "AgentLink");
+    expect(createTerminalSpy).toHaveBeenCalledWith(
+      "/workspace",
+      "AgentLink",
+      undefined,
+    );
     expect(result.terminal_id).toBe("term_new");
     expect(existing.terminal.sendText).not.toHaveBeenCalled();
   });
@@ -186,7 +253,11 @@ describe("TerminalManager terminal selection", () => {
     });
     await Promise.resolve();
 
-    expect(createTerminalSpy).toHaveBeenCalledWith("/workspace", "AgentLink");
+    expect(createTerminalSpy).toHaveBeenCalledWith(
+      "/workspace",
+      "AgentLink",
+      undefined,
+    );
 
     releaseCooldown?.();
 
@@ -248,6 +319,84 @@ describe("TerminalManager terminal selection", () => {
     expect(result.execution_mode).toBe("send_text");
     expect(result.command_sent).toBe(true);
     expect(result.verification_hint).toContain("Do not re-run");
+  });
+
+  it("creates a separate default terminal when env map differs", async () => {
+    const manager = new TerminalManager();
+
+    vi.spyOn(
+      manager as unknown as {
+        waitForShellIntegration: (terminal: unknown) => Promise<boolean>;
+      },
+      "waitForShellIntegration",
+    ).mockResolvedValue(false);
+
+    const first = await manager.executeCommand({
+      command: "echo first",
+      cwd: "/workspace",
+      env: { CI: "1" },
+    });
+
+    const second = await manager.executeCommand({
+      command: "echo second",
+      cwd: "/workspace",
+      env: { CI: "0" },
+    });
+
+    expect(first.terminal_id).not.toBe(second.terminal_id);
+  });
+
+  it("rejects terminal_id reuse when env differs", async () => {
+    const manager = new TerminalManager();
+
+    vi.spyOn(
+      manager as unknown as {
+        waitForShellIntegration: (terminal: unknown) => Promise<boolean>;
+      },
+      "waitForShellIntegration",
+    ).mockResolvedValue(false);
+
+    const first = await manager.executeCommand({
+      command: "echo first",
+      cwd: "/workspace",
+      env: { CI: "1" },
+    });
+
+    await expect(
+      manager.executeCommand({
+        command: "echo second",
+        cwd: "/workspace",
+        terminal_id: first.terminal_id,
+      }),
+    ).rejects.toThrow(/different env set/);
+  });
+
+  it("allows terminal_id reuse when env matches", async () => {
+    const manager = new TerminalManager();
+
+    vi.spyOn(
+      manager as unknown as {
+        waitForShellIntegration: (terminal: unknown) => Promise<boolean>;
+      },
+      "waitForShellIntegration",
+    ).mockResolvedValue(false);
+
+    const first = await manager.executeCommand({
+      command: "echo first",
+      cwd: "/workspace",
+      env: { CI: "1" },
+    });
+
+    expect(manager.interruptTerminal(first.terminal_id)).toBe(true);
+
+    const second = await manager.executeCommand({
+      command: "echo second",
+      cwd: "/workspace",
+      terminal_id: first.terminal_id,
+      env: { CI: "1" },
+    });
+
+    expect(second.terminal_id).toBe(first.terminal_id);
   });
 
   it("does not reuse a send_text fallback terminal while the prior command may still be running", async () => {

@@ -57,6 +57,69 @@ describe("validateCommand", () => {
     });
   });
 
+  describe("non-cat file writers (direct commands)", () => {
+    it("rejects tee with file target", () => {
+      const result = validateCommand("echo hi | tee out.txt");
+      expect(result).not.toBeNull();
+      expect(result!.message).toContain('"tee" with file targets');
+      expect(result!.message).toContain("write_file");
+    });
+
+    it("rejects tee with heredoc", () => {
+      const result = validateCommand(
+        "tee /tmp/out.txt >/dev/null <<'EOF'\nhello\nEOF",
+      );
+      expect(result).not.toBeNull();
+      expect(result!.message).toContain('"tee" with file targets');
+    });
+
+    it("rejects tee append with file target", () => {
+      const result = validateCommand("echo hi | tee -a out.txt");
+      expect(result).not.toBeNull();
+      expect(result!.message).toContain('"tee" with file targets');
+    });
+
+    it("rejects tee with -- separator and file target", () => {
+      const result = validateCommand("echo hi | tee -- out.txt");
+      expect(result).not.toBeNull();
+      expect(result!.message).toContain('"tee" with file targets');
+    });
+
+    it("allows tee without file target", () => {
+      expect(validateCommand("echo hi | tee")).toBeNull();
+      expect(validateCommand("echo hi | tee -a")).toBeNull();
+      expect(validateCommand("echo hi | tee -")).toBeNull();
+    });
+
+    it("rejects printf with output redirection", () => {
+      const result = validateCommand("printf 'hello\\n' > out.txt");
+      expect(result).not.toBeNull();
+      expect(result!.message).toContain('"printf" with output redirection');
+      expect(result!.message).toContain("write_file");
+    });
+
+    it("rejects echo with output redirection", () => {
+      const result = validateCommand("echo hello >> out.txt");
+      expect(result).not.toBeNull();
+      expect(result!.message).toContain('"echo" with output redirection');
+    });
+
+    it("rejects echo redirection in compound command", () => {
+      const result = validateCommand(
+        "mkdir -p out && echo hello > out/file.txt",
+      );
+      expect(result).not.toBeNull();
+      expect(result!.message).toContain('"echo" with output redirection');
+    });
+
+    it("allows echo/printf without file redirection", () => {
+      expect(validateCommand("echo hello")).toBeNull();
+      expect(validateCommand("printf 'hello\\n'")).toBeNull();
+      expect(validateCommand("printf 'x\\n' 2>&1")).toBeNull();
+      expect(validateCommand("echo hello >&2")).toBeNull();
+    });
+  });
+
   describe("head", () => {
     it("rejects head with a file argument", () => {
       const result = validateCommand("head -20 server.log");

@@ -800,11 +800,18 @@ export class CodexProvider implements ModelProvider {
       messages,
       maxTokens,
       temperature: _temperature,
+      reasoningEffort: requestedEffort,
       cache,
       state,
     } = request;
 
     const codexInput = translateMessages(messages);
+
+    const modelDef = CODEX_MODEL_MAP.get(model);
+    const reasoningEffort =
+      requestedEffort === "none"
+        ? undefined
+        : (requestedEffort ?? modelDef?.defaultReasoningEffort ?? "medium");
 
     let auth = await this.getModelAuthOrThrow();
     const attemptedOAuthAccountIds = new Set<string>();
@@ -821,8 +828,21 @@ export class CodexProvider implements ModelProvider {
         maxTokens,
         state,
         cache,
+        reasoningEffort,
         auth,
       });
+
+      // Log request shape (mirrors stream() logging)
+      {
+        const inputItems = requestBody.input;
+        const inputSummary = Array.isArray(inputItems)
+          ? `${inputItems.length} items`
+          : "string";
+        const body = requestBody as unknown as Record<string, unknown>;
+        this.log(
+          `[codex] complete(): model=${requestBody.model} auth=${auth.method} input=${inputSummary} tools=${requestBody.tools?.length ?? 0} store=${requestBody.store} reasoning=${JSON.stringify(body.reasoning ?? null)}`,
+        );
+      }
 
       let text = "";
       let inputTokens = 0;
@@ -860,6 +880,10 @@ export class CodexProvider implements ModelProvider {
         };
       } catch (err) {
         const sdkErr = toCodexSdkError(err);
+
+        this.log(
+          `[codex] complete() error: status=${sdkErr.status ?? "none"} message=${sdkErr.message} rawCode=${sdkErr.rawCode ?? "none"} body=${JSON.stringify(sdkErr.body ?? null)}`,
+        );
 
         if (auth.method === "oauth" && isAuthError(sdkErr) && auth.canRefresh) {
           const refreshAccountId = auth.oauthAccountPoolId;

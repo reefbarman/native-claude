@@ -231,7 +231,7 @@ describe("summarizeConversation", () => {
     expect(content[1]?.text).toContain("## Conversation Summary");
   });
 
-  it("falls back to a deterministic summary when the model omits the latest user message after retry", async () => {
+  it("accepts model summary without validation retry", async () => {
     const messages: AgentMessage[] = [
       { role: "user", content: "Investigate condense" } as AgentMessage,
       { role: "assistant", content: [{ type: "text", text: "Looking now." }] },
@@ -242,21 +242,11 @@ describe("summarizeConversation", () => {
       } as AgentMessage,
     ];
 
-    let callCount = 0;
     const { provider, complete } = makeProvider(() => {
-      callCount += 1;
       return {
         text: `<summary>
-1. **Primary Request and Intent**: Keep working.
-2. **Key Technical Concepts**: TypeScript.
-3. **Files and Code Sections**: src/agent/condense.ts.
-4. **Errors and Fixes**: None.
-5. **Problem Solving**: Preserved context.
-6. **All User Messages**: "Investigate condense"
-7. **User Corrections & Behavioral Directives**: None.
-8. **Pending Tasks**: None.
-9. **Current Work**: Inspecting condense behavior.
-10. **Optional Next Step**: Continue.
+Working on condense improvements. Key files: src/agent/condense.ts.
+User wants to fix the condense resume bug for Codex after summarization.
 </summary>`,
       };
     });
@@ -266,29 +256,16 @@ describe("summarizeConversation", () => {
       provider,
       systemPrompt: "system prompt",
       isAutomatic: true,
-      preservedContext: {
-        toolNames: ["read_file", "codebase_search"],
-        mcpServerNames: ["linear"],
-      },
     });
 
     expect(result.error).toBeUndefined();
-    expect(complete).toHaveBeenCalledTimes(2);
-    expect(callCount).toBe(2);
-    expect(result.validationWarnings).toContain(
-      "Fell back to a deterministic summary because the model-authored summary could not be trusted after retry.",
-    );
-
+    // No validation retry — single API call.
+    expect(complete).toHaveBeenCalledTimes(1);
     const summary = result.messages[result.messages.length - 1];
     expect(summary.isSummary).toBe(true);
     const content = summary.content as Array<{ type: string; text?: string }>;
-    expect(content[0]?.text).toContain("Continue from this task");
-    expect(content[0]?.text).toContain(
-      "Continue fixing the condense resume bug for Codex after summarization.",
-    );
-    expect(content[1]?.text).toContain(
-      '9. **Current Work**: Continue from this task: "Continue fixing the condense resume bug for Codex after summarization."',
-    );
+    expect(content[1]?.text).toContain("## Conversation Summary");
+    expect(content[1]?.text).toContain("condense improvements");
   });
 
   it("uses an honest resume anchor when no pending task heuristic matches", async () => {
@@ -606,8 +583,10 @@ describe("summarizeConversation", () => {
     });
 
     expect(result.error).toBeUndefined();
-    expect(complete).toHaveBeenCalledTimes(3);
-    expect(result.summary).toContain("Primary Request and Intent");
+    // nano fails with context error → falls through to gpt-5.4 which succeeds.
+    // No validation retry — just 2 model candidate calls.
+    expect(complete).toHaveBeenCalledTimes(2);
+    expect(result.summary).toBeTruthy();
   });
 
   it("preserves structured error metadata for condense failures", async () => {

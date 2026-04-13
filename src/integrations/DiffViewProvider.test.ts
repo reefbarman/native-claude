@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { withFileLock } from "./DiffViewProvider.js";
+import { isIgnorableTabCloseError, withFileLock } from "./DiffViewProvider.js";
 
 // Each test uses a unique path to avoid interference from the shared
 // module-level pathLocks Map.
@@ -7,6 +7,22 @@ let pathCounter = 0;
 function uniquePath(): string {
   return `/test/lock-${++pathCounter}-${Date.now()}`;
 }
+
+describe("isIgnorableTabCloseError", () => {
+  it("returns true for invalid-tab race message", () => {
+    expect(
+      isIgnorableTabCloseError(new Error("Tab close: Invalid tab not found!")),
+    ).toBe(true);
+  });
+
+  it("returns false for unrelated errors", () => {
+    expect(
+      isIgnorableTabCloseError(
+        new Error("Permission denied while closing tab"),
+      ),
+    ).toBe(false);
+  });
+});
 
 describe("withFileLock", () => {
   afterEach(() => {
@@ -78,7 +94,10 @@ describe("withFileLock", () => {
     let resolveA: () => void;
     const lockA = withFileLock(
       path,
-      () => new Promise<void>((r) => { resolveA = r; }),
+      () =>
+        new Promise<void>((r) => {
+          resolveA = r;
+        }),
     );
 
     // Lock B: queued behind A

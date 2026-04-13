@@ -159,6 +159,13 @@ describe("parseSearchReplaceBlocks", () => {
     expect(blocks[0].search).toBe("hello");
     expect(blocks[0].replace).toBe("world");
   });
+
+  it("marks malformed blocks when REPLACE marker is missing", () => {
+    const input = "<<<<<<< SEARCH\nhello\n======= DIVIDER =======\nworld";
+    const { blocks, malformedBlocks } = parseSearchReplaceBlocks(input);
+    expect(blocks).toHaveLength(0);
+    expect(malformedBlocks).toBe(1);
+  });
 });
 
 describe("applyBlocks", () => {

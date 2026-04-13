@@ -116,9 +116,9 @@ export function InputArea({
   const [slashOpen, setSlashOpen] = useState(false);
   const [slashQuery, setSlashQuery] = useState("");
   const [slashStart, setSlashStart] = useState(-1);
-  const [slashView, setSlashView] = useState<"main" | "mode" | "model" | "mcp">(
-    "main",
-  );
+  const [slashView, setSlashView] = useState<
+    "main" | "mode" | "model" | "mcp-config"
+  >("main");
   const [slashSelectedIdx, setSlashSelectedIdx] = useState(0);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const inputWrapperRef = useRef<HTMLDivElement>(null);
@@ -243,8 +243,8 @@ export function InputArea({
         isCurrent: m.id === currentModel,
       }));
     }
-    // Sub-view: mcp scope picker
-    if (slashView === "mcp") {
+    // Sub-view: mcp-config scope picker
+    if (slashView === "mcp-config") {
       return [
         {
           name: "__mcp:project",
@@ -312,11 +312,11 @@ export function InputArea({
     "checkpoint",
     "revert",
     "help",
+    "mcp",
     "mcp-refresh",
-    "mcp-status",
   ]);
   // Commands that open a sub-picker
-  const SUB_PICKER_CMDS = new Set(["mode", "model", "mcp"]);
+  const SUB_PICKER_CMDS = new Set(["mode", "model", "mcp-config"]);
 
   const handleSlashSelect = useCallback(
     (cmd: SlashCommandInfo) => {
@@ -332,7 +332,7 @@ export function InputArea({
         const scope = cmd.name.slice(6) as "project" | "global";
         setText(before);
         closeSlash();
-        onExecuteBuiltinCommand?.("mcp", scope);
+        onExecuteBuiltinCommand?.("mcp-config", scope);
         return;
       }
       if (cmd.name.startsWith("__mode:")) {
@@ -353,7 +353,7 @@ export function InputArea({
       // Commands that drill into a sub-picker — clear typed text, stay open
       if (SUB_PICKER_CMDS.has(cmd.name)) {
         setText(before);
-        setSlashView(cmd.name as "mode" | "model" | "mcp");
+        setSlashView(cmd.name as "mode" | "model" | "mcp-config");
         setSlashSelectedIdx(0);
         return;
       }
@@ -962,7 +962,7 @@ export function InputArea({
               ? "Switch Mode"
               : slashView === "model"
                 ? "Switch Model"
-                : slashView === "mcp"
+                : slashView === "mcp-config"
                   ? "Open MCP Config"
                   : undefined
           }

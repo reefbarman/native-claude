@@ -35,7 +35,7 @@ import { toSupportedImageMediaType } from "./providers/types.js";
 import type { ProviderRegistry } from "./providers/index.js";
 import { AnthropicProvider } from "./providers/anthropic/index.js";
 const MAX_API_RETRIES = 3;
-const MAX_EMPTY_RESPONSE_RETRIES = 1;
+const MAX_EMPTY_RESPONSE_RETRIES = 2;
 
 /** Walk the error cause chain and join unique messages into one string. */
 // (No equivalent exists elsewhere in the codebase.)
@@ -57,6 +57,7 @@ function isRetryableError(msg: string): boolean {
   return (
     lower.includes("rate_limit") ||
     lower.includes("overloaded") ||
+    lower.includes("503") ||
     lower.includes("529") ||
     lower.includes("connection error") ||
     lower.includes("econnrefused") ||
@@ -66,6 +67,7 @@ function isRetryableError(msg: string): boolean {
     lower.includes("fetch failed") ||
     lower.includes("other side closed") ||
     lower.includes("terminated") ||
+    lower.includes("termination") ||
     lower.includes("an error occurred while processing your request") ||
     lower.includes("please include the request id")
   );
@@ -137,21 +139,15 @@ function isAuthError(msg: string): boolean {
  */
 const CONTEXT_WINDOW_SAFETY_BUFFER = 0.05;
 
-function estimatePendingToolResultTokens(
-  toolResults?: ToolCallResult[],
-): number {
-  return toolResults
-    ? Math.ceil(
-        toolResults.reduce(
-          (n, tr) =>
-            n +
-            JSON.stringify(
-              toolResultToContent(tr.result, undefined, tr.toolName),
-            ).length,
-          0,
-        ) / 4,
-      )
-    : 0;
+/** Estimate the character size of a set of tool results (for token estimation). */
+function estimateToolResultChars(toolResults: ToolCallResult[]): number {
+  return toolResults.reduce(
+    (n, tr) =>
+      n +
+      JSON.stringify(toolResultToContent(tr.result, undefined, tr.toolName))
+        .length,
+    0,
+  );
 }
 
 /**
@@ -175,7 +171,6 @@ function getOutputReservation(
 function getCondenseBudgetSnapshot(
   session: AgentSession,
   provider: ModelProvider,
-  toolResults?: ToolCallResult[],
 ): {
   usedTokens: number;
   outputReservation: number;
@@ -190,9 +185,8 @@ function getCondenseBudgetSnapshot(
   const safetyBufferTokens = Math.floor(
     caps.contextWindow * CONTEXT_WINDOW_SAFETY_BUFFER,
   );
-  const estimatedResultTokens = estimatePendingToolResultTokens(toolResults);
-  const usedTokens =
-    session.lastInputTokens + session.lastOutputTokens + estimatedResultTokens;
+  // Use the session's running estimate: last API total + accumulated since then.
+  const usedTokens = session.estimatedTotalUsed;
   const cacheHitRatio =
     session.lastInputTokens > 0
       ? session.lastCacheReadTokens / session.lastInputTokens
@@ -229,13 +223,9 @@ function getCondenseBudgetSnapshot(
 function isOverCondenseThresholdInternal(
   session: AgentSession,
   provider: ModelProvider,
-  toolResults?: ToolCallResult[],
 ): boolean {
   if (!session.autoCondense || session.lastInputTokens === 0) return false;
-  return (
-    getCondenseBudgetSnapshot(session, provider, toolResults).triggerReason !==
-    null
-  );
+  return getCondenseBudgetSnapshot(session, provider).triggerReason !== null;
 }
 
 function hasUnansweredUserTurn(session: AgentSession): boolean {
@@ -480,6 +470,7 @@ export class AgentEngine {
     try {
       let retryCount = 0;
       let emptyResponseRetryCount = 0;
+      let emptyResponseCondenseAttempted = false;
       let credentialRefreshCount = 0;
       // Sticky for the whole user turn: once we fall back from remote response
       // state to full local replay, keep reporting that on the eventual
@@ -546,7 +537,7 @@ export class AgentEngine {
         };
 
         if (
-          this.isOverCondenseThreshold(session, undefined, provider) &&
+          this.isOverCondenseThreshold(session, provider) &&
           !hasUnansweredUserTurn(session)
         ) {
           yield* this.condenseSession(
@@ -960,7 +951,8 @@ export class AgentEngine {
             retryCount++;
             const isRateLimit =
               streamErrMsg.includes("rate_limit") ||
-              streamErrMsg.includes("overloaded");
+              streamErrMsg.includes("overloaded") ||
+              streamErrMsg.includes("503");
             const delayMs = isRateLimit
               ? Math.min(retryCount * 15_000, 60_000)
               : Math.min(retryCount * 2_000, 10_000);
@@ -1060,16 +1052,55 @@ export class AgentEngine {
         if (contentBlocks.length === 0) {
           if (emptyResponseRetryCount < MAX_EMPTY_RESPONSE_RETRIES) {
             emptyResponseRetryCount++;
+            if (emptyResponseRetryCount === 1) {
+              // First retry: silent re-stream (transient failures often self-heal)
+              yield {
+                type: "warning",
+                message: "Provider returned an empty response — retrying…",
+              };
+            } else {
+              // Subsequent retries: nudge the model with an explicit continuation prompt
+              yield {
+                type: "warning",
+                message:
+                  "Provider returned an empty response — asking it to continue…",
+              };
+              // Intentionally do not append an empty assistant turn to history.
+              session.addUserMessage(
+                "Your previous response was empty. Continue from where you left off and provide the full response.",
+              );
+            }
+            session.status = "streaming";
+            continue;
+          }
+
+          // Clean up the injected retry nudge message so the session isn't
+          // left dirty (it was only meant as a transient nudge, not permanent
+          // history). Only the second retry injects a message.
+          session.popLastMessage("user");
+
+          // Last resort: try auto-condensing and retrying once — this resets
+          // the context and gives the model a fresh start. Only attempt once
+          // to avoid an infinite condense → empty → condense loop.
+          if (
+            !emptyResponseCondenseAttempted &&
+            !signal.aborted &&
+            session.autoCondense
+          ) {
+            emptyResponseCondenseAttempted = true;
             yield {
               type: "warning",
               message:
-                "Provider returned an empty response — asking it to continue…",
+                "Empty responses persisted — condensing conversation and retrying…",
             };
-            // Intentionally do not append an empty assistant turn to history.
-            session.addUserMessage(
-              "Your previous response was empty. Continue from where you left off and provide the full response.",
+            yield* this.condenseSession(
+              session,
+              true,
+              provider,
+              preservedContext,
             );
-            session.status = "streaming";
+            if (signal.aborted) break;
+            emptyResponseRetryCount = 0;
             continue;
           }
 
@@ -1077,6 +1108,7 @@ export class AgentEngine {
             type: "error",
             error: `Provider returned empty responses ${MAX_EMPTY_RESPONSE_RETRIES + 1} times in a row. Please retry.`,
             retryable: true,
+            actions: { condense: true },
           };
           return;
         }
@@ -1282,6 +1314,9 @@ export class AgentEngine {
           })),
         );
 
+        // Feed estimated token size of tool results to the running accumulator.
+        session.addEstimatedTokens(estimateToolResultChars(toolResults));
+
         // Internal tools (todo_write) don't flow through executeToolCalls, so emit
         // their completion events now. Dispatch-tool completion events are emitted
         // by executeToolCalls as each call finishes.
@@ -1308,14 +1343,11 @@ export class AgentEngine {
           break;
         }
 
-        // Post-batch condense check: tool results may have added significant tokens
-        // that aren't reflected in lastInputTokens yet (which still shows the count
-        // from before the results were appended). Estimate the result size and
-        // condense proactively if the projected next-turn context would exceed the
-        // threshold — avoiding an oversized API call or a "prompt is too long" error.
+        // Post-batch condense check: tool results added estimated tokens to the
+        // session accumulator above. Check if we've crossed the threshold.
         if (
           !signal.aborted &&
-          this.isOverCondenseThreshold(session, toolResults, provider)
+          this.isOverCondenseThreshold(session, provider)
         ) {
           yield* this.condenseSession(
             session,
@@ -1431,24 +1463,18 @@ export class AgentEngine {
    * Results are returned in the same order as the original tool_use blocks.
    */
   /**
-   * Returns true if the session's projected next-turn context usage exceeds the
-   * auto-condense threshold. Pass toolResults to include an estimate of their
-   * token cost (used for the post-batch check, where results have been appended
-   * to history but lastInputTokens still reflects pre-result counts).
+   * Returns true if the session's estimated context usage exceeds the
+   * auto-condense threshold. Uses session.estimatedTotalUsed which includes
+   * accumulated estimates for content added since the last API response.
    */
   isOverCondenseThreshold(
     session: AgentSession,
-    toolResults?: ToolCallResult[],
     provider?: ModelProvider,
   ): boolean {
     const resolvedProvider =
       provider ?? this.registry.tryResolveProvider(session.model);
     if (!resolvedProvider) return false;
-    return isOverCondenseThresholdInternal(
-      session,
-      resolvedProvider,
-      toolResults,
-    );
+    return isOverCondenseThresholdInternal(session, resolvedProvider);
   }
 
   private async executeToolCalls(

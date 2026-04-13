@@ -1,12 +1,127 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import * as path from "path";
+
+const {
+  execRipgrepSearch,
+  getRipgrepBinPath,
+  semanticSearch,
+  resolveAndValidatePath,
+  tryGetFirstWorkspaceRoot,
+} = vi.hoisted(() => ({
+  execRipgrepSearch: vi.fn(),
+  getRipgrepBinPath: vi.fn(),
+  semanticSearch: vi.fn(),
+  resolveAndValidatePath: vi.fn(),
+  tryGetFirstWorkspaceRoot: vi.fn(),
+}));
+
+vi.mock("../util/ripgrep.js", async () => {
+  const actual =
+    await vi.importActual<typeof import("../util/ripgrep.js")>(
+      "../util/ripgrep.js",
+    );
+  return {
+    ...actual,
+    execRipgrepSearch,
+    getRipgrepBinPath,
+  };
+});
+
+vi.mock("../services/semanticSearch.js", () => ({
+  semanticSearch,
+}));
+
+vi.mock("../util/paths.js", () => ({
+  resolveAndValidatePath,
+  tryGetFirstWorkspaceRoot,
+}));
+
 import {
   sanitizeRegex,
   getEscapingHint,
   needsMultiline,
   resolveFilePatternAsPath,
   expandSimpleBraceGlob,
+  handleSearchFiles,
 } from "./searchFiles.js";
+
+describe("handleSearchFiles ripgrep args", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getRipgrepBinPath.mockResolvedValue("rg");
+    execRipgrepSearch.mockResolvedValue("");
+    semanticSearch.mockResolvedValue({
+      content: [{ type: "text", text: JSON.stringify({ total_matches: 0 }) }],
+    });
+    const resolvedPath = path.resolve(".");
+    resolveAndValidatePath.mockReturnValue({
+      absolutePath: resolvedPath,
+      inWorkspace: true,
+    });
+    tryGetFirstWorkspaceRoot.mockReturnValue(resolvedPath);
+  });
+
+  it("adds default .git and node_modules exclude globs", async () => {
+    await handleSearchFiles(
+      { path: ".", regex: "workflowStepIdx", semantic: false },
+      {
+        isPathTrusted: () => true,
+      } as never,
+      {} as never,
+      "session-1",
+    );
+
+    expect(execRipgrepSearch).toHaveBeenCalledTimes(1);
+    const args = execRipgrepSearch.mock.calls[0][1] as string[];
+    expect(args).toContain("--glob");
+    expect(args).toContain("!**/.git/**");
+    expect(args).toContain("!**/node_modules/**");
+  });
+
+  it("passes search dir as cwd to ripgrep execution", async () => {
+    await handleSearchFiles(
+      {
+        path: ".",
+        regex: "workflowStepIdx",
+        file_pattern: "src/**/*.ts",
+        semantic: false,
+      },
+      {
+        isPathTrusted: () => true,
+      } as never,
+      {} as never,
+      "session-2",
+    );
+
+    expect(execRipgrepSearch).toHaveBeenCalledTimes(1);
+    const options = execRipgrepSearch.mock.calls[0][2] as
+      | { cwd?: string }
+      | undefined;
+    expect(options?.cwd).toBe(path.resolve("."));
+  });
+
+  it("keeps excludes when file_pattern globs are provided", async () => {
+    await handleSearchFiles(
+      {
+        path: ".",
+        regex: "workflowStepIdx",
+        file_pattern: "templates/templates/**/*.ts",
+        semantic: false,
+      },
+      {
+        isPathTrusted: () => true,
+      } as never,
+      {} as never,
+      "session-3",
+    );
+
+    expect(execRipgrepSearch).toHaveBeenCalledTimes(1);
+    const args = execRipgrepSearch.mock.calls[0][1] as string[];
+    expect(args).toContain("!**/.git/**");
+    expect(args).toContain("!**/node_modules/**");
+    expect(args).toContain("templates/templates/**/*.ts");
+  });
+});
 
 describe("sanitizeRegex", () => {
   it("collapses double-escaped character classes", () => {

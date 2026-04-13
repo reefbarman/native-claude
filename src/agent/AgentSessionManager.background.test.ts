@@ -227,6 +227,171 @@ describe("AgentSessionManager background agents", () => {
     expect(result.killed).toBe(false);
   });
 
+  it("shows file-specific status detail from tool input when available", async () => {
+    let release: (() => void) | undefined;
+
+    mocks.runBehavior.mockReturnValue(
+      (async function* () {
+        yield { type: "tool_start", toolCallId: "tc-1", toolName: "read_file" };
+        yield {
+          type: "tool_result",
+          toolCallId: "tc-1",
+          toolName: "read_file",
+          result: [{ type: "text", text: "ok" }],
+          durationMs: 5,
+          input: { path: "src/agent/ChatViewProvider.ts" },
+        };
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        yield { type: "done" };
+      })(),
+    );
+
+    const mgr = new AgentSessionManager(config, "/tmp");
+    mgr.setToolContext(toolCtx);
+
+    const spawned = await mgr.spawnBackground({
+      task: "status detail",
+      message: "inspect file",
+    });
+
+    await new Promise((r) => setTimeout(r, 0));
+
+    const session = (mgr as any).sessions.get(spawned.sessionId);
+    session.status = "streaming";
+    session.currentTool = "read_file";
+
+    const info = mgr
+      .getBgSessionInfos()
+      .find((s: any) => s.id === spawned.sessionId);
+    expect(info).toBeDefined();
+    expect(info!.displayStatus).toBe("Reading src/agent/ChatViewProvider.ts");
+    expect(info!.displayStatusSource).toBe("heuristic");
+
+    release?.();
+  });
+
+  it("clears stale file detail when a new tool starts", async () => {
+    mocks.runBehavior.mockReturnValue(
+      (async function* () {
+        yield { type: "tool_start", toolCallId: "tc-1", toolName: "read_file" };
+        yield {
+          type: "tool_result",
+          toolCallId: "tc-1",
+          toolName: "read_file",
+          result: [{ type: "text", text: "ok" }],
+          durationMs: 5,
+          input: { path: "src/agent/ChatViewProvider.ts" },
+        };
+        yield {
+          type: "tool_start",
+          toolCallId: "tc-2",
+          toolName: "execute_command",
+        };
+        yield { type: "done" };
+      })(),
+    );
+
+    const mgr = new AgentSessionManager(config, "/tmp");
+    mgr.setToolContext(toolCtx);
+
+    const spawned = await mgr.spawnBackground({
+      task: "status detail clear",
+      message: "inspect then run",
+    });
+
+    await new Promise((r) => setTimeout(r, 0));
+
+    const session = (mgr as any).sessions.get(spawned.sessionId);
+    session.status = "streaming";
+    session.currentTool = "execute_command";
+
+    const info = mgr
+      .getBgSessionInfos()
+      .find((s: any) => s.id === spawned.sessionId);
+    expect(info).toBeDefined();
+    expect(info!.displayStatus).toBe("Running command");
+    expect(info!.displayStatusSource).toBe("heuristic");
+  });
+
+  it("normalizes model summary statuses to user-facing labels", async () => {
+    mocks.runBehavior.mockReturnValue(
+      (async function* () {
+        yield { type: "tool_start", toolCallId: "tc-1", toolName: "read_file" };
+        yield { type: "done" };
+      })(),
+    );
+
+    const mgr = new AgentSessionManager(config, "/tmp");
+    mgr.setToolContext(toolCtx);
+
+    const spawned = await mgr.spawnBackground({
+      task: "status normalization",
+      message: "run",
+    });
+
+    const summary = (mgr as any).getOrInitBgSummary(spawned.sessionId);
+    summary.shortStatus = "Streaming file analysis";
+    summary.generatedAt = Date.now();
+
+    const info = mgr
+      .getBgSessionInfos()
+      .find((s: any) => s.id === spawned.sessionId);
+    expect(info).toBeDefined();
+
+    // Force a non-terminal state to verify model-summary normalization path.
+    const session = (mgr as any).sessions.get(spawned.sessionId);
+    session.status = "streaming";
+
+    const liveInfo = mgr
+      .getBgSessionInfos()
+      .find((s: any) => s.id === spawned.sessionId);
+    expect(liveInfo).toBeDefined();
+    expect(liveInfo!.displayStatus).toBe("Reviewing code");
+    expect(liveInfo!.displayStatusSource).toBe("model");
+  });
+
+  it("prefers heuristic over generic model thinking while tool activity is visible", async () => {
+    mocks.runBehavior.mockReturnValue(
+      (async function* () {
+        yield {
+          type: "tool_start",
+          toolCallId: "tc-1",
+          toolName: "execute_command",
+        };
+        yield { type: "text_delta", text: "running npm test" };
+        yield { type: "done" };
+      })(),
+    );
+
+    const mgr = new AgentSessionManager(config, "/tmp");
+    mgr.setToolContext(toolCtx);
+
+    const spawned = await mgr.spawnBackground({
+      task: "generic fallback",
+      message: "run tests",
+    });
+
+    const summary = (mgr as any).getOrInitBgSummary(spawned.sessionId);
+    summary.shortStatus = "Streaming active";
+    summary.generatedAt = Date.now();
+
+    const session = (mgr as any).sessions.get(spawned.sessionId);
+    session.status = "streaming";
+    session.currentTool = "execute_command";
+
+    const info = mgr
+      .getBgSessionInfos()
+      .find((s: any) => s.id === spawned.sessionId);
+    expect(info).toBeDefined();
+    expect(info!.displayStatus).toBe("Running command");
+    expect(info!.displayStatusSource).toBe("heuristic");
+
+    const statusInfo = mgr.getBackgroundStatus(spawned.sessionId);
+    expect(statusInfo.displayStatus).toBe("Running command");
+  });
+
   it("resumes the foreground session when a background result returns after it stopped", async () => {
     mocks.runBehavior
       .mockReturnValueOnce(

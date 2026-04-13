@@ -7,6 +7,41 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const INTERACTIVE_PROMPT_PATTERNS: RegExp[] = [
+  /\b(y\/n|yes\/no|press\s+(enter|return)|continue\?|are you sure)\b/i,
+  /\b(choose|select)\b.*\b(option|number)\b/i,
+  /\b(waiting\s+for\s+(input|confirmation)|enter\s+(?:yes|no|y|n))\b/i,
+  // Known prompt text emitted by codegen workflows that pause for confirmation.
+  /\bcustom code preservation\b/i,
+];
+
+function detectPromptBlock(output: string): {
+  blocked_on_prompt: boolean;
+  matched_pattern?: string;
+} {
+  const trimmed = output.trim();
+  if (!trimmed) {
+    return { blocked_on_prompt: false };
+  }
+
+  const tail = trimmed.slice(Math.max(0, trimmed.length - 4000));
+  const nonEmptyLines = tail
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  const recentTail = nonEmptyLines.slice(-6).join("\n");
+
+  for (const pattern of INTERACTIVE_PROMPT_PATTERNS) {
+    if (pattern.test(recentTail)) {
+      return {
+        blocked_on_prompt: true,
+        matched_pattern: pattern.source,
+      };
+    }
+  }
+  return { blocked_on_prompt: false };
+}
+
 export async function handleGetTerminalOutput(params: {
   terminal_id: string;
   wait_seconds?: number;
@@ -61,12 +96,20 @@ export async function handleGetTerminalOutput(params: {
   const state = terminalManager.getBackgroundState(params.terminal_id);
 
   if (!state) {
+    const recent = terminalManager.getRecentlyClosedTerminals(5).map((t) => ({
+      terminal_id: t.id,
+      terminal_name: t.name,
+      closed_at: new Date(t.closedAt).toISOString(),
+    }));
+
     return {
       content: [
         {
           type: "text",
           text: JSON.stringify({
             error: `Terminal "${params.terminal_id}" not found. It may have been closed.`,
+            ...(recent.length > 0 && { recently_closed_terminals: recent }),
+            hint: "Use execute_command with terminal_name for long-running workflows so you can recover by name if terminal_id changes.",
           }),
         },
       ],
@@ -80,6 +123,19 @@ export async function handleGetTerminalOutput(params: {
     output_captured: state.output_captured,
     ...(params.kill && { killed: true }),
   };
+
+  if (state.is_running && state.output_captured) {
+    const promptState = detectPromptBlock(state.output);
+    if (promptState.blocked_on_prompt) {
+      result.blocked_on_prompt = true;
+      result.prompt_detection = "heuristic";
+      if (promptState.matched_pattern) {
+        result.prompt_pattern = promptState.matched_pattern;
+      }
+      result.prompt_hint =
+        "The command appears to be waiting for interactive input. Use terminal_id with get_terminal_output(kill: true) to stop it, or open the terminal UI and answer the prompt.";
+    }
+  }
 
   if (state.output_captured && state.output) {
     const { filtered, totalLines, linesShown } = filterOutput(state.output, {

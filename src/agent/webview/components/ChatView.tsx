@@ -1,6 +1,7 @@
 import { useRef, useEffect, useCallback } from "preact/hooks";
 import type { ChatMessage } from "../types";
 import type { BgSessionInfoProps } from "./BackgroundSessionStrip";
+import type { DetectedQuestion } from "../questionDetection";
 import { MessageBubble } from "./MessageBubble";
 import { CondenseRow } from "./CondenseRow";
 import { WarningRow } from "./WarningRow";
@@ -10,6 +11,9 @@ interface ChatViewProps {
   messages: ChatMessage[];
   streaming: boolean;
   sessionId: string | null;
+  detectedQuestion?: (DetectedQuestion & { messageId: string }) | null;
+  onDetectedQuestionAnswer?: (payload: string) => void;
+  onDismissDetectedQuestion?: (messageId: string) => void;
   onOpenFile?: (path: string, line?: number) => void;
   onOpenSpecialBlockPanel?: (block: {
     kind: "mermaid" | "vega" | "vega-lite";
@@ -34,6 +38,9 @@ export function ChatView({
   messages,
   streaming,
   sessionId,
+  detectedQuestion,
+  onDetectedQuestionAnswer,
+  onDismissDetectedQuestion,
   onOpenFile,
   onOpenSpecialBlockPanel,
   onRevertCheckpoint,
@@ -187,6 +194,14 @@ export function ChatView({
                   msg === messages[messages.length - 1] &&
                   msg.role === "assistant"
                 }
+                detectedQuestion={
+                  msg.role === "assistant" &&
+                  detectedQuestion?.messageId === msg.id
+                    ? detectedQuestion
+                    : null
+                }
+                onDetectedQuestionAnswer={onDetectedQuestionAnswer}
+                onDismissDetectedQuestion={onDismissDetectedQuestion}
                 onOpenFile={onOpenFile}
                 onOpenSpecialBlockPanel={onOpenSpecialBlockPanel}
                 onRetry={

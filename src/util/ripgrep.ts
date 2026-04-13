@@ -120,9 +120,12 @@ export function truncateLine(
 export async function execRipgrepSearch(
   rgPath: string,
   args: string[],
+  options?: { cwd?: string },
 ): Promise<string> {
   return new Promise((resolve, reject) => {
-    const rgProcess = childProcess.spawn(rgPath, args);
+    const rgProcess = childProcess.spawn(rgPath, args, {
+      cwd: options?.cwd,
+    });
     const rl = readline.createInterface({
       input: rgProcess.stdout,
       crlfDelay: Infinity,

@@ -130,13 +130,13 @@ export const BUILTIN_COMMANDS: SlashCommand[] = [
   },
   {
     name: "mcp",
-    description: "Open MCP server config (project or global)",
+    description: "Show MCP server connection status",
     source: "builtin",
     builtin: true,
   },
   {
-    name: "mcp-status",
-    description: "Show MCP server connection status",
+    name: "mcp-config",
+    description: "Open MCP server config (project or global)",
     source: "builtin",
     builtin: true,
   },

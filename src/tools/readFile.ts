@@ -292,7 +292,10 @@ async function getSymbolOutline(
 
 // --- Friendly errors ---
 
-function findLikelyPathSuggestions(inputPath: string, limit = 5): string[] {
+export function findLikelyPathSuggestions(
+  inputPath: string,
+  limit = 5,
+): string[] {
   const workspaceRoot = tryGetFirstWorkspaceRoot();
   if (!workspaceRoot) return [];
 
@@ -337,7 +340,7 @@ function findLikelyPathSuggestions(inputPath: string, limit = 5): string[] {
   return [...suggestions];
 }
 
-function buildReadFileError(
+export function buildReadFileError(
   err: unknown,
   inputPath: string,
 ): Record<string, unknown> {
@@ -370,6 +373,24 @@ function buildReadFileError(
 
 // --- Main handler ---
 
+export function isEnoentWithSingleSuggestion(
+  payload: Record<string, unknown>,
+): payload is Record<string, unknown> & {
+  suggestions: [string];
+  path: string;
+  error: string;
+} {
+  if (!payload || typeof payload !== "object") return false;
+  const suggestions = payload.suggestions;
+  return (
+    Array.isArray(suggestions) &&
+    suggestions.length === 1 &&
+    typeof suggestions[0] === "string" &&
+    typeof payload.path === "string" &&
+    typeof payload.error === "string"
+  );
+}
+
 export async function handleReadFile(
   params: {
     path: string;
@@ -377,12 +398,17 @@ export async function handleReadFile(
     limit?: number;
     include_symbols?: boolean;
     query?: string;
+    anchor?: string;
+    anchor_regex?: string;
+    anchor_offset?: number;
+    auto_follow_suggestion?: boolean;
   },
   approvalManager: ApprovalManager,
   approvalPanel: ApprovalPanelProvider,
   sessionId: string,
 ): Promise<ToolResult> {
   const release = await readSemaphore.acquire();
+  let released = false;
   try {
     const { absolutePath: filePath, inWorkspace } = resolveAndValidatePath(
       params.path,
@@ -472,10 +498,74 @@ export async function handleReadFile(
     const allLines = raw.split("\n");
     const totalLines = allLines.length;
 
-    // Semantic offset: when query is provided and no explicit offset, use the
-    // index to jump to the most relevant section of the file.
+    let anchorHit:
+      | {
+          mode: "literal" | "regex";
+          pattern: string;
+          line: number;
+        }
+      | undefined;
+
+    if (params.anchor && params.anchor_regex) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              error:
+                "Specify only one of 'anchor' or 'anchor_regex' (not both).",
+              path: params.path,
+            }),
+          },
+        ],
+      };
+    }
+
+    if (params.anchor_regex && params.offset == null) {
+      let anchorRegex: RegExp;
+      try {
+        anchorRegex = new RegExp(params.anchor_regex, "m");
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                error: `Invalid anchor_regex: ${err instanceof Error ? err.message : String(err)}`,
+                path: params.path,
+              }),
+            },
+          ],
+        };
+      }
+
+      const match = raw.match(anchorRegex);
+      if (match && match.index != null) {
+        const prefix = raw.slice(0, match.index);
+        const line = prefix.split("\n").length;
+        anchorHit = {
+          mode: "regex",
+          pattern: params.anchor_regex,
+          line,
+        };
+      }
+    } else if (params.anchor && params.offset == null) {
+      const idx = raw.indexOf(params.anchor);
+      if (idx >= 0) {
+        const prefix = raw.slice(0, idx);
+        const line = prefix.split("\n").length;
+        anchorHit = {
+          mode: "literal",
+          pattern: params.anchor,
+          line,
+        };
+      }
+    }
+
+    // Semantic offset: when query is provided and no explicit/manual anchor,
+    // use the index to jump to the most relevant section of the file.
     let semanticHit: { startLine: number; endLine: number } | null = null;
-    if (params.query && params.offset == null) {
+    if (params.query && params.offset == null && !anchorHit) {
       const wsRoot = tryGetFirstWorkspaceRoot();
       if (wsRoot) {
         const relPath = path.relative(wsRoot, filePath);
@@ -483,9 +573,18 @@ export async function handleReadFile(
       }
     }
 
-    const offset = semanticHit
-      ? Math.max(1, semanticHit.startLine - 5) // 5 lines of context before the match
-      : Math.max(1, params.offset ?? 1);
+    const baseOffset = anchorHit
+      ? anchorHit.line
+      : semanticHit
+        ? Math.max(1, semanticHit.startLine - 5) // 5 lines of context before the semantic match
+        : Math.max(1, params.offset ?? 1);
+    const shouldApplyAnchorOffset =
+      params.offset == null && !!(anchorHit || semanticHit);
+    const anchorOffset =
+      shouldApplyAnchorOffset && Number.isFinite(params.anchor_offset)
+        ? Math.trunc(params.anchor_offset as number)
+        : 0;
+    const offset = Math.max(1, baseOffset + anchorOffset);
 
     if (offset > totalLines) {
       const emptyResult: Record<string, unknown> = {
@@ -542,6 +641,29 @@ export async function handleReadFile(
       result.truncated = true;
     }
 
+    if (anchorHit) {
+      result.anchor_match = {
+        mode: anchorHit.mode,
+        pattern: anchorHit.pattern,
+        line: anchorHit.line,
+        anchor_offset: Number.isFinite(params.anchor_offset)
+          ? Math.trunc(params.anchor_offset as number)
+          : 0,
+      };
+    } else if (
+      (params.anchor || params.anchor_regex) &&
+      params.offset == null
+    ) {
+      result.anchor_match = {
+        status: "not_found",
+        ...(params.anchor && { mode: "literal", pattern: params.anchor }),
+        ...(params.anchor_regex && {
+          mode: "regex",
+          pattern: params.anchor_regex,
+        }),
+      };
+    }
+
     // Semantic match info
     if (semanticHit) {
       result.semantic_match = {
@@ -590,15 +712,61 @@ export async function handleReadFile(
       content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
     };
   } catch (err) {
+    const errorPayload = buildReadFileError(err, params.path);
+
+    if (
+      params.auto_follow_suggestion &&
+      isEnoentWithSingleSuggestion(errorPayload)
+    ) {
+      const [suggestedPath] = errorPayload.suggestions;
+      // Release this call's permit before recursively following the suggestion;
+      // otherwise concurrent follow-ups can deadlock by double-acquiring.
+      release();
+      released = true;
+      return handleReadFile(
+        {
+          ...params,
+          path: suggestedPath,
+          auto_follow_suggestion: false,
+        },
+        approvalManager,
+        approvalPanel,
+        sessionId,
+      ).then((followed) => {
+        const item = followed.content[0];
+        if (item?.type !== "text") {
+          return followed;
+        }
+        try {
+          const parsed = JSON.parse(item.text) as Record<string, unknown>;
+          parsed.resolution = "auto_followed_suggestion";
+          parsed.auto_followed_from = errorPayload.path;
+          parsed.resolved_path = suggestedPath;
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(parsed, null, 2),
+              },
+            ],
+          };
+        } catch {
+          return followed;
+        }
+      });
+    }
+
     return {
       content: [
         {
           type: "text",
-          text: JSON.stringify(buildReadFileError(err, params.path)),
+          text: JSON.stringify(errorPayload),
         },
       ],
     };
   } finally {
-    release();
+    if (!released) {
+      release();
+    }
   }
 }

@@ -16,6 +16,10 @@ import type {
   Question,
   SessionSummary,
 } from "./types";
+import {
+  detectQuestionFromAssistantText,
+  type DetectedQuestion,
+} from "./questionDetection";
 import type {
   ApprovalRequest,
   DecisionMessage,
@@ -66,6 +70,28 @@ function parseLoadSkillResult(result: string): {
   }
 }
 
+function parseJsonObject(value: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function inferBgResultStatus(
+  resultText: string,
+): "completed" | "error" | "cancelled" {
+  const normalized = resultText.trim().toLowerCase();
+  if (!normalized) return "completed";
+  if (normalized.startsWith("background agent stopped:")) {
+    return normalized.includes("cancel") ? "cancelled" : "error";
+  }
+  return "completed";
+}
+
 interface VsCodeApi {
   postMessage(message: unknown): void;
   getState(): unknown;
@@ -82,6 +108,8 @@ interface AppState {
   lastCacheReadTokens: number;
   debugInfo: Record<string, string | number> | null;
   systemPrompt: string | null;
+  /** Running token estimate from the engine — updated between API calls. */
+  estimatedTotalUsed: number;
   loadedInstructions: Array<{ source: string; chars: number }> | null;
   todos: TodoItem[];
   modes: ModeInfo[];
@@ -98,9 +126,13 @@ interface AppState {
     documents?: Array<{ name: string; mimeType: string; base64: string }>;
   }>;
   questionRequest: { id: string; questions: Question[] } | null;
+  detectedQuestion: (DetectedQuestion & { messageId: string }) | null;
+  dismissedDetectedQuestionIds: string[];
   /** Temporary status override shown in the streaming spinner (e.g. "Refreshing credentials…") */
   statusOverride: string | null;
   restoringSession: boolean;
+  /** Number of visible user turns before the first rendered message in `messages`. */
+  loadedUserTurnOffset: number;
 }
 
 type AppAction =
@@ -191,6 +223,11 @@ type AppAction =
   | { type: "SET_QUESTION"; id: string; questions: Question[] }
   | { type: "CLEAR_QUESTION" }
   | {
+      type: "SET_DETECTED_QUESTION";
+      detectedQuestion: (DetectedQuestion & { messageId: string }) | null;
+    }
+  | { type: "DISMISS_DETECTED_QUESTION"; messageId: string }
+  | {
       type: "ADD_CONDENSE";
       prevInputTokens: number;
       newInputTokens: number;
@@ -220,6 +257,15 @@ type AppAction =
       lastInputTokens?: number;
       lastOutputTokens?: number;
       checkpoints?: Array<{ turnIndex: number; checkpointId: string }>;
+      userTurnOffset?: number;
+      hasMoreBefore?: boolean;
+    }
+  | {
+      type: "PREPEND_SESSION_CHUNK";
+      messages: ChatMessage[];
+      userTurnOffset: number;
+      hasMoreBefore: boolean;
+      checkpoints?: Array<{ turnIndex: number; checkpointId: string }>;
     }
   | { type: "SET_CHECKPOINT"; checkpointId: string; turnIndex: number }
   | { type: "CONDENSE_START" }
@@ -230,13 +276,15 @@ type AppAction =
       task: string;
       status: "completed" | "error" | "cancelled";
       resultText?: string;
+      summary?: string;
     }
   | {
       type: "ADD_BG_QUESTION";
       bgTask: string;
       questions: string[];
       answer: string;
-    };
+    }
+  | { type: "TOKEN_ESTIMATE"; estimatedTotalUsed: number };
 
 /**
  * Convert persisted AgentMessage[] (Anthropic API format) to ChatMessage[] (webview display format).
@@ -380,26 +428,150 @@ export function agentMessagesToChatMessages(raw: unknown[]): ChatMessage[] {
         } else if (block.type === "tool_use") {
           const toolId = block.id ?? crypto.randomUUID();
           const toolName = block.name ?? "";
-          const result = toolResults.get(toolId) ?? "";
+          const toolResult = toolResults.get(toolId) ?? "";
+          const inputJson = JSON.stringify(block.input ?? {});
+
           if (toolName === "load_skill") {
-            const parsed = parseLoadSkillResult(result);
+            const parsed = parseLoadSkillResult(toolResult);
             blocks.push({
               type: "skill_load",
               id: toolId,
-              inputJson: JSON.stringify(block.input ?? {}),
-              result,
+              inputJson,
+              result: toolResult,
               complete: true,
               skillName: parsed.skillName,
               path: parsed.path,
               content: parsed.content,
             });
+          } else if (toolName === "spawn_background_agent") {
+            const parsedResult = parseJsonObject(toolResult);
+            const parsedInput =
+              block.input &&
+              typeof block.input === "object" &&
+              !Array.isArray(block.input)
+                ? (block.input as Record<string, unknown>)
+                : null;
+            const sessionId =
+              typeof parsedResult?.sessionId === "string"
+                ? parsedResult.sessionId
+                : undefined;
+            const task =
+              typeof parsedInput?.task === "string" && parsedInput.task
+                ? parsedInput.task
+                : "Background Agent";
+            const message =
+              typeof parsedInput?.message === "string" && parsedInput.message
+                ? parsedInput.message
+                : undefined;
+
+            blocks.push({
+              type: "tool_call",
+              id: toolId,
+              name: toolName,
+              inputJson,
+              result: toolResult,
+              complete: true,
+            });
+
+            if (sessionId) {
+              blocks.push({
+                type: "bg_agent",
+                sessionId,
+                task,
+                message,
+                resolvedModel:
+                  typeof parsedResult?.resolvedModel === "string"
+                    ? parsedResult.resolvedModel
+                    : undefined,
+                resolvedProvider:
+                  typeof parsedResult?.resolvedProvider === "string"
+                    ? parsedResult.resolvedProvider
+                    : undefined,
+                resolvedMode:
+                  typeof parsedResult?.resolvedMode === "string"
+                    ? parsedResult.resolvedMode
+                    : undefined,
+                taskClass:
+                  typeof parsedResult?.taskClass === "string"
+                    ? parsedResult.taskClass
+                    : undefined,
+                routingReason:
+                  typeof parsedResult?.routingReason === "string"
+                    ? parsedResult.routingReason
+                    : undefined,
+              });
+            }
+          } else if (toolName === "get_background_result") {
+            const parsedInput =
+              block.input &&
+              typeof block.input === "object" &&
+              !Array.isArray(block.input)
+                ? (block.input as Record<string, unknown>)
+                : null;
+            const sessionId =
+              typeof parsedInput?.sessionId === "string"
+                ? parsedInput.sessionId
+                : undefined;
+
+            blocks.push({
+              type: "tool_call",
+              id: toolId,
+              name: toolName,
+              inputJson,
+              result: toolResult,
+              complete: true,
+            });
+
+            if (sessionId) {
+              const status = inferBgResultStatus(toolResult);
+              let task = "Background Agent";
+              for (let i = blocks.length - 1; i >= 0; i--) {
+                const candidate = blocks[i];
+                if (
+                  candidate.type === "bg_agent" &&
+                  candidate.sessionId === sessionId
+                ) {
+                  task = candidate.task;
+                  break;
+                }
+              }
+              if (task === "Background Agent") {
+                for (let msgIdx = result.length - 1; msgIdx >= 0; msgIdx--) {
+                  const prior = result[msgIdx];
+                  if (prior.role !== "assistant") continue;
+                  for (
+                    let blockIdx = prior.blocks.length - 1;
+                    blockIdx >= 0;
+                    blockIdx--
+                  ) {
+                    const candidate = prior.blocks[blockIdx];
+                    if (
+                      candidate.type === "bg_agent" &&
+                      candidate.sessionId === sessionId
+                    ) {
+                      task = candidate.task;
+                      break;
+                    }
+                  }
+                  if (task !== "Background Agent") break;
+                }
+              }
+              blocks.push({
+                type: "bg_agent_result",
+                sessionId,
+                task,
+                status,
+                resultText: toolResult || undefined,
+                summary: undefined,
+              });
+            }
           } else {
             blocks.push({
               type: "tool_call",
               id: toolId,
               name: toolName,
-              inputJson: JSON.stringify(block.input ?? {}),
-              result,
+              inputJson,
+              result: toolResult,
               complete: true,
             });
           }
@@ -464,6 +636,30 @@ function cloneLast(messages: ChatMessage[]): {
   };
   msgs[msgs.length - 1] = last;
   return { msgs, last };
+}
+
+function applyCheckpoints(
+  messages: ChatMessage[],
+  checkpoints: Array<{ turnIndex: number; checkpointId: string }> | undefined,
+  userTurnOffset: number,
+): ChatMessage[] {
+  if (!checkpoints || checkpoints.length === 0) return messages;
+  const msgs = [...messages];
+  for (const cp of checkpoints) {
+    let userCount = 0;
+    const targetUserIndex = cp.turnIndex - 1 - userTurnOffset;
+    if (targetUserIndex < 0) continue;
+    for (let i = 0; i < msgs.length; i++) {
+      if (msgs[i].role === "user") {
+        if (userCount === targetUserIndex) {
+          msgs[i] = { ...msgs[i], checkpointId: cp.checkpointId };
+          break;
+        }
+        userCount++;
+      }
+    }
+  }
+  return msgs;
 }
 
 export function reducer(state: AppState, action: AppAction): AppState {
@@ -838,7 +1034,13 @@ export function reducer(state: AppState, action: AppAction): AppState {
         lastInputTokens: action.inputTokens,
         lastOutputTokens: action.outputTokens,
         lastCacheReadTokens: action.cacheReadTokens,
+        // Real API data resets the running estimate.
+        estimatedTotalUsed: 0,
       };
+    }
+
+    case "TOKEN_ESTIMATE": {
+      return { ...state, estimatedTotalUsed: action.estimatedTotalUsed };
     }
 
     case "TODO_UPDATE":
@@ -940,12 +1142,16 @@ export function reducer(state: AppState, action: AppAction): AppState {
         ...state,
         messages: [],
         streaming: false,
+        loadedUserTurnOffset: 0,
         lastInputTokens: 0,
         lastOutputTokens: 0,
         lastCacheReadTokens: 0,
+        estimatedTotalUsed: 0,
         todos: [],
         messageQueue: [],
         questionRequest: null,
+        detectedQuestion: null,
+        dismissedDetectedQuestionIds: [],
         statusOverride: null,
       };
 
@@ -1052,6 +1258,25 @@ export function reducer(state: AppState, action: AppAction): AppState {
 
     case "CLEAR_QUESTION":
       return { ...state, questionRequest: null };
+
+    case "SET_DETECTED_QUESTION":
+      return {
+        ...state,
+        detectedQuestion: action.detectedQuestion,
+      };
+
+    case "DISMISS_DETECTED_QUESTION":
+      return {
+        ...state,
+        detectedQuestion:
+          state.detectedQuestion?.messageId === action.messageId
+            ? null
+            : state.detectedQuestion,
+        dismissedDetectedQuestionIds:
+          state.dismissedDetectedQuestionIds.includes(action.messageId)
+            ? state.dismissedDetectedQuestionIds
+            : [...state.dismissedDetectedQuestionIds, action.messageId],
+      };
 
     case "CONDENSE_START": {
       // Add a pending condense row — replaced with final stats when complete.
@@ -1193,43 +1418,45 @@ export function reducer(state: AppState, action: AppAction): AppState {
     }
 
     case "LOAD_SESSION": {
-      // Apply checkpoint IDs to the user message immediately before each checkpoint.
-      // `turnIndex` is the number of visible user turns already committed at the
-      // snapshot, so the visible row is `turnIndex - 1`.
-      let msgs = action.messages;
-      if (action.checkpoints && action.checkpoints.length > 0) {
-        msgs = [...msgs];
-        for (const cp of action.checkpoints) {
-          let userCount = 0;
-          const targetUserIndex = cp.turnIndex - 1;
-          if (targetUserIndex < 0) continue;
-          for (let i = 0; i < msgs.length; i++) {
-            if (msgs[i].role === "user") {
-              if (userCount === targetUserIndex) {
-                msgs[i] = { ...msgs[i], checkpointId: cp.checkpointId };
-                break;
-              }
-              userCount++;
-            }
-          }
-        }
-      }
+      const userTurnOffset = action.userTurnOffset ?? 0;
+      const msgs = applyCheckpoints(
+        action.messages,
+        action.checkpoints,
+        userTurnOffset,
+      );
       return {
         ...state,
         messages: msgs,
         streaming: false,
         restoringSession: false,
+        loadedUserTurnOffset: userTurnOffset,
         lastInputTokens: action.lastInputTokens ?? 0,
         lastOutputTokens: action.lastOutputTokens ?? 0,
         todos: [],
         messageQueue: [],
         questionRequest: null,
+        detectedQuestion: null,
+        dismissedDetectedQuestionIds: [],
         chatState: {
           ...state.chatState,
           sessionId: action.sessionId,
           mode: action.mode,
           streaming: false,
         },
+      };
+    }
+
+    case "PREPEND_SESSION_CHUNK": {
+      const prepended = [...action.messages, ...state.messages];
+      const withCheckpoints = applyCheckpoints(
+        prepended,
+        action.checkpoints,
+        action.userTurnOffset,
+      );
+      return {
+        ...state,
+        messages: withCheckpoints,
+        loadedUserTurnOffset: action.userTurnOffset,
       };
     }
 
@@ -1243,6 +1470,7 @@ export function reducer(state: AppState, action: AppAction): AppState {
         task: action.task,
         status: action.status,
         resultText: action.resultText,
+        summary: action.summary,
       };
       const lastMsg = state.messages[state.messages.length - 1];
       if (lastMsg?.role === "assistant") {
@@ -1268,10 +1496,10 @@ export function reducer(state: AppState, action: AppAction): AppState {
     case "SET_CHECKPOINT": {
       // Attach checkpointId to the user message immediately before this checkpoint.
       // `turnIndex` is a snapshot user-turn count, so the visible row is
-      // `turnIndex - 1`.
+      // `turnIndex - 1`, adjusted by any loaded history offset.
       const msgs = [...state.messages];
       let userCount = 0;
-      const targetUserIndex = action.turnIndex - 1;
+      const targetUserIndex = action.turnIndex - 1 - state.loadedUserTurnOffset;
       if (targetUserIndex < 0) return state;
       for (let i = 0; i < msgs.length; i++) {
         if (msgs[i].role === "user") {
@@ -1303,6 +1531,7 @@ export const initialState: AppState = {
   lastInputTokens: 0,
   lastOutputTokens: 0,
   lastCacheReadTokens: 0,
+  estimatedTotalUsed: 0,
   debugInfo: null,
   systemPrompt: null,
   loadedInstructions: null,
@@ -1318,8 +1547,11 @@ export const initialState: AppState = {
   slashCommands: [],
   messageQueue: [],
   questionRequest: null,
+  detectedQuestion: null,
+  dismissedDetectedQuestionIds: [],
   statusOverride: null,
   restoringSession: false,
+  loadedUserTurnOffset: 0,
 };
 
 export interface Injection {
@@ -1335,6 +1567,7 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
   const [state, dispatch] = useReducer(reducer, initialState);
   const stateRef = useRef(state.chatState);
   stateRef.current = state.chatState;
+  const previousStreamingRef = useRef(state.streaming);
   const startupRestorePendingRef = useRef(true);
   const messageQueueRef = useRef(state.messageQueue);
   messageQueueRef.current = state.messageQueue;
@@ -1554,6 +1787,12 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
             input: msg.input,
           });
           break;
+        case "agentTokenEstimate":
+          dispatch({
+            type: "TOKEN_ESTIMATE",
+            estimatedTotalUsed: msg.estimatedTotalUsed,
+          });
+          break;
         case "agentUserAnnotation":
           if (dropIfNotStreaming()) break;
           dispatch({
@@ -1703,7 +1942,7 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
           break;
         case "agentMcpStatus":
           if (msg.open) {
-            // /mcp-status command — always open the panel
+            // /mcp command — always open the panel
             setMcpStatusInfos(msg.infos);
           } else {
             // live update from onStatusChange — only refresh if already open
@@ -1781,8 +2020,21 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
             lastInputTokens: msg.lastInputTokens,
             lastOutputTokens: msg.lastOutputTokens,
             checkpoints: msg.checkpoints,
+            userTurnOffset: (msg.userTurnOffset as number | undefined) ?? 0,
+            hasMoreBefore: msg.hasMoreBefore,
           });
           setShowHistory(false);
+          break;
+
+        case "agentSessionChunk":
+          if (msg.sessionId !== stateRef.current.sessionId) break;
+          dispatch({
+            type: "PREPEND_SESSION_CHUNK",
+            messages: agentMessagesToChatMessages(msg.messages as unknown[]),
+            userTurnOffset: msg.userTurnOffset as number,
+            hasMoreBefore: msg.hasMoreBefore as boolean,
+            checkpoints: msg.checkpoints,
+          });
           break;
 
         case "agentCheckpointCreated":
@@ -1856,6 +2108,7 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
             status: bgStatus,
             resultText:
               (msg.resultText as string | undefined) ?? bgInfo?.resultText,
+            summary: msg.resultSummary as string | undefined,
           });
           break;
         }
@@ -2046,6 +2299,69 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
     }
   }, [vscodeApi]);
 
+  const handleDetectedQuestionAnswer = useCallback(
+    (payload: string) => {
+      handleSend(payload);
+    },
+    [handleSend],
+  );
+
+  const handleDismissDetectedQuestion = useCallback((messageId: string) => {
+    dispatch({ type: "DISMISS_DETECTED_QUESTION", messageId });
+  }, []);
+
+  useEffect(() => {
+    const wasStreaming = previousStreamingRef.current;
+    const isStreaming = state.streaming;
+
+    if (!wasStreaming || isStreaming) {
+      previousStreamingRef.current = isStreaming;
+      return;
+    }
+
+    previousStreamingRef.current = isStreaming;
+
+    if (state.questionRequest) {
+      dispatch({ type: "SET_DETECTED_QUESTION", detectedQuestion: null });
+      return;
+    }
+
+    const lastMsg = state.messages[state.messages.length - 1];
+    if (!lastMsg || lastMsg.role !== "assistant") {
+      dispatch({ type: "SET_DETECTED_QUESTION", detectedQuestion: null });
+      return;
+    }
+
+    if (state.dismissedDetectedQuestionIds.includes(lastMsg.id)) {
+      dispatch({ type: "SET_DETECTED_QUESTION", detectedQuestion: null });
+      return;
+    }
+
+    const assistantText = (lastMsg.blocks ?? [])
+      .filter((b) => b.type === "text")
+      .map((b) => b.text)
+      .join("\n")
+      .trim();
+
+    if (!assistantText) {
+      dispatch({ type: "SET_DETECTED_QUESTION", detectedQuestion: null });
+      return;
+    }
+
+    const detected = detectQuestionFromAssistantText(assistantText);
+    dispatch({
+      type: "SET_DETECTED_QUESTION",
+      detectedQuestion: detected
+        ? { ...detected, messageId: lastMsg.id }
+        : null,
+    });
+  }, [
+    state.streaming,
+    state.messages,
+    state.questionRequest,
+    state.dismissedDetectedQuestionIds,
+  ]);
+
   const handleStopBackground = useCallback(
     (sessionId: string) => {
       vscodeApi.postMessage({ command: "agentStop", sessionId });
@@ -2171,11 +2487,13 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
           });
           break;
         case "mcp":
-          // args is "project" or "global" (from the webview sub-picker)
+          vscodeApi.postMessage({ command: "agentSlashCommand", name, args });
+          break;
+        case "mcp-config":
+          // args is "project" or "global" (from the webview mcp-config sub-picker)
           vscodeApi.postMessage({ command: "agentSlashCommand", name, args });
           break;
         case "mcp-refresh":
-        case "mcp-status":
           vscodeApi.postMessage({ command: "agentSlashCommand", name, args });
           break;
         case "btw":
@@ -2601,6 +2919,9 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
           messages={state.messages}
           streaming={state.streaming}
           sessionId={state.chatState.sessionId}
+          detectedQuestion={state.detectedQuestion}
+          onDetectedQuestionAnswer={handleDetectedQuestionAnswer}
+          onDismissDetectedQuestion={handleDismissDetectedQuestion}
           onOpenFile={handleOpenFile}
           onOpenSpecialBlockPanel={handleOpenSpecialBlockPanel}
           onRevertCheckpoint={handleRevertCheckpoint}
@@ -2729,7 +3050,9 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
             ))}
           </div>
         )}
-        {(state.lastInputTokens > 0 || state.lastOutputTokens > 0) &&
+        {(state.lastInputTokens > 0 ||
+          state.lastOutputTokens > 0 ||
+          state.estimatedTotalUsed > 0) &&
           (() => {
             const currentModel = state.availableModels.find(
               (m) => m.id === state.chatState.model,
@@ -2753,6 +3076,7 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
                 }
                 hardBudget={state.chatState.contextBudget?.hardBudget}
                 condenseThreshold={state.chatState.condenseThreshold}
+                estimatedTotalUsed={state.estimatedTotalUsed}
               />
             );
           })()}

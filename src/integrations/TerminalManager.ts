@@ -30,6 +30,16 @@ export function escapeHistoryExpansion(command: string): string {
   return result;
 }
 
+export function shouldEscapeHistoryExpansion(
+  platform: NodeJS.Platform,
+  shellPath?: string,
+): boolean {
+  if (platform !== "win32") return true;
+  if (!shellPath) return false;
+  const normalized = shellPath.toLowerCase();
+  return /(^|[\\/])(bash|zsh)(\.exe)?$/.test(normalized);
+}
+
 export function initializeTerminalManager(
   extensionUri: vscode.Uri,
   log?: (message: string) => void,
@@ -50,6 +60,7 @@ interface ManagedTerminal {
   name: string;
   cwd: string;
   busy: boolean;
+  envKey?: string;
   /** Timestamp when the last foreground command completed — used for reuse cooldown */
   lastCommandEndedAt: number;
   /** Accumulated output from the current shell integration execution */
@@ -62,6 +73,12 @@ interface ManagedTerminal {
   backgroundOutputCaptured: boolean;
   /** Disposables for background listeners (stream reader, exit listener) */
   backgroundDisposables: vscode.Disposable[];
+}
+
+interface ClosedTerminalSnapshot {
+  id: string;
+  name: string;
+  closedAt: number;
 }
 
 export interface CommandResult {
@@ -93,6 +110,7 @@ export interface ExecuteOptions {
   split_from?: string;
   background?: boolean;
   timeout?: number;
+  env?: Record<string, string>;
   /** Called once the terminal is resolved, before execution begins */
   onTerminalAssigned?: (terminalId: string) => void;
 }
@@ -131,6 +149,7 @@ let nextTerminalId = 1;
 export class TerminalManager {
   private terminals: ManagedTerminal[] = [];
   private disposables: vscode.Disposable[] = [];
+  private recentlyClosed: ClosedTerminalSnapshot[] = [];
   log?: (message: string) => void;
 
   /**
@@ -148,6 +167,13 @@ export class TerminalManager {
    * command's OSC 633 completion sequences.
    */
   private static readonly REUSE_COOLDOWN_MS = 500;
+  private static readonly MAX_RECENTLY_CLOSED = 20;
+
+  private buildEnvKey(env?: Record<string, string>): string | undefined {
+    if (!env || Object.keys(env).length === 0) return undefined;
+    const entries = Object.entries(env).sort(([a], [b]) => a.localeCompare(b));
+    return entries.map(([k, v]) => `${k}=${v}`).join("\n");
+  }
 
   /** Wait until the terminal's reuse cooldown has elapsed. */
   private async waitForCooldown(managed: ManagedTerminal): Promise<void> {
@@ -189,6 +215,7 @@ export class TerminalManager {
           (t) => t.terminal === closedTerminal,
         );
         for (const managed of closing) {
+          this.rememberClosedTerminal(managed);
           for (const d of managed.backgroundDisposables) d.dispose();
           managed.backgroundDisposables = [];
         }
@@ -200,12 +227,15 @@ export class TerminalManager {
   }
 
   async executeCommand(options: ExecuteOptions): Promise<CommandResult> {
-    // Escape ! characters to prevent shell history expansion in
-    // interactive terminals (zsh/bash treat ! specially in double quotes).
-    const command =
-      process.platform !== "win32"
-        ? escapeHistoryExpansion(options.command)
-        : options.command;
+    // Escape ! characters only for shells that perform history expansion.
+    // On Windows this primarily means Git Bash/zsh; native PowerShell/cmd
+    // treat `\!` literally and should not be rewritten.
+    const command = shouldEscapeHistoryExpansion(
+      process.platform,
+      vscode.env?.shell,
+    )
+      ? escapeHistoryExpansion(options.command)
+      : options.command;
 
     const managed = await this.resolveTerminal(options);
     options.onTerminalAssigned?.(managed.id);
@@ -242,11 +272,17 @@ export class TerminalManager {
     options: ExecuteOptions,
   ): Promise<ManagedTerminal> {
     const { cwd, terminal_id, terminal_name, split_from } = options;
+    const envKey = this.buildEnvKey(options.env);
 
     // If terminal_id is specified, find that specific terminal
     if (terminal_id) {
       const existing = this.terminals.find((t) => t.id === terminal_id);
       if (existing) {
+        if (existing.envKey !== envKey) {
+          throw new Error(
+            `Terminal ${terminal_id} was created with a different env set. Use a different terminal_id/terminal_name or omit env to reuse.`,
+          );
+        }
         if (existing.busy || existing.backgroundRunning) {
           throw new Error(
             `Terminal ${terminal_id} is busy. Wait for the current command to finish or use get_terminal_output/kill for background commands.`,
@@ -267,7 +303,11 @@ export class TerminalManager {
     // If terminal_name is specified, find or create by name
     if (terminal_name) {
       const existing = this.terminals.find(
-        (t) => t.name === terminal_name && !t.busy && !t.backgroundRunning,
+        (t) =>
+          t.name === terminal_name &&
+          !t.busy &&
+          !t.backgroundRunning &&
+          t.envKey === envKey,
       );
       if (existing) {
         existing.busy = true;
@@ -280,7 +320,7 @@ export class TerminalManager {
         }
       }
       // Create with the specified name, optionally split from a parent
-      const managed = this.createTerminal(cwd, terminal_name);
+      const managed = this.createTerminal(cwd, terminal_name, options.env);
       managed.busy = true;
       try {
         if (split_from) {
@@ -301,7 +341,8 @@ export class TerminalManager {
         !t.busy &&
         !t.backgroundRunning &&
         t.name === "AgentLink" &&
-        t.cwd === cwd,
+        t.cwd === cwd &&
+        t.envKey === envKey,
     );
     if (cwdMatch) {
       cwdMatch.busy = true;
@@ -314,7 +355,7 @@ export class TerminalManager {
       }
     }
 
-    const managed = this.createTerminal(cwd, "AgentLink");
+    const managed = this.createTerminal(cwd, "AgentLink", options.env);
     managed.busy = true;
     try {
       if (split_from) {
@@ -390,12 +431,16 @@ export class TerminalManager {
     );
   }
 
-  private createTerminal(cwd: string, name: string): ManagedTerminal {
+  private createTerminal(
+    cwd: string,
+    name: string,
+    extraEnv?: Record<string, string>,
+  ): ManagedTerminal {
     const terminal = vscode.window.createTerminal({
       name,
       cwd,
       iconPath: terminalIconPath ?? new vscode.ThemeIcon("terminal"),
-      env: buildAgentExecutionEnv(),
+      env: buildAgentExecutionEnv({ extraEnv }),
     });
 
     const id = `term_${nextTerminalId++}`;
@@ -404,6 +449,7 @@ export class TerminalManager {
       terminal,
       name,
       cwd,
+      envKey: this.buildEnvKey(extraEnv),
       busy: false,
       lastCommandEndedAt: 0,
       outputBuffer: "",
@@ -1071,6 +1117,7 @@ export class TerminalManager {
       : [...this.terminals];
 
     for (const managed of toClose) {
+      this.rememberClosedTerminal(managed);
       for (const d of managed.backgroundDisposables) d.dispose();
       managed.backgroundDisposables = [];
       managed.terminal.dispose();
@@ -1165,6 +1212,24 @@ export class TerminalManager {
       name: t.name,
       busy: t.busy,
     }));
+  }
+
+  getRecentlyClosedTerminals(limit = 5): ClosedTerminalSnapshot[] {
+    return this.recentlyClosed.slice(0, Math.max(0, limit));
+  }
+
+  private rememberClosedTerminal(managed: ManagedTerminal): void {
+    this.recentlyClosed.unshift({
+      id: managed.id,
+      name: managed.name,
+      closedAt: Date.now(),
+    });
+    if (this.recentlyClosed.length > TerminalManager.MAX_RECENTLY_CLOSED) {
+      this.recentlyClosed = this.recentlyClosed.slice(
+        0,
+        TerminalManager.MAX_RECENTLY_CLOSED,
+      );
+    }
   }
 
   dispose(): void {

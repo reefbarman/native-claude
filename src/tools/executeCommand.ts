@@ -31,6 +31,7 @@ export async function handleExecuteCommand(
     split_from?: string;
     background?: boolean;
     timeout?: number;
+    env?: Record<string, string>;
     output_head?: number;
     output_tail?: number;
     output_offset?: number;
@@ -178,6 +179,7 @@ export async function handleExecuteCommand(
       split_from: params.split_from,
       background: params.background,
       timeout: params.timeout ? params.timeout * 1000 : undefined, // seconds → ms
+      env: params.env,
       onTerminalAssigned: trackerCtx
         ? (tid) => trackerCtx.setTerminalId(tid)
         : undefined,
@@ -228,11 +230,22 @@ export async function handleExecuteCommand(
     };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    const lowerMessage = message.toLowerCase();
+    const newlineRegexHint =
+      lowerMessage.includes("ripgrep error") &&
+      lowerMessage.includes("regex") &&
+      lowerMessage.includes("newline")
+        ? 'Your regex appears to contain a literal newline. Remove the literal newline from the command string and use escaped \\n with multiline mode instead (e.g. pattern: "foo\\nbar", plus --multiline).'
+        : undefined;
     return {
       content: [
         {
           type: "text",
-          text: JSON.stringify({ error: message, command: params.command }),
+          text: JSON.stringify({
+            error: message,
+            ...(newlineRegexHint && { hint: newlineRegexHint }),
+            command: params.command,
+          }),
         },
       ],
     };

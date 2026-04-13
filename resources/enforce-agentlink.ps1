@@ -46,8 +46,8 @@ if ($toolName -in $fileTools) {
     }
 }
 
-# Allow Read for non-text file types that agentlink can't handle
-# (images, PDFs, notebooks - Claude's built-in Read handles these natively)
+# Allow Read only for non-text file types that read_file still does not handle
+# (PDFs and notebooks - use read_file for local image files)
 if ($toolName -eq "Read") {
     $filePath = ""
     if ($input.tool_input -and $input.tool_input.PSObject.Properties["file_path"]) {
@@ -56,8 +56,6 @@ if ($toolName -eq "Read") {
     if ($filePath) {
         $ext = [System.IO.Path]::GetExtension($filePath).TrimStart(".").ToLower()
         $allowedExts = @(
-            # Images (Claude is multimodal - built-in Read displays these visually)
-            "png", "jpg", "jpeg", "gif", "bmp", "svg", "webp", "ico", "tiff", "tif", "avif",
             # PDFs (built-in Read supports pages parameter)
             "pdf",
             # Jupyter notebooks (built-in Read renders cells + outputs)

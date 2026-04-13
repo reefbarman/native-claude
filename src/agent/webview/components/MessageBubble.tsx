@@ -12,6 +12,7 @@ import { BgAgentResultBlock } from "./BgAgentResultBlock";
 import { BgQuestionBlock } from "./BgQuestionBlock";
 import { QuestionAnswerBlock } from "./QuestionAnswerBlock";
 import type { BgSessionInfoProps } from "./BackgroundSessionStrip";
+import type { DetectedQuestion } from "../questionDetection";
 import { matchFilePaths } from "./filePathLinks";
 
 /**
@@ -41,6 +42,9 @@ export function getStreamingActivity(blocks: ContentBlock[]): string {
 interface MessageBubbleProps {
   message: ChatMessage;
   streaming: boolean;
+  detectedQuestion?: (DetectedQuestion & { messageId: string }) | null;
+  onDetectedQuestionAnswer?: (payload: string) => void;
+  onDismissDetectedQuestion?: (messageId: string) => void;
   onOpenFile?: (path: string, line?: number) => void;
   onOpenSpecialBlockPanel?: (block: {
     kind: "mermaid" | "vega" | "vega-lite";
@@ -58,6 +62,9 @@ interface MessageBubbleProps {
 export function MessageBubble({
   message,
   streaming,
+  detectedQuestion,
+  onDetectedQuestionAnswer,
+  onDismissDetectedQuestion,
   onOpenFile,
   onOpenSpecialBlockPanel,
   onRetry,
@@ -206,6 +213,7 @@ export function MessageBubble({
                   task={block.task}
                   status={block.status}
                   resultText={block.resultText}
+                  summary={block.summary}
                   onOpenTranscript={onOpenTranscript}
                 />
               );
@@ -239,6 +247,39 @@ export function MessageBubble({
         {!streaming && blocks.length === 0 && !message.error && (
           <div class="message-content assistant-content empty-response">
             (No response)
+          </div>
+        )}
+
+        {!streaming && detectedQuestion && (
+          <div class="detected-question-card">
+            <div class="detected-question-header">
+              <i class="codicon codicon-lightbulb" />
+              <span>Detected choice prompt</span>
+              {onDismissDetectedQuestion && (
+                <button
+                  class="icon-button detected-question-dismiss"
+                  title="Dismiss"
+                  onClick={() => onDismissDetectedQuestion(message.id)}
+                >
+                  <i class="codicon codicon-close" />
+                </button>
+              )}
+            </div>
+            <div class="detected-question-text">{detectedQuestion.prompt}</div>
+            <div class="detected-question-options">
+              {detectedQuestion.options.map((opt) => (
+                <button
+                  key={`${opt.label}-${opt.payload}`}
+                  class="question-option detected-question-option"
+                  onClick={() => {
+                    onDismissDetectedQuestion?.(message.id);
+                    onDetectedQuestionAnswer?.(opt.payload);
+                  }}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
           </div>
         )}
       </div>

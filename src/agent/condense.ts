@@ -44,68 +44,22 @@ import {
 // Prompts
 // ---------------------------------------------------------------------------
 
-const CONDENSE_SYSTEM_PROMPT = `You are a helpful AI assistant tasked with summarizing conversations.
+const CONDENSE_SYSTEM_PROMPT = `You are performing a CONTEXT CHECKPOINT COMPACTION.
 
 CRITICAL: This is a summarization-only request. DO NOT call any tools or functions.
-Your ONLY task is to analyze the conversation and produce a text summary.
-Respond with text only — no tool calls will be processed.
+Respond with text only — no tool calls will be processed.`;
 
-CRITICAL: This summarization request is a SYSTEM OPERATION, not a user message.
-When analyzing "user requests" and "user intent", completely EXCLUDE this summarization message.
-The "most recent user request" and "Optional Next Step" must be based on what the user was doing BEFORE this system message appeared.
-The goal is for work to continue seamlessly after condensation — as if it never happened.`;
+const CONDENSE_INSTRUCTIONS = `Create a handoff summary for another LLM that will resume the task.
 
-const CONDENSE_INSTRUCTIONS = `Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions.
+Include:
+- Current progress and key decisions made
+- Important context, constraints, or user preferences
+- What remains to be done (clear next steps)
+- Any critical data, file paths, code snippets, or references needed to continue
+- All user corrections and behavioral directives (verbatim quotes)
 
-This summary should be thorough in capturing technical details, code patterns, and architectural decisions essential for continuing development work without losing context.
-
-CRITICAL accuracy rules:
-- Include only claims grounded in the provided conversation content.
-- If something is uncertain or not directly evidenced, say "Unknown from transcript".
-- Do NOT invent quantitative outcomes (test counts, error counts, token values) unless explicitly present.
-- Do NOT mark work "complete" when pending work is still described.
-- "All User Messages" must be literal user-authored messages only (exclude tool results and system condense prompts).
-- The session's system prompt, tool definitions, and MCP/tool-server availability are preserved outside the condensed transcript and will be reattached on future requests. Do not treat them as lost conversation state.
-- If preserved runtime context is relevant to ongoing work, mention only the specific tools/server capabilities that matter; do not waste summary space restating the entire tool catalog.
-
-Before providing your final summary, wrap your analysis in <analysis> tags. In your analysis:
-
-1. Chronologically analyze each message section. For each, identify:
-   - The user's explicit requests and intents
-   - Your approach to addressing them
-   - Key decisions, technical concepts, and code patterns
-   - Specific details: file names, full code snippets, function signatures, file edits
-   - Errors encountered and how you fixed them
-   - **User corrections** — any time the user told you to do something differently, change behavior, or remember something. Include verbatim quotes.
-
-2. Double-check for technical accuracy and completeness.
-
-Your summary MUST include the following sections:
-
-1. **Primary Request and Intent**: Capture all user requests and intents in detail
-2. **Key Technical Concepts**: List all important technical concepts, technologies, and frameworks discussed
-3. **Files and Code Sections**: Enumerate files examined, modified, or created. Include full code snippets where applicable and explain why each is important.
-4. **Errors and Fixes**: List every error encountered and how it was fixed. Include any user feedback about incorrect approaches.
-5. **Problem Solving**: Document problems solved and any ongoing troubleshooting.
-6. **All User Messages**: List ALL user messages (not tool results) verbatim. Critical for preserving intent and changing instructions.
-7. **User Corrections & Behavioral Directives** *(CRITICAL — preserve across all future condensings)*: Extract EVERY instance where the user:
-   - Corrected your behavior ("use X not Y", "don't do Z")
-   - Stated a persistent preference ("always use npm", "remember to check X first")
-   - Gave behavioral feedback ("stop doing that", "that approach is wrong")
-   Include verbatim quotes with turn numbers where possible. These MUST survive all future condensings.
-8. **Pending Tasks**: Outline tasks explicitly asked but not yet completed.
-9. **Current Work**: Describe in detail exactly what was being worked on immediately before this summary. Include file names and code snippets.
-10. **Optional Next Step**: The single next step directly in line with the most recent work. Include direct quotes from recent conversation. Do NOT propose tangential tasks or revisit completed work without explicit user request.
-
-Format your response exactly as:
-
-<analysis>
-[Your thorough analysis]
-</analysis>
-
-<summary>
-[Your structured summary with the 10 sections above]
-</summary>`;
+Be concise, structured, and focused on helping the next LLM seamlessly continue the work.
+Wrap your summary in <summary> tags.`;
 
 // ---------------------------------------------------------------------------
 // Tool block → text conversion (for summarization API call)
@@ -159,15 +113,17 @@ function convertToolBlocksToText(
 
 function stripMedia(content: string | ContentBlock[]): string | ContentBlock[] {
   if (typeof content === "string") return content;
-  return content.map((block) => {
-    if (block.type === "image")
-      return { type: "text" as const, text: "[Image]" };
-    if (block.type === "document") {
-      const title = (block as { title?: string }).title ?? "PDF";
-      return { type: "text" as const, text: `[Document: ${title}]` };
-    }
-    return block;
-  });
+  return content
+    .filter((block) => block.type !== "thinking")
+    .map((block) => {
+      if (block.type === "image")
+        return { type: "text" as const, text: "[Image]" };
+      if (block.type === "document") {
+        const title = (block as { title?: string }).title ?? "PDF";
+        return { type: "text" as const, text: `[Document: ${title}]` };
+      }
+      return block;
+    });
 }
 
 const MAX_TOOL_RESULT_TEXT_CHARS = 20_000;
@@ -506,8 +462,6 @@ export interface SummarizeResult {
     inputMessageCount: number;
     sourceUserMessageCount: number;
     hadPriorSummaryInInput: boolean;
-    retryUsed: boolean;
-    validatorErrors: string[];
     sourceHash: string;
     providerId: string;
     condenseModel: string;
@@ -643,29 +597,6 @@ export function renderDeterministicSections(options: {
   ].join("\n");
 }
 
-function normalizeWhitespace(text: string): string {
-  return text.replace(/\s+/g, " ").trim().toLowerCase();
-}
-
-function extractNumberedSection(summaryText: string, title: string): string {
-  const escapedTitle = title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const numberedMatch = summaryText.match(
-    new RegExp(
-      `(?:^|\\n)\\d+\\.\\s+\\*\\*${escapedTitle}(?:[^*]*)\\*\\*:?([\\s\\S]*?)(?=\\n\\d+\\.\\s+\\*\\*|$)`,
-      "i",
-    ),
-  );
-  if (numberedMatch?.[1]) return numberedMatch[1].trim();
-
-  const boldMatch = summaryText.match(
-    new RegExp(
-      `(?:^|\\n)\\*\\*${escapedTitle}(?:[^*]*)\\*\\*:?([\\s\\S]*?)(?=\\n(?:\\d+\\.\\s+\\*\\*|\\*\\*)|$)`,
-      "i",
-    ),
-  );
-  return boldMatch?.[1]?.trim() ?? "";
-}
-
 function buildDeterministicFallbackSummary(options: {
   userMessages: string[];
   pendingTasks: string[];
@@ -695,92 +626,6 @@ function buildDeterministicFallbackSummary(options: {
     `9. **Current Work**: Continue from this task: "${options.resumeAnchor.currentTask}". Latest user message: "${options.resumeAnchor.latestUserMessage}".`,
     `10. **Optional Next Step**: Resume work on "${options.resumeAnchor.currentTask}".`,
   ].join("\n\n");
-}
-
-function isUnsupportedCodexModelError(message: string): boolean {
-  return /model is not supported|unsupported model|invalid model/i.test(
-    message,
-  );
-}
-
-function validateSummary(options: {
-  summaryText: string;
-  canonicalUserMessages: string[];
-}): {
-  errors: string[];
-  warnings: string[];
-  stats: {
-    unmatchedQuotedStrings: number;
-    preservedCanonicalMessages: number;
-    latestUserMessagePreserved: boolean;
-  };
-} {
-  const { summaryText, canonicalUserMessages } = options;
-  const errors: string[] = [];
-  const warnings: string[] = [];
-  const lower = summaryText.toLowerCase();
-
-  const unsupportedQuant =
-    /(\d+\s*\/\s*\d+\s+tests?\s+pass|all\s+tests\s+pass(ed)?|\b\d+\s+tests\s+pass(ed)?)/i;
-  if (unsupportedQuant.test(summaryText)) {
-    errors.push(
-      "Summary includes high-confidence test pass counts/claims; requires direct evidence.",
-    );
-  }
-
-  if (
-    /(feature-complete|fully complete|all done|nothing left)/i.test(lower) &&
-    /(not yet|in progress|pending|todo|to do|left to)/i.test(lower)
-  ) {
-    errors.push(
-      "Summary has a completion contradiction (complete vs pending).",
-    );
-  }
-
-  const allUserMessagesSection = extractNumberedSection(
-    summaryText,
-    "All User Messages",
-  );
-  const normalizedAllUserMessagesSection = normalizeWhitespace(
-    allUserMessagesSection,
-  );
-  const normalizedCanonicalMessages =
-    canonicalUserMessages.map(normalizeWhitespace);
-  const preservedCanonicalMessages = normalizedCanonicalMessages.filter(
-    (message) => normalizedAllUserMessagesSection.includes(message),
-  ).length;
-  const latestCanonicalMessage = normalizedCanonicalMessages.at(-1);
-  const latestUserMessagePreserved = latestCanonicalMessage
-    ? normalizedAllUserMessagesSection.includes(latestCanonicalMessage)
-    : true;
-
-  if (canonicalUserMessages.length > 0 && !latestUserMessagePreserved) {
-    errors.push(
-      "Summary's 'All User Messages' section does not preserve the latest canonical user message verbatim.",
-    );
-  }
-
-  const quoted = [...summaryText.matchAll(/"([^"]{2,400})"/g)].map((m) => m[1]);
-  const unmatched = quoted.filter(
-    (q) =>
-      q.trim().length > 4 &&
-      !canonicalUserMessages.some((u) => u.includes(q) || q.includes(u)),
-  );
-  if (unmatched.length > 0) {
-    warnings.push(
-      `Summary contains ${unmatched.length} quoted strings not matched to canonical user messages.`,
-    );
-  }
-
-  return {
-    errors,
-    warnings,
-    stats: {
-      unmatchedQuotedStrings: unmatched.length,
-      preservedCanonicalMessages,
-      latestUserMessagePreserved,
-    },
-  };
 }
 
 function sourceWindowHash(messages: AgentMessage[]): string {
@@ -868,6 +713,19 @@ function isContextWindowExceededError(message: string): boolean {
   );
 }
 
+/**
+ * Detect a bare 400 with no body — typically caused by an oversized HTTP
+ * request payload hitting a proxy/CDN limit before the model can parse it.
+ */
+function isBarePayloadError(message: string): boolean {
+  return /400 status code \(no body\)/i.test(message);
+}
+
+/** Errors that suggest the condense input is too large and should be shrunk. */
+function isShrinkableError(message: string): boolean {
+  return isContextWindowExceededError(message) || isBarePayloadError(message);
+}
+
 function getCodexCondenseModelCandidates(args: {
   activeModel?: string;
   provider: ModelProvider;
@@ -927,15 +785,8 @@ export async function summarizeConversation(
   options: SummarizeOptions,
   prevInputTokens = 0,
 ): Promise<SummarizeResult> {
-  const {
-    messages,
-    provider,
-    activeModel,
-    systemPrompt,
-    filesRead,
-    cwd,
-    preservedContext,
-  } = options;
+  const { messages, provider, activeModel, systemPrompt, preservedContext } =
+    options;
 
   const errorResult = (
     error: string,
@@ -988,23 +839,38 @@ export async function summarizeConversation(
   ): MessageParam[] => {
     const withSyntheticResults = injectSyntheticToolResults(sourceMessages);
     const transformed = transformMessagesForCondensing(withSyntheticResults);
-    return [
+    const raw: MessageParam[] = [
       ...transformed.map(({ role, content }) => ({ role, content })),
       finalMsg,
     ];
+
+    // Merge consecutive same-role messages. After tool blocks are converted to
+    // text, the conversation can end up with adjacent user or assistant messages
+    // which the Codex Responses API rejects as a 400.
+    const merged: MessageParam[] = [];
+    for (const msg of raw) {
+      const prev = merged[merged.length - 1];
+      if (prev && prev.role === msg.role) {
+        const prevBlocks: ContentBlock[] =
+          typeof prev.content === "string"
+            ? [{ type: "text", text: prev.content }]
+            : prev.content;
+        const curBlocks: ContentBlock[] =
+          typeof msg.content === "string"
+            ? [{ type: "text", text: msg.content }]
+            : msg.content;
+        prev.content = [...prevBlocks, ...curBlocks];
+      } else {
+        merged.push({ ...msg });
+      }
+    }
+    return merged;
   };
 
   let requestMessages: MessageParam[] = buildRequestMessages(toSummarize);
 
-  const fileContextPromise =
-    filesRead && filesRead.length > 0 && cwd
-      ? generateFoldedFileContext(filesRead, cwd).catch(() => [] as string[])
-      : Promise.resolve([] as string[]);
-
   const validationWarnings: string[] = [];
   let condenseSourceMessages = toSummarize;
-  let retryUsed = false;
-  let validatorErrors: string[] = [];
   let summaryText = "";
   const getModelSelection = (messagesForRequest: MessageParam[]) =>
     provider.id === "codex"
@@ -1025,26 +891,16 @@ export async function summarizeConversation(
     getModelSelection(requestMessages);
   let selectedModel = modelCandidates[0] ?? provider.condenseModel;
 
-  const completeOnce = async (
-    extraInstruction?: string,
-  ): Promise<{
+  // 3-minute timeout for the condense API call. Falls back to deterministic summary.
+  const CONDENSE_TIMEOUT_MS = 3 * 60 * 1000;
+
+  const completeOnce = async (): Promise<{
     text: string;
     error?: string;
     retryable?: boolean;
     code?: string;
     actions?: AgentErrorActions;
   }> => {
-    const adjustedMessages =
-      extraInstruction && requestMessages.length > 0
-        ? [
-            ...requestMessages.slice(0, -1),
-            {
-              role: "user" as const,
-              content: `${requestMessages[requestMessages.length - 1].content}\n\n${extraInstruction}`,
-            },
-          ]
-        : requestMessages;
-
     let lastError = "";
     let lastErrorMeta:
       | {
@@ -1056,19 +912,31 @@ export async function summarizeConversation(
 
     for (const model of modelCandidates) {
       try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), CONDENSE_TIMEOUT_MS);
         const result = await provider.complete({
           model,
           systemPrompt: CONDENSE_SYSTEM_PROMPT,
-          messages: adjustedMessages,
+          messages: requestMessages,
           maxTokens: 8192,
           temperature: 0,
+          reasoningEffort: "low",
+          signal: controller.signal,
         });
+        clearTimeout(timer);
         selectedModel = model;
         return { text: result.text };
       } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") {
+          return {
+            text: "",
+            error: `Condensing timed out after ${CONDENSE_TIMEOUT_MS / 1000}s`,
+          };
+        }
         const msg = err instanceof Error ? err.message : String(err);
         lastError = msg;
         const errObj = err as {
+          status?: number;
           retryable?: boolean;
           code?: string;
           actions?: AgentErrorActions;
@@ -1080,8 +948,11 @@ export async function summarizeConversation(
         };
         const shouldRetry =
           provider.id === "codex" &&
-          (isUnsupportedCodexModelError(msg) ||
-            isContextWindowExceededError(msg));
+          (/model is not supported|unsupported model|invalid model/i.test(
+            msg,
+          ) ||
+            isContextWindowExceededError(msg) ||
+            isBarePayloadError(msg));
         if (!shouldRetry) {
           return {
             text: "",
@@ -1100,7 +971,7 @@ export async function summarizeConversation(
   };
 
   let first = await completeOnce();
-  if (first.error && isContextWindowExceededError(first.error)) {
+  if (first.error && isShrinkableError(first.error)) {
     for (const fraction of [0.75, 0.5, 0.33]) {
       const shrunk = shrinkCondenseSourceWindow(toSummarize, fraction);
       if (shrunk.length >= condenseSourceMessages.length) continue;
@@ -1110,10 +981,10 @@ export async function summarizeConversation(
         getModelSelection(requestMessages));
       selectedModel = modelCandidates[0] ?? provider.condenseModel;
       validationWarnings.push(
-        `Condense request exceeded context window; retried with newest ${Math.round(fraction * 100)}% of unsummarized messages.`,
+        `Condense request too large (${isBarePayloadError(first.error) ? "payload limit" : "context window"}); retried with newest ${Math.round(fraction * 100)}% of unsummarized messages.`,
       );
       first = await completeOnce();
-      if (!first.error || !isContextWindowExceededError(first.error)) {
+      if (!first.error || !isShrinkableError(first.error)) {
         break;
       }
     }
@@ -1125,47 +996,17 @@ export async function summarizeConversation(
       actions: first.actions,
     });
   }
-  summaryText = extractSummaryText(first.text);
-  if (!summaryText) return errorResult("Condensing produced no output.");
-
-  let validation = validateSummary({
-    summaryText,
-    canonicalUserMessages,
-  });
-  validatorErrors = [...validation.errors];
-  validationWarnings.push(...validation.warnings);
-
-  if (validation.errors.length > 0) {
-    retryUsed = true;
-    const retry = await completeOnce(
-      `VALIDATION FAILED. Fix these issues and regenerate a corrected summary:\n- ${validation.errors.join("\n- ")}\n\nDo not invent unsupported metrics or completion claims.`,
+  summaryText = extractSummaryText(first.text) || first.text.trim();
+  if (!summaryText) {
+    // API succeeded but produced no usable text — fall back to deterministic summary.
+    summaryText = buildDeterministicFallbackSummary({
+      userMessages: canonicalUserMessages,
+      pendingTasks,
+      resumeAnchor,
+    });
+    validationWarnings.push(
+      "Model returned empty summary; using deterministic fallback.",
     );
-    if (retry.error) {
-      validationWarnings.push(
-        `Validation retry failed, using first-pass summary: ${retry.error}`,
-      );
-    } else {
-      const retried = extractSummaryText(retry.text);
-      if (retried) {
-        summaryText = retried;
-        validation = validateSummary({ summaryText, canonicalUserMessages });
-        validatorErrors = [...validation.errors];
-        validationWarnings.push(...validation.warnings);
-      }
-    }
-    if (validatorErrors.length > 0) {
-      validationWarnings.push(
-        `Summary still has validator issues after retry: ${validatorErrors.join("; ")}`,
-      );
-      summaryText = buildDeterministicFallbackSummary({
-        userMessages: canonicalUserMessages,
-        pendingTasks,
-        resumeAnchor,
-      });
-      validationWarnings.push(
-        "Fell back to a deterministic summary because the model-authored summary could not be trusted after retry.",
-      );
-    }
   }
 
   const summaryContent: ContentBlock[] = [
@@ -1190,11 +1031,6 @@ export async function summarizeConversation(
         text: `<system-reminder>\n## Persistent User Corrections & Preferences\n${corrections}\n</system-reminder>`,
       });
     }
-  }
-
-  const fileContextSections = await fileContextPromise;
-  for (const section of fileContextSections) {
-    summaryContent.push({ type: "text", text: section });
   }
 
   const condenseId = randomUUID();
@@ -1235,8 +1071,6 @@ export async function summarizeConversation(
       inputMessageCount: toSummarize.length,
       sourceUserMessageCount: canonicalUserMessages.length,
       hadPriorSummaryInInput,
-      retryUsed,
-      validatorErrors,
       sourceHash: sourceWindowHash(toSummarize),
       providerId: provider.id,
       condenseModel: provider.condenseModel,

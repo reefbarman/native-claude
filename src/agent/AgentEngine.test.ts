@@ -929,7 +929,48 @@ describe("AgentEngine", () => {
       }
     });
 
-    it("retries once when the provider finishes with empty content blocks", async () => {
+    it("auto-retries 503 upstream connect errors with backoff", async () => {
+      let attempts = 0;
+      const provider = makeMockProvider();
+      provider.stream = async function* () {
+        attempts += 1;
+        if (attempts <= 2) {
+          yield* [];
+          throw new Error(
+            "Codex API error 503: 503 upstream connect error or disconnect/reset before headers. reset reason: connection termination",
+          );
+        }
+        yield* makeProviderStream({ text: "Recovered after 503" });
+      };
+
+      const timerSpy = vi
+        .spyOn(globalThis, "setTimeout")
+        .mockImplementation((fn: TimerHandler) => {
+          if (typeof fn === "function") fn();
+          return 0 as unknown as ReturnType<typeof setTimeout>;
+        });
+
+      try {
+        const session = await makeSession();
+        session.addUserMessage("hello");
+        const engine = new AgentEngine(makeRegistry(provider));
+
+        const events = await collectEvents(engine.run(session));
+        const warnings = events.filter((e) => e.type === "warning");
+
+        expect(attempts).toBe(3);
+        expect(warnings).toHaveLength(2);
+        // 503 errors use the longer rate-limit backoff (15s per attempt)
+        expect(warnings[0]?.message).toContain("retrying in 15s");
+        expect(warnings[1]?.message).toContain("retrying in 30s");
+        // Should recover successfully
+        expect(events.find((e) => e.type === "error")).toBeUndefined();
+      } finally {
+        timerSpy.mockRestore();
+      }
+    });
+
+    it("recovers silently on the first empty response retry", async () => {
       let attempts = 0;
       const provider = makeMockProvider();
       provider.stream = async function* () {
@@ -964,8 +1005,7 @@ describe("AgentEngine", () => {
       expect(warnings).toEqual([
         expect.objectContaining({
           type: "warning",
-          message:
-            "Provider returned an empty response — asking it to continue…",
+          message: "Provider returned an empty response — retrying…",
         }),
       ]);
       expect(doneEvent).toBeDefined();
@@ -974,9 +1014,9 @@ describe("AgentEngine", () => {
         role: "assistant",
         content: [{ type: "text", text: "Recovered response" }],
       });
-      expect(session.getAllMessages()).toContainEqual(
+      // First retry is silent — no nudge message injected into history
+      expect(session.getAllMessages()).not.toContainEqual(
         expect.objectContaining({
-          role: "user",
           content:
             "Your previous response was empty. Continue from where you left off and provide the full response.",
         }),
@@ -1000,6 +1040,8 @@ describe("AgentEngine", () => {
       };
 
       const session = await makeSession();
+      // Disable auto-condense so we test the pure empty-response error path
+      session.autoCondense = false;
       session.addUserMessage("hello");
       const engine = new AgentEngine(makeRegistry(provider));
 
@@ -1008,23 +1050,97 @@ describe("AgentEngine", () => {
       const doneEvent = events.find((e) => e.type === "done");
       const errorEvent = events.find((e) => e.type === "error");
 
-      expect(attempts).toBe(2);
-      expect(warnings).toEqual([
+      // 3 attempts: initial + 2 retries (MAX_EMPTY_RESPONSE_RETRIES = 2)
+      expect(attempts).toBe(3);
+      expect(warnings).toContainEqual(
+        expect.objectContaining({
+          type: "warning",
+          message: "Provider returned an empty response — retrying…",
+        }),
+      );
+      expect(warnings).toContainEqual(
         expect.objectContaining({
           type: "warning",
           message:
             "Provider returned an empty response — asking it to continue…",
         }),
-      ]);
+      );
       expect(doneEvent).toBeUndefined();
       expect(errorEvent).toEqual(
         expect.objectContaining({
           type: "error",
           error:
-            "Provider returned empty responses 2 times in a row. Please retry.",
+            "Provider returned empty responses 3 times in a row. Please retry.",
           retryable: true,
+          actions: { condense: true },
         }),
       );
+      // The nudge message injected during retry should be cleaned up
+      expect(session.getAllMessages()).not.toContainEqual(
+        expect.objectContaining({
+          content:
+            "Your previous response was empty. Continue from where you left off and provide the full response.",
+        }),
+      );
+    });
+
+    it("auto-condenses and recovers after consecutive empty responses", async () => {
+      let attempts = 0;
+      let condenseCalled = false;
+      const provider = makeMockProvider();
+      provider.stream = async function* () {
+        attempts += 1;
+        if (!condenseCalled) {
+          // Return empty before condense
+          yield {
+            type: "usage",
+            inputTokens: 100,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheCreationTokens: 0,
+          };
+          yield { type: "content_blocks", blocks: [] };
+          yield { type: "done" };
+          return;
+        }
+        // After condense, return a real response
+        yield* makeProviderStream({ text: "Recovered after condense" });
+      };
+
+      // Mock successful condense
+      mocks.mockSummarizeConversation.mockResolvedValueOnce({
+        messages: [
+          { role: "user", content: "condensed summary", isSummary: true },
+        ],
+        summary: "condensed summary",
+        prevInputTokens: 100,
+        newInputTokens: 50,
+      });
+
+      const session = await makeSession();
+      session.addUserMessage("hello");
+      const engine = new AgentEngine(makeRegistry(provider));
+
+      // Intercept condenseSession to track it and mark condenseCalled
+      const originalCondense = (engine as any).condenseSession;
+      (engine as any).condenseSession = async function* (...args: any[]) {
+        yield* originalCondense.apply(engine, args);
+        condenseCalled = true;
+      };
+
+      const events = await collectEvents(engine.run(session));
+      const doneEvent = events.find((e) => e.type === "done");
+      const errorEvent = events.find((e) => e.type === "error");
+      const condenseWarning = events.find(
+        (e) =>
+          e.type === "warning" &&
+          (e as any).message.includes("condensing conversation"),
+      );
+
+      expect(condenseCalled).toBe(true);
+      expect(condenseWarning).toBeDefined();
+      expect(doneEvent).toBeDefined();
+      expect(errorEvent).toBeUndefined();
     });
   });
 

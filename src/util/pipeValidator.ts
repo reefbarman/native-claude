@@ -98,6 +98,43 @@ function checkDirectFileCommands(command: string): ValidationResult | null {
 
   for (const sub of subCommands) {
     const trimmed = sub.trim();
+    if (!trimmed) continue;
+
+    const pipeSegments = splitOnUnquotedPipes(trimmed);
+    for (const rawSegment of pipeSegments) {
+      const segment = rawSegment.trim();
+      const segmentTokens = tokenize(segment);
+      if (segmentTokens.length === 0) continue;
+
+      const segmentCmd = segmentTokens[0];
+
+      if (segmentCmd === "tee") {
+        const teeFiles = findTeeFileTargets(segmentTokens.slice(1));
+        if (teeFiles.length > 0) {
+          return {
+            type: "direct",
+            message: [
+              `Command rejected: "tee" with file targets should not be run in the terminal — it bypasses user review.`,
+              `\nUse the write_file or apply_diff tool instead — they open a diff view for the user to review and approve changes, and return diagnostics from the language server.`,
+            ].join("\n"),
+          };
+        }
+      }
+
+      if (
+        (segmentCmd === "echo" || segmentCmd === "printf") &&
+        hasOutputRedirection(segment)
+      ) {
+        return {
+          type: "direct",
+          message: [
+            `Command rejected: "${segmentCmd}" with output redirection should not be run in the terminal — it bypasses user review.`,
+            `\nUse the write_file or apply_diff tool instead — they open a diff view for the user to review and approve changes, and return diagnostics from the language server.`,
+          ].join("\n"),
+        };
+      }
+    }
+
     const tokens = tokenize(trimmed);
     if (tokens.length === 0) continue;
 
@@ -318,6 +355,67 @@ function findSedFileArg(args: string[]): string | null {
   }
 
   return null;
+}
+
+function findTeeFileTargets(args: string[]): string[] {
+  const files: string[] = [];
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+
+    if (!arg || arg === "-") continue;
+
+    if (arg === "--") {
+      for (let j = i + 1; j < args.length; j++) {
+        const tailArg = args[j];
+        if (tailArg && tailArg !== "-") files.push(stripQuotes(tailArg));
+      }
+      break;
+    }
+
+    if (arg.startsWith("-")) {
+      continue;
+    }
+
+    files.push(stripQuotes(arg));
+  }
+
+  return files;
+}
+
+function hasOutputRedirection(command: string): boolean {
+  let inSingle = false;
+  let inDouble = false;
+
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+
+    if (ch === "\\" && i + 1 < command.length) {
+      i++;
+      continue;
+    }
+
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      continue;
+    }
+
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      continue;
+    }
+
+    if (inSingle || inDouble || ch !== ">") continue;
+
+    const next = i + 1 < command.length ? command[i + 1] : "";
+
+    // Ignore FD redirects like 2>&1, 1>&2, 3>&-, >&2
+    if (next === "&") continue;
+
+    return true;
+  }
+
+  return false;
 }
 
 /**

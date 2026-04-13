@@ -6,6 +6,7 @@ import { providerRegistry } from "./providers/index.js";
 import { getConfiguredBaseThresholdForModel } from "./modelCondenseThresholds.js";
 import { getModeModelPreferences } from "./modeModelPreferences.js";
 import type { AgentSessionManager } from "./AgentSessionManager.js";
+import type { AgentSession } from "./AgentSession.js";
 import type { AgentErrorActions, AgentEvent } from "./types.js";
 import type { TodoItem } from "./todoTool.js";
 import { SlashCommandRegistry } from "./SlashCommandRegistry.js";
@@ -21,6 +22,7 @@ import type {
 import type { ApprovalManager } from "../approvals/ApprovalManager.js";
 import type { ToolCallTracker } from "../server/ToolCallTracker.js";
 import { DIFF_VIEW_URI_SCHEME } from "../extension.js";
+import { getRelativePath } from "../util/paths.js";
 
 /**
  * Webview protocol types — messages between extension and chat webview.
@@ -199,8 +201,7 @@ export type ExtensionToWebview =
         inputMessageCount: number;
         sourceUserMessageCount: number;
         hadPriorSummaryInInput: boolean;
-        retryUsed: boolean;
-        validatorErrors: string[];
+
         sourceHash: string;
         providerId: string;
         condenseModel: string;
@@ -227,6 +228,12 @@ export type ExtensionToWebview =
       type: "agentCondenseStart";
       sessionId: string;
       isAutomatic: boolean;
+    }
+  | {
+      type: "agentTokenEstimate";
+      sessionId: string;
+      /** Running estimate of total context window usage (tokens). */
+      estimatedTotalUsed: number;
     }
   | {
       type: "agentWarning";
@@ -258,6 +265,20 @@ export type ExtensionToWebview =
        * Restored checkpoints keyed by the number of visible user turns already
        * committed at that snapshot.
        */
+      checkpoints?: Array<{ turnIndex: number; checkpointId: string }>;
+      /** Number of user turns before the first message in this chunk. */
+      userTurnOffset?: number;
+      /** True when older messages still exist before this chunk. */
+      hasMoreBefore?: boolean;
+    }
+  | {
+      type: "agentSessionChunk";
+      sessionId: string;
+      messages: import("./types.js").AgentMessage[];
+      /** Number of user turns before the first message in this chunk. */
+      userTurnOffset: number;
+      /** True when older messages still exist before this chunk. */
+      hasMoreBefore: boolean;
       checkpoints?: Array<{ turnIndex: number; checkpointId: string }>;
     }
   | {
@@ -329,6 +350,7 @@ export type ExtensionToWebview =
       totalCacheReadTokens: number;
       totalCacheCreationTokens: number;
       resultText?: string;
+      resultSummary?: string;
     }
   | {
       type: "agentInterjection";
@@ -380,6 +402,103 @@ export interface ChatState {
     hardBudget: number;
   };
   agentWriteApproval?: "prompt" | "session" | "project" | "global";
+}
+
+const RESTORE_TAIL_TURNS = 8;
+const RESTORE_BACKFILL_BATCH_TURNS = 12;
+
+function countUserTurns(messages: import("./types.js").AgentMessage[]): number {
+  let count = 0;
+  for (const m of messages) {
+    if (m.role === "user" && typeof m.content === "string") count++;
+  }
+  return count;
+}
+
+function getTailChunkByUserTurns(
+  messages: import("./types.js").AgentMessage[],
+  tailTurns: number,
+): {
+  chunk: import("./types.js").AgentMessage[];
+  userTurnOffset: number;
+  hasMoreBefore: boolean;
+} {
+  if (messages.length === 0) {
+    return { chunk: [], userTurnOffset: 0, hasMoreBefore: false };
+  }
+
+  if (tailTurns <= 0) {
+    return {
+      chunk: [...messages],
+      userTurnOffset: 0,
+      hasMoreBefore: false,
+    };
+  }
+
+  let seenUserTurns = 0;
+  let startIndex = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role === "user" && typeof m.content === "string") {
+      seenUserTurns++;
+      if (seenUserTurns > tailTurns) {
+        startIndex = i + 1;
+        break;
+      }
+    }
+  }
+
+  const chunk = messages.slice(startIndex);
+  const prefix = messages.slice(0, startIndex);
+  const userTurnOffset = countUserTurns(prefix);
+  return {
+    chunk,
+    userTurnOffset,
+    hasMoreBefore: startIndex > 0,
+  };
+}
+
+function getBackfillChunksByUserTurns(
+  prefix: import("./types.js").AgentMessage[],
+  batchTurns: number,
+): Array<{
+  messages: import("./types.js").AgentMessage[];
+  userTurnOffset: number;
+  hasMoreBefore: boolean;
+}> {
+  if (prefix.length === 0) return [];
+  const batch = Math.max(1, batchTurns);
+
+  const chunks: Array<{
+    messages: import("./types.js").AgentMessage[];
+    userTurnOffset: number;
+    hasMoreBefore: boolean;
+  }> = [];
+
+  let cursor = prefix.length;
+  while (cursor > 0) {
+    let turnsInChunk = 0;
+    let start = cursor;
+    for (let i = cursor - 1; i >= 0; i--) {
+      start = i;
+      const m = prefix[i];
+      if (m.role === "user" && typeof m.content === "string") {
+        turnsInChunk++;
+        if (turnsInChunk >= batch) break;
+      }
+    }
+
+    const chunkMessages = prefix.slice(start, cursor);
+    const userTurnOffset = countUserTurns(prefix.slice(0, start));
+    chunks.push({
+      messages: chunkMessages,
+      userTurnOffset,
+      hasMoreBefore: start > 0,
+    });
+    cursor = start;
+  }
+
+  return chunks.reverse();
 }
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
@@ -1155,17 +1274,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             ?.restoreLastSession()
             .then((session) => {
               if (session) {
-                this.postMessage({
-                  type: "agentSessionLoaded",
-                  sessionId: session.id,
-                  title: session.title,
-                  mode: session.mode,
-                  messages: session.getAllMessages(),
-                  lastInputTokens: session.lastInputTokens,
-                  // lastOutputTokens is the per-last-request output count used for
-                  // context bar display. We don't persist this value, so send 0 for
-                  // loaded sessions to avoid displaying stale cumulative totals.
-                  lastOutputTokens: 0,
+                this.postSessionLoaded(session, {
                   restored: true,
                   checkpoints: this.getSessionCheckpoints(session.id),
                 });
@@ -1635,19 +1744,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
           await this.revertCheckpointWithConfirmation(fg.id, checkpoint.id);
         } else if (name === "mcp") {
-          const scope =
-            (msg.args as string) === "global" ? "global" : "project";
-          await this.openMcpConfig(scope);
-        } else if (name === "mcp-refresh") {
-          await this.refreshMcpConnections();
-          vscode.window.showInformationMessage("MCP servers reconnected.");
-        } else if (name === "mcp-status") {
           const infos = this.mcpHub.getServerInfos();
           this.postMessage({
             type: "agentMcpStatus",
             infos,
             open: true,
           } as ExtensionToWebview);
+        } else if (name === "mcp-config") {
+          const scope =
+            (msg.args as string) === "global" ? "global" : "project";
+          await this.openMcpConfig(scope);
+        } else if (name === "mcp-refresh") {
+          await this.refreshMcpConnections();
+          vscode.window.showInformationMessage("MCP servers reconnected.");
         } else if (name === "btw") {
           const question = String(msg.args ?? "").trim();
           if (question) {
@@ -1716,12 +1825,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "agentResolveDroppedFiles": {
         const paths = msg.paths as string[];
         if (!Array.isArray(paths)) break;
-        const pathMod = require("path");
-        const workspaceRoot =
-          vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "";
-        const resolved = paths.map((p: string) =>
-          workspaceRoot ? pathMod.relative(workspaceRoot, p) : p,
-        );
+        const resolved = paths.map((p: string) => getRelativePath(p));
         this.postMessage({
           type: "agentDroppedFilesResolved",
           files: resolved,
@@ -1739,11 +1843,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           title: "Attach files to chat",
         });
         if (uris?.length) {
-          const pathMod = require("path");
-          const wsRoot = workspaceRoot?.fsPath ?? "";
-          const resolved = uris.map((u) =>
-            wsRoot ? pathMod.relative(wsRoot, u.fsPath) : u.fsPath,
-          );
+          const resolved = uris.map((u) => getRelativePath(u.fsPath));
           this.postMessage({
             type: "agentDroppedFilesResolved",
             files: resolved,
@@ -1796,14 +1896,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this.log(`[history] session not found: ${sessionId}`);
           break;
         }
-        this.postMessage({
-          type: "agentSessionLoaded",
-          sessionId: session.id,
-          title: session.title,
-          mode: session.mode,
-          messages: session.getAllMessages(),
-          lastInputTokens: session.lastInputTokens,
-          lastOutputTokens: 0, // per-last-request value not persisted; 0 avoids stale cumulative display
+        this.postSessionLoaded(session, {
           checkpoints: this.getSessionCheckpoints(session.id),
         });
         this.sendInitialState();
@@ -2118,6 +2211,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           durationMs: event.durationMs,
           input: event.input,
         });
+        // Send running token estimate so the context bar stays current
+        // between API responses (tool results can add 10-100k+ tokens).
+        if (!isBackground) {
+          const session = this.sessionManager?.getSession(sessionId);
+          if (session) {
+            this.postMessage({
+              type: "agentTokenEstimate",
+              sessionId,
+              estimatedTotalUsed: session.estimatedTotalUsed,
+            } as ExtensionToWebview);
+          }
+        }
+        // Keep bg strip in sync after tool completion. Use throttled updates to
+        // avoid flooding when tools complete in quick succession.
+        if (isBackground) {
+          this.sendBgSessionsUpdateThrottled();
+        }
         // Emit user-visible annotation for follow-ups and user rejections
         try {
           const parsed = JSON.parse(resultText);
@@ -2297,6 +2407,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           `[agent] done totalIn=${event.totalInputTokens} totalOut=${event.totalOutputTokens} ` +
             `cacheRead=${event.totalCacheReadTokens} cacheCreate=${event.totalCacheCreationTokens}`,
         );
+        const bgInfo = isBackground
+          ? this.sessionManager
+              ?.getBgSessionInfos()
+              .find((s) => s.id === sessionId)
+          : undefined;
         this.postMessage({
           type: isBackground ? "agentBgDone" : "agentDone",
           sessionId,
@@ -2309,6 +2424,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               this.sessionManager
                 ?.getSession(sessionId)
                 ?.getLastAssistantText() ?? undefined,
+            resultSummary:
+              bgInfo?.resultSummary ??
+              this.sessionManager?.getBackgroundResultSummary(sessionId),
           }),
         });
         // Refresh session list after save (SessionStore.save is called in SessionManager)
@@ -2336,8 +2454,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         inputMessageCount: number;
         sourceUserMessageCount: number;
         hadPriorSummaryInInput: boolean;
-        retryUsed: boolean;
-        validatorErrors: string[];
+
         sourceHash: string;
         providerId: string;
         condenseModel: string;
@@ -2410,14 +2527,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       summaryLines.push(
         `- hadPriorSummaryInInput: ${event.metadata.hadPriorSummaryInInput}`,
       );
-      summaryLines.push(`- retryUsed: ${event.metadata.retryUsed}`);
       summaryLines.push(`- sourceHash: ${event.metadata.sourceHash}`);
-      if (event.metadata.validatorErrors.length > 0) {
-        summaryLines.push(
-          `- validatorErrors: ${event.metadata.validatorErrors.join(" | ")}`,
-        );
-      }
-
       summaryLines.push(``);
       summaryLines.push(`## Resume Anchor Inputs`);
       summaryLines.push(``);
@@ -2751,15 +2861,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       );
       const session = this.sessionManager.getSession(sessionId);
       if (session) {
-        this.postMessage({
-          type: "agentSessionLoaded",
-          sessionId: session.id,
-          title: session.title,
-          mode: session.mode,
-          messages: session.getAllMessages(),
-          lastInputTokens: session.lastInputTokens,
-          lastOutputTokens: 0,
+        this.postSessionLoaded(session, {
           checkpoints: this.getSessionCheckpoints(session.id),
+          // Checkpoint revert should feel immediate and deterministic.
+          tailTurns: 0,
         });
       }
       if (result.restoredPrompt) {
@@ -3139,6 +3244,57 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     this.view?.webview.postMessage(msg);
+  }
+
+  private postSessionLoaded(
+    session: AgentSession,
+    opts?: {
+      restored?: boolean;
+      tailTurns?: number;
+      backfillBatchTurns?: number;
+      checkpoints?: Array<{ turnIndex: number; checkpointId: string }>;
+    },
+  ): void {
+    const all = session.getAllMessages();
+    const tail = getTailChunkByUserTurns(
+      all,
+      opts?.tailTurns ?? RESTORE_TAIL_TURNS,
+    );
+    this.postMessage({
+      type: "agentSessionLoaded",
+      sessionId: session.id,
+      title: session.title,
+      mode: session.mode,
+      messages: tail.chunk,
+      lastInputTokens: session.lastInputTokens,
+      // lastOutputTokens is the per-last-request output count used for
+      // context bar display. We don't persist this value, so send 0 for
+      // loaded sessions to avoid displaying stale cumulative totals.
+      lastOutputTokens: 0,
+      restored: opts?.restored,
+      checkpoints: opts?.checkpoints,
+      userTurnOffset: tail.userTurnOffset,
+      hasMoreBefore: tail.hasMoreBefore,
+    });
+
+    if (!tail.hasMoreBefore) return;
+
+    const prefix = all.slice(0, all.length - tail.chunk.length);
+    const chunks = getBackfillChunksByUserTurns(
+      prefix,
+      opts?.backfillBatchTurns ?? RESTORE_BACKFILL_BATCH_TURNS,
+    );
+    const checkpoints = opts?.checkpoints;
+    for (const chunk of chunks) {
+      this.postMessage({
+        type: "agentSessionChunk",
+        sessionId: session.id,
+        messages: chunk.messages,
+        userTurnOffset: chunk.userTurnOffset,
+        hasMoreBefore: chunk.hasMoreBefore,
+        checkpoints,
+      });
+    }
   }
 
   private getHtml(): string {

@@ -561,6 +561,120 @@ describe("webview App reducer background agent launch blocks", () => {
     ]);
   });
 
+  it("restores persisted background tool calls into bg_agent and bg_agent_result blocks", async () => {
+    const { agentMessagesToChatMessages } = await import("./App");
+
+    const bgSessionId = "bg-session-restore";
+    const task = "Review implementation";
+    const message = "Review the patch and report correctness issues.";
+    const resultText = "Looks good overall. I found one edge case to fix.";
+
+    const restored = agentMessagesToChatMessages([
+      { role: "user", content: "run a background review" },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "bg-spawn-tool",
+            name: "spawn_background_agent",
+            input: { task, message },
+          },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "bg-spawn-tool",
+            content: JSON.stringify({
+              sessionId: bgSessionId,
+              resolvedMode: "review",
+              resolvedProvider: "openai",
+              resolvedModel: "gpt-5.3-codex",
+              taskClass: "review_code",
+              routingReason: "taskClass policy",
+            }),
+          },
+        ],
+      },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "bg-result-tool",
+            name: "get_background_result",
+            input: { sessionId: bgSessionId },
+          },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "bg-result-tool",
+            content: resultText,
+          },
+        ],
+      },
+    ] as unknown[]);
+
+    expect(restored).toHaveLength(3);
+    expect(restored[0]?.role).toBe("user");
+
+    expect(restored[1]?.role).toBe("assistant");
+    expect(restored[1]?.blocks).toEqual([
+      {
+        type: "tool_call",
+        id: "bg-spawn-tool",
+        name: "spawn_background_agent",
+        inputJson: JSON.stringify({ task, message }),
+        result: JSON.stringify({
+          sessionId: bgSessionId,
+          resolvedMode: "review",
+          resolvedProvider: "openai",
+          resolvedModel: "gpt-5.3-codex",
+          taskClass: "review_code",
+          routingReason: "taskClass policy",
+        }),
+        complete: true,
+      },
+      {
+        type: "bg_agent",
+        sessionId: bgSessionId,
+        task,
+        message,
+        resolvedMode: "review",
+        resolvedProvider: "openai",
+        resolvedModel: "gpt-5.3-codex",
+        taskClass: "review_code",
+        routingReason: "taskClass policy",
+      },
+    ]);
+
+    expect(restored[2]?.role).toBe("assistant");
+    expect(restored[2]?.blocks).toEqual([
+      {
+        type: "tool_call",
+        id: "bg-result-tool",
+        name: "get_background_result",
+        inputJson: JSON.stringify({ sessionId: bgSessionId }),
+        result: resultText,
+        complete: true,
+      },
+      {
+        type: "bg_agent_result",
+        sessionId: bgSessionId,
+        task,
+        status: "completed",
+        resultText,
+      },
+    ]);
+  });
+
   it("restores persisted runtime errors on assistant messages with retry metadata", async () => {
     const { agentMessagesToChatMessages } = await import("./App");
 
@@ -676,5 +790,54 @@ describe("webview App reducer background agent launch blocks", () => {
       code: "oauth_usage_limit_exhausted",
       actions: { signInAnotherAccount: true },
     });
+  });
+
+  it("stores and clears detected question fallback state", () => {
+    const detected = {
+      messageId: "assistant-1",
+      kind: "yes_no" as const,
+      prompt: "Proceed?",
+      options: [
+        { label: "Yes", payload: "Yes" },
+        { label: "No", payload: "No" },
+      ],
+    };
+
+    let state = reducer(initialState, {
+      type: "SET_DETECTED_QUESTION",
+      detectedQuestion: detected,
+    });
+    expect(state.detectedQuestion).toEqual(detected);
+
+    state = reducer(state, {
+      type: "DISMISS_DETECTED_QUESTION",
+      messageId: "assistant-1",
+    });
+    expect(state.detectedQuestion).toBeNull();
+    expect(state.dismissedDetectedQuestionIds).toContain("assistant-1");
+  });
+
+  it("resets detected question state on NEW_SESSION", () => {
+    let state = reducer(initialState, {
+      type: "SET_DETECTED_QUESTION",
+      detectedQuestion: {
+        messageId: "assistant-2",
+        kind: "yes_no",
+        prompt: "Proceed?",
+        options: [
+          { label: "Yes", payload: "Yes" },
+          { label: "No", payload: "No" },
+        ],
+      },
+    });
+
+    state = reducer(state, {
+      type: "DISMISS_DETECTED_QUESTION",
+      messageId: "assistant-2",
+    });
+
+    state = reducer(state, { type: "NEW_SESSION" });
+    expect(state.detectedQuestion).toBeNull();
+    expect(state.dismissedDetectedQuestionIds).toEqual([]);
   });
 });

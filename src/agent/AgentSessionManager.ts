@@ -22,11 +22,13 @@ import {
 } from "./CheckpointManager.js";
 import { providerRegistry } from "./providers/index.js";
 import { resolveBackgroundRoute } from "./backgroundModelRouter.js";
+import { CODEX_CONDENSE_MODEL_FALLBACKS } from "./providers/codex/models.js";
 import {
   getConfiguredBaseThresholdForModel,
   getEffectiveAutoCondenseThreshold,
 } from "./modelCondenseThresholds.js";
 import { resolveModelForMode } from "./modeModelPreferences.js";
+import { summarizeTextForPreview } from "../shared/textSummary.js";
 import type {
   SpawnBackgroundRequest,
   SpawnBackgroundResult,
@@ -60,6 +62,8 @@ export class AgentSessionManager {
   private bgCompletedAt = new Map<string, number>();
   /** Error messages for background sessions. */
   private bgErrors = new Map<string, string>();
+  /** Human-friendly status detail (e.g. active file path) per background session. */
+  private bgStatusDetail = new Map<string, string>();
   /** Set of bg session IDs that were explicitly cancelled by the user. */
   private bgCancelled = new Set<string>();
   /** Foreground session that launched each background session. */
@@ -84,6 +88,25 @@ export class AgentSessionManager {
       fallbackUsed: boolean;
       toolCalls: number;
       tokenUsage: number;
+    }
+  >();
+  /** Current heuristic phase bucket per background session. */
+  private bgPhase = new Map<string, string>();
+  /** Background summary state keyed by session id. */
+  private bgSummary = new Map<
+    string,
+    {
+      inFlight: boolean;
+      generatedAt?: number;
+      sourceModel?: string;
+      fallbackUsed?: boolean;
+      confidence?: number;
+      shortStatus?: string;
+      lastAttemptAt?: number;
+      lastFailureAt?: number;
+      lastFailureReason?: string;
+      lastInputHash?: string;
+      needsRefresh: boolean;
     }
   >();
 
@@ -1393,6 +1416,19 @@ export class AgentSessionManager {
           if (event.type === "text_delta") {
             this.appendBgStreamingText(session.id, event.text);
           }
+          if (event.type === "tool_start") {
+            // Clear stale detail from previous tool runs.
+            this.bgStatusDetail.delete(session.id);
+          }
+          if (event.type === "tool_result") {
+            const detail = this.extractToolStatusDetail(
+              event.toolName,
+              event.input,
+            );
+            if (detail) {
+              this.bgStatusDetail.set(session.id, detail);
+            }
+          }
 
           // Track tool calls and token usage for observability
           const meta = this.bgMeta.get(session.id);
@@ -1404,6 +1440,25 @@ export class AgentSessionManager {
               meta.tokenUsage += event.uncachedInputTokens + event.outputTokens;
             }
           }
+
+          const isCancelled = this.bgCancelled.has(session.id);
+          const status =
+            isCancelled && session.status === "idle"
+              ? "cancelled"
+              : (session.status as BgSessionInfo["status"]);
+          this.maybeScheduleBgSummary({
+            sessionId: session.id,
+            event,
+            status,
+            currentTool: session.currentTool,
+            streamingText: this.bgStreamingText.get(session.id),
+            resultText:
+              session.status === "idle" || session.status === "error"
+                ? session.getLastAssistantText()
+                : undefined,
+            errorMessage: this.bgErrors.get(session.id),
+            statusDetail: this.bgStatusDetail.get(session.id),
+          });
 
           this.onEvent?.(session.id, event);
         }
@@ -1423,6 +1478,9 @@ export class AgentSessionManager {
         clearInterval(inFlightPersistTimer);
         persistIfHistoryChanged();
       }
+
+      // Clear transient status detail once the run has finished.
+      this.bgStatusDetail.delete(session.id);
 
       // Mark completion time for auto-dismiss
       this.markBgCompleted(session.id);
@@ -1470,6 +1528,520 @@ export class AgentSessionManager {
     };
   }
 
+  private normalizeBgStatusPhrase(status: string): string {
+    const raw = status.trim();
+    if (!raw) return "";
+
+    const normalized = raw
+      .toLowerCase()
+      .replace(/[_-]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    const directMap: Record<string, string> = {
+      "streaming active": "Thinking…",
+      streaming: "Thinking…",
+      "streaming thinking": "Thinking…",
+      "streaming file analysis": "Reviewing code",
+      "streaming file list": "Scanning files",
+      "file analysis": "Reviewing code",
+      "file list": "Scanning files",
+      analysis: "Reviewing code",
+      reviewing: "Reviewing code",
+      "tool call": "Running tool",
+      "tool calls": "Running tools",
+      "tool execution": "Running tool",
+      executing: "Running tool",
+      done: "Done",
+      complete: "Done",
+      completed: "Done",
+      finished: "Done",
+      cancel: "Cancelled",
+      cancelled: "Cancelled",
+      canceled: "Cancelled",
+      error: "Error",
+      failed: "Error",
+      waiting: "Awaiting input",
+      "awaiting approval": "Awaiting approval",
+      approval: "Awaiting approval",
+    };
+
+    if (directMap[normalized]) return directMap[normalized];
+
+    if (normalized.startsWith("streaming ")) {
+      const rest = normalized.replace(/^streaming\s+/, "");
+      if (rest.includes("file") && rest.includes("analysis")) {
+        return "Reviewing code";
+      }
+      if (rest.includes("file") && rest.includes("list")) {
+        return "Scanning files";
+      }
+      if (rest.includes("tool")) {
+        return "Running tool";
+      }
+      if (
+        rest.includes("search") ||
+        rest.includes("inspect") ||
+        rest.includes("analy")
+      ) {
+        return "Reviewing code";
+      }
+      return "Thinking…";
+    }
+
+    // Lightweight humanization fallback: Title Case with compact spacing.
+    return normalized
+      .split(" ")
+      .map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w))
+      .join(" ");
+  }
+
+  private extractToolStatusDetail(toolName: string, input?: unknown): string {
+    if (!input || typeof input !== "object") return "";
+
+    const tool = toolName.toLowerCase();
+    const obj = input as Record<string, unknown>;
+    const pathVal = typeof obj.path === "string" ? obj.path.trim() : "";
+
+    if (!pathVal) return "";
+
+    const compactPath =
+      pathVal.length > 60 ? `…${pathVal.slice(-57)}` : pathVal;
+
+    if (tool.includes("read_file")) return `Reading ${compactPath}`;
+    if (tool.includes("search_files")) return `Searching ${compactPath}`;
+    if (tool.includes("write_file")) return `Writing ${compactPath}`;
+    if (tool.includes("find_and_replace")) return `Editing ${compactPath}`;
+    if (tool.includes("rename_symbol")) return `Renaming in ${compactPath}`;
+
+    return "";
+  }
+
+  private inferBgDisplayStatus(args: {
+    status: BgSessionInfo["status"];
+    currentTool?: string;
+    streamingText?: string;
+    resultText?: string;
+    errorMessage?: string;
+    statusDetail?: string;
+  }): string {
+    const tool = (args.currentTool ?? "").toLowerCase();
+    const textWindow = [args.streamingText, args.resultText]
+      .filter((v): v is string => typeof v === "string" && v.trim().length > 0)
+      .join("\n")
+      .toLowerCase()
+      .slice(-700);
+
+    if (args.status === "awaiting_approval") return "Awaiting approval";
+    if (args.status === "idle") return "Done";
+    if (args.status === "cancelled") return "Cancelled";
+    if (args.status === "error") {
+      if (args.errorMessage?.trim()) return "Error";
+      return "Error";
+    }
+
+    if (args.statusDetail?.trim()) {
+      return args.statusDetail;
+    }
+
+    const isTestCommand =
+      tool.includes("execute_command") &&
+      /(\bnpm\s+test\b|\bpnpm\s+test\b|\byarn\s+test\b|\bvitest\b|\bjest\b|\blint\b|\btsc\b|\bbuild\b)/i.test(
+        textWindow,
+      );
+
+    if (
+      tool.includes("read_file") ||
+      tool.includes("search_files") ||
+      tool.includes("codebase_search") ||
+      tool.includes("list_files") ||
+      tool.includes("get_symbols") ||
+      tool.includes("get_references") ||
+      tool.includes("go_to_definition") ||
+      tool.includes("go_to_implementation") ||
+      tool.includes("get_type_hierarchy") ||
+      tool.includes("get_hover") ||
+      tool.includes("get_completions")
+    ) {
+      if (
+        /\bi found\b|\bfound the issue\b|\broot cause\b|\bproblem is\b/.test(
+          textWindow,
+        )
+      ) {
+        return "Issue found";
+      }
+      if (/\binspect\b|\binvestigat\w*\b|\banaly\w*\b/.test(textWindow)) {
+        return "Inspecting code";
+      }
+      return "Reading code";
+    }
+
+    if (
+      tool.includes("apply_diff") ||
+      tool.includes("write_file") ||
+      tool.includes("find_and_replace") ||
+      tool.includes("rename_symbol") ||
+      tool.includes("apply_code_action")
+    ) {
+      if (/\bapplied patch\b|\bupdated\b|\bpatched\b/.test(textWindow)) {
+        return "Patch applied";
+      }
+      return "Editing code";
+    }
+
+    if (tool.includes("execute_command")) {
+      if (
+        /\bre-ran tests\b|\ball tests pass\b|\btests pass\b|\bverified\b/.test(
+          textWindow,
+        )
+      ) {
+        return "Verifying fix";
+      }
+      return isTestCommand ? "Running tests" : "Running command";
+    }
+
+    if (tool.includes("ask_user")) return "Waiting input";
+
+    if (args.status === "tool_executing") {
+      if (/\bre-ran tests\b|\brerun\b|\btest\b/.test(textWindow)) {
+        return "Running tests";
+      }
+      if (/\bapplied patch\b|\bupdating\b|\bpatching\b/.test(textWindow)) {
+        return "Updating code";
+      }
+      if (/\bi found\b|\bfound the issue\b|\broot cause\b/.test(textWindow)) {
+        return "Issue found";
+      }
+      return "Running…";
+    }
+
+    if (
+      /\bneed confirmation\b|\bwaiting for\b|\bblocked on\b/.test(textWindow)
+    ) {
+      return "Awaiting input";
+    }
+    if (/\bnext i('|’)ll\b|\bi('|’)m going to\b|\binspect\b/.test(textWindow)) {
+      return "Inspecting code";
+    }
+    if (/\bi found\b|\bfound the issue\b|\broot cause\b/.test(textWindow)) {
+      return "Issue found";
+    }
+
+    return "Thinking…";
+  }
+
+  private getOrInitBgSummary(sessionId: string): {
+    inFlight: boolean;
+    generatedAt?: number;
+    sourceModel?: string;
+    fallbackUsed?: boolean;
+    confidence?: number;
+    shortStatus?: string;
+    lastAttemptAt?: number;
+    lastFailureAt?: number;
+    lastFailureReason?: string;
+    lastInputHash?: string;
+    needsRefresh: boolean;
+  } {
+    const existing = this.bgSummary.get(sessionId);
+    if (existing) return existing;
+    const init = {
+      inFlight: false,
+      needsRefresh: true,
+    };
+    this.bgSummary.set(sessionId, init);
+    return init;
+  }
+
+  private async tryRefreshBgSummary(args: {
+    sessionId: string;
+    trigger: "phase_change" | "important_tool" | "error" | "done";
+    status: BgSessionInfo["status"];
+    currentTool?: string;
+    streamingText?: string;
+    resultText?: string;
+    errorMessage?: string;
+  }): Promise<void> {
+    const summary = this.getOrInitBgSummary(args.sessionId);
+    const now = Date.now();
+    const cooldownMs = 10_000;
+
+    if (summary.inFlight) return;
+    if (summary.lastAttemptAt && now - summary.lastAttemptAt < cooldownMs)
+      return;
+
+    const contextText = [
+      `status=${args.status}`,
+      args.currentTool ? `tool=${args.currentTool}` : null,
+      args.errorMessage ? `error=${args.errorMessage}` : null,
+      args.streamingText ? `stream=${args.streamingText.slice(-500)}` : null,
+      args.resultText ? `result=${args.resultText.slice(0, 1000)}` : null,
+    ]
+      .filter((v): v is string => Boolean(v))
+      .join("\n");
+
+    const contextHash = `${args.status}|${args.currentTool ?? ""}|${contextText.slice(-400)}`;
+    if (summary.lastInputHash === contextHash && !summary.needsRefresh) return;
+
+    summary.inFlight = true;
+    summary.lastAttemptAt = now;
+    summary.lastInputHash = contextHash;
+    this.onSessionsChanged?.();
+
+    try {
+      const session = this.sessions.get(args.sessionId);
+      if (!session) return;
+
+      const provider = providerRegistry.tryResolveProvider(session.model);
+      if (!provider) {
+        summary.lastFailureAt = Date.now();
+        summary.lastFailureReason = `No provider for model ${session.model}`;
+        summary.needsRefresh = false;
+        return;
+      }
+
+      const modelCandidates =
+        provider.id === "codex"
+          ? ["gpt-5.4-mini", ...CODEX_CONDENSE_MODEL_FALLBACKS]
+          : [provider.condenseModel];
+      const uniqueModels = [...new Set(modelCandidates)];
+
+      let selectedModel: string | undefined;
+      let fallbackUsed = false;
+      let text = "";
+      let lastError = "";
+
+      const prompt = [
+        "Summarize the background agent's current state for a tiny UI status area.",
+        "Return ONLY JSON with shape:",
+        '{"status":"string","confidence":0.0}',
+        "Rules:",
+        "- status must be 1-3 words (hard max 5 words)",
+        "- concise, phase-oriented wording",
+        "- confidence between 0 and 1",
+      ].join("\n");
+
+      const userPayload = [
+        `Trigger: ${args.trigger}`,
+        `Context:\n${contextText}`,
+      ].join("\n\n");
+
+      for (let i = 0; i < uniqueModels.length; i++) {
+        const model = uniqueModels[i];
+        try {
+          const result = await provider.complete({
+            model,
+            systemPrompt: prompt,
+            messages: [{ role: "user", content: userPayload }],
+            maxTokens: 120,
+            temperature: 0,
+          });
+          selectedModel = model;
+          fallbackUsed = i > 0;
+          text = result.text;
+          break;
+        } catch (err) {
+          lastError = err instanceof Error ? err.message : String(err);
+        }
+      }
+
+      if (!selectedModel || !text.trim()) {
+        summary.lastFailureAt = Date.now();
+        summary.lastFailureReason =
+          lastError || "No model candidate produced a summary";
+        summary.needsRefresh = false;
+        return;
+      }
+
+      let shortStatus = "";
+      let confidence: number | undefined;
+      try {
+        const unfenced = text
+          .trim()
+          .replace(/^```(?:json)?\s*/i, "")
+          .replace(/\s*```$/, "")
+          .trim();
+        const parsed = JSON.parse(unfenced) as {
+          status?: unknown;
+          confidence?: unknown;
+        };
+        shortStatus =
+          typeof parsed.status === "string" ? parsed.status.trim() : "";
+        confidence =
+          typeof parsed.confidence === "number" ? parsed.confidence : undefined;
+      } catch {
+        shortStatus = "";
+      }
+
+      if (!shortStatus) {
+        summary.lastFailureAt = Date.now();
+        summary.lastFailureReason = "Summary response was not valid JSON";
+        summary.needsRefresh = false;
+        return;
+      }
+
+      const wordCount = shortStatus.split(/\s+/).filter(Boolean).length;
+      if (wordCount < 1 || wordCount > 5) {
+        summary.lastFailureAt = Date.now();
+        summary.lastFailureReason = "Summary status violated 1-5 word rule";
+        summary.needsRefresh = false;
+        return;
+      }
+
+      summary.shortStatus = shortStatus;
+      summary.confidence = confidence;
+      summary.generatedAt = Date.now();
+      summary.sourceModel = selectedModel;
+      summary.fallbackUsed = fallbackUsed;
+      summary.lastFailureReason = undefined;
+      summary.needsRefresh = false;
+    } finally {
+      summary.inFlight = false;
+      this.onSessionsChanged?.();
+    }
+  }
+
+  private maybeScheduleBgSummary(args: {
+    sessionId: string;
+    event: AgentEvent;
+    status: BgSessionInfo["status"];
+    currentTool?: string;
+    streamingText?: string;
+    resultText?: string;
+    errorMessage?: string;
+    statusDetail?: string;
+  }): void {
+    const nextPhase = this.inferBgDisplayStatus({
+      status: args.status,
+      currentTool: args.currentTool,
+      streamingText: args.streamingText,
+      resultText: args.resultText,
+      errorMessage: args.errorMessage,
+      statusDetail: args.statusDetail,
+    });
+
+    const prevPhase = this.bgPhase.get(args.sessionId);
+    if (prevPhase !== nextPhase) {
+      this.bgPhase.set(args.sessionId, nextPhase);
+      void this.tryRefreshBgSummary({
+        sessionId: args.sessionId,
+        trigger: "phase_change",
+        status: args.status,
+        currentTool: args.currentTool,
+        streamingText: args.streamingText,
+        resultText: args.resultText,
+        errorMessage: args.errorMessage,
+      });
+      return;
+    }
+
+    if (args.event.type === "tool_result") {
+      const name = args.event.toolName.toLowerCase();
+      const important =
+        name.includes("execute_command") ||
+        name.includes("apply_diff") ||
+        name.includes("write_file") ||
+        name.includes("ask_user");
+      if (important) {
+        void this.tryRefreshBgSummary({
+          sessionId: args.sessionId,
+          trigger: "important_tool",
+          status: args.status,
+          currentTool: args.currentTool,
+          streamingText: args.streamingText,
+          resultText: args.resultText,
+          errorMessage: args.errorMessage,
+        });
+      }
+      return;
+    }
+
+    if (args.event.type === "error") {
+      void this.tryRefreshBgSummary({
+        sessionId: args.sessionId,
+        trigger: "error",
+        status: args.status,
+        currentTool: args.currentTool,
+        streamingText: args.streamingText,
+        resultText: args.resultText,
+        errorMessage: args.errorMessage,
+      });
+      return;
+    }
+
+    if (args.event.type === "done") {
+      void this.tryRefreshBgSummary({
+        sessionId: args.sessionId,
+        trigger: "done",
+        status: args.status,
+        currentTool: args.currentTool,
+        streamingText: args.streamingText,
+        resultText: args.resultText,
+        errorMessage: args.errorMessage,
+      });
+    }
+  }
+
+  private pickBgDisplayStatus(args: {
+    status: BgSessionInfo["status"];
+    heuristicStatus: string;
+    summary: {
+      shortStatus?: string;
+      generatedAt?: number;
+      inFlight: boolean;
+    };
+  }): {
+    displayStatus: string;
+    displayStatusSource: "terminal" | "model" | "heuristic";
+  } {
+    if (args.status === "idle") {
+      return { displayStatus: "Done", displayStatusSource: "terminal" };
+    }
+    if (args.status === "error") {
+      return { displayStatus: "Error", displayStatusSource: "terminal" };
+    }
+    if (args.status === "cancelled") {
+      return { displayStatus: "Cancelled", displayStatusSource: "terminal" };
+    }
+
+    if (args.summary.shortStatus && args.summary.generatedAt) {
+      const ageMs = Date.now() - args.summary.generatedAt;
+      if (ageMs <= 60_000) {
+        const normalizedModelStatus = this.normalizeBgStatusPhrase(
+          args.summary.shortStatus,
+        );
+        const normalized = normalizedModelStatus.toLowerCase();
+
+        // Prevent false terminal labels before the underlying session is terminal.
+        const looksTerminal =
+          normalized === "done" ||
+          normalized === "cancelled" ||
+          normalized === "error";
+
+        const prefersHeuristicWhileToolActive =
+          normalized === "thinking…" &&
+          typeof args.heuristicStatus === "string" &&
+          args.heuristicStatus !== "Thinking…";
+
+        if (
+          !looksTerminal &&
+          normalizedModelStatus &&
+          !prefersHeuristicWhileToolActive
+        ) {
+          return {
+            displayStatus: normalizedModelStatus,
+            displayStatusSource: "model",
+          };
+        }
+      }
+    }
+
+    return {
+      displayStatus: args.heuristicStatus,
+      displayStatusSource: "heuristic",
+    };
+  }
+
   /**
    * Non-blocking status check for a background session.
    */
@@ -1480,14 +2052,32 @@ export class AgentSessionManager {
         status: "error",
         done: true,
         partialOutput: "Session not found",
+        displayStatus: "Error",
       };
     }
     const done = session.status === "idle" || session.status === "error";
+    const status = session.status as BgStatusResult["status"];
+    const heuristicStatus = this.inferBgDisplayStatus({
+      status: status as BgSessionInfo["status"],
+      currentTool: session.currentTool,
+      streamingText: this.bgStreamingText.get(sessionId),
+      resultText: done ? session.getLastAssistantText() : undefined,
+      errorMessage: this.bgErrors.get(sessionId),
+      statusDetail: this.bgStatusDetail.get(sessionId),
+    });
+    const summary = this.getOrInitBgSummary(sessionId);
+    const picked = this.pickBgDisplayStatus({
+      status: status as BgSessionInfo["status"],
+      heuristicStatus,
+      summary,
+    });
+
     return {
-      status: session.status as BgStatusResult["status"],
+      status,
       currentTool: session.currentTool,
       done,
       partialOutput: done ? session.getLastAssistantText() : undefined,
+      displayStatus: picked.displayStatus,
     };
   }
 
@@ -1566,6 +2156,23 @@ export class AgentSessionManager {
     this.bgCompletedAt.set(sessionId, Date.now());
   }
 
+  getBackgroundResultSummary(sessionId: string): string | undefined {
+    const summary = this.bgSummary.get(sessionId)?.shortStatus?.trim();
+    if (summary) return summary;
+
+    const session = this.sessions.get(sessionId);
+    if (!session) return undefined;
+
+    const isCancelled = this.bgCancelled.has(sessionId);
+    if (isCancelled) return "Cancelled";
+    if (session.status === "error") return "Error";
+
+    return summarizeTextForPreview(session.getLastAssistantText(), {
+      maxLength: 220,
+      minSentenceLength: 20,
+    });
+  }
+
   private async resumeParentAfterBackgroundCompletion(
     bgSessionId: string,
     resultText: string,
@@ -1585,7 +2192,7 @@ export class AgentSessionManager {
         session.id,
         [
           `The background agent for "${parent.task}" has returned while you were stopped.`,
-          "Resume now: summarize the background result for the user and continue the task if more work is needed.",
+          "Resume now using the included <background_result> content (do not call get_background_result unless you explicitly need to wait on another session).",
           "",
           `<background_result task="${parent.task}" sessionId="${bgSessionId}">`,
           resultText,
@@ -1617,22 +2224,53 @@ export class AgentSessionManager {
           status = "cancelled";
         }
         const meta = this.bgMeta.get(s.id);
+        const streamingText = this.bgStreamingText.get(s.id);
+        const resultText = isDone ? s.getLastAssistantText() : undefined;
+        const errorMessage = this.bgErrors.get(s.id);
+        const heuristicStatus = this.inferBgDisplayStatus({
+          status,
+          currentTool: s.currentTool,
+          streamingText,
+          resultText,
+          errorMessage,
+          statusDetail: this.bgStatusDetail.get(s.id),
+        });
+        const summary = this.getOrInitBgSummary(s.id);
+        const picked = this.pickBgDisplayStatus({
+          status,
+          heuristicStatus,
+          summary,
+        });
+
         return {
           id: s.id,
           task: s.title,
           status,
           currentTool: s.currentTool,
+          displayStatus: picked.displayStatus,
+          displayStatusSource: picked.displayStatusSource,
           resolvedMode: meta?.resolvedMode,
           resolvedModel: meta?.resolvedModel,
           resolvedProvider: meta?.resolvedProvider,
           taskClass: meta?.taskClass,
           routingReason: meta?.routingReason,
           fallbackUsed: meta?.fallbackUsed,
-          streamingText: this.bgStreamingText.get(s.id),
-          resultText: isDone ? s.getLastAssistantText() : undefined,
-          errorMessage: this.bgErrors.get(s.id),
+          streamingText,
+          resultText,
+          errorMessage,
           completedAt: this.bgCompletedAt.get(s.id),
           fullTranscript: isDone ? s.getFullAssistantTranscript() : undefined,
+          resultSummary: summary.shortStatus,
+          summaryMeta: {
+            inFlight: summary.inFlight,
+            generatedAt: summary.generatedAt,
+            sourceModel: summary.sourceModel,
+            fallbackUsed: summary.fallbackUsed,
+            confidence: summary.confidence,
+            lastAttemptAt: summary.lastAttemptAt,
+            lastFailureAt: summary.lastFailureAt,
+            lastFailureReason: summary.lastFailureReason,
+          },
         };
       });
   }

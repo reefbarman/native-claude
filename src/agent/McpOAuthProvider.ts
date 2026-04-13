@@ -14,7 +14,8 @@ export class McpOAuthError extends Error {
     public readonly kind:
       | "callback_timeout"
       | "callback_missing_code"
-      | "authorization_error",
+      | "authorization_error"
+      | "stale_client_redirect",
     message: string,
   ) {
     super(message);
@@ -30,7 +31,9 @@ function storageKey(serverName: string, suffix: string): string {
  * OAuthClientProvider implementation for MCP HTTP servers.
  *
  * Flow:
- * 1. `start()` binds a local HTTP server to get a dynamic port for the redirect URI.
+ * 1. `start()` binds a local HTTP server for the redirect URI, preferring the
+ *    previously registered localhost callback port when available and falling back
+ *    to an OS-assigned ephemeral port otherwise.
  * 2. When the MCP transport gets a 401, the SDK calls `auth()` which in turn calls
  *    `redirectToAuthorization()`.  Our async implementation opens a browser and
  *    awaits the OAuth callback before returning, so by the time it resolves the
@@ -94,17 +97,93 @@ export class McpOAuthProvider implements OAuthClientProvider {
     private readonly storage: vscode.Memento,
   ) {}
 
+  private preferredCallbackPort(
+    info: OAuthClientInformationMixed | undefined,
+  ): number | undefined {
+    const redirectUris = this.redirectUrisForClient(info);
+    if (!redirectUris) return undefined;
+
+    for (const redirectUri of redirectUris) {
+      try {
+        const parsed = new URL(redirectUri);
+        if (parsed.protocol !== "http:") continue;
+        if (
+          parsed.hostname !== "localhost" &&
+          parsed.hostname !== "127.0.0.1" &&
+          parsed.hostname !== "::1"
+        ) {
+          continue;
+        }
+
+        const port = Number(parsed.port);
+        if (!Number.isInteger(port) || port <= 0 || port > 65535) continue;
+        return port;
+      } catch {
+        // ignore malformed cached URIs
+      }
+    }
+
+    return undefined;
+  }
+
+  private async listenOnPort(port: number): Promise<void> {
+    if (!this._server) return;
+
+    await new Promise<void>((resolve, reject) => {
+      const server = this._server!;
+      const onError = (err: Error): void => {
+        server.off("listening", onListening);
+        reject(err);
+      };
+      const onListening = (): void => {
+        server.off("error", onError);
+        this._port = (server.address() as net.AddressInfo).port;
+        resolve();
+      };
+
+      server.once("error", onError);
+      server.once("listening", onListening);
+      server.listen(port, "localhost");
+    });
+  }
+
   /** Start the local callback HTTP server and capture the assigned port. */
   async start(): Promise<void> {
     if (this._server) return;
+
+    const clientInfo = this.storage.get<OAuthClientInformationMixed>(
+      storageKey(this.serverName, "client"),
+    );
+    const preferredPort = this.preferredCallbackPort(clientInfo);
+
     this._server = http.createServer();
-    await new Promise<void>((resolve, reject) => {
-      this._server!.listen(0, "localhost", () => {
-        this._port = (this._server!.address() as net.AddressInfo).port;
-        resolve();
-      });
-      this._server!.on("error", reject);
-    });
+
+    try {
+      if (preferredPort) {
+        try {
+          await this.listenOnPort(preferredPort);
+          this.onLog?.(
+            `[mcp:${this.serverName}] callback server bound to preferred cached redirect port ${preferredPort}`,
+          );
+          return;
+        } catch (err) {
+          const code = (err as NodeJS.ErrnoException | undefined)?.code;
+          this.onLog?.(
+            `[mcp:${this.serverName}] preferred cached redirect port ${preferredPort} unavailable (${code ?? "unknown"}); falling back to ephemeral callback port`,
+          );
+        }
+      }
+
+      await this.listenOnPort(0);
+      this.onLog?.(
+        `[mcp:${this.serverName}] callback server bound to port ${this._port}${preferredPort ? ` (fallback from preferred ${preferredPort})` : ""}`,
+      );
+    } catch (err) {
+      this._server?.close();
+      this._server = null;
+      this._port = 0;
+      throw err;
+    }
   }
 
   /** Stop the callback server. */
@@ -130,15 +209,27 @@ export class McpOAuthProvider implements OAuthClientProvider {
     };
   }
 
+  private redirectUrisForClient(
+    info: OAuthClientInformationMixed | undefined,
+  ): string[] | undefined {
+    return info && "redirect_uris" in info && Array.isArray(info.redirect_uris)
+      ? info.redirect_uris
+      : undefined;
+  }
+
+  private hasRedirectUriMismatch(
+    info: OAuthClientInformationMixed | undefined,
+  ): boolean {
+    const redirectUris = this.redirectUrisForClient(info);
+    return Boolean(redirectUris && !redirectUris.includes(this.redirectUrl));
+  }
+
   async clientInformation(): Promise<OAuthClientInformationMixed | undefined> {
     const info = this.storage.get<OAuthClientInformationMixed>(
       storageKey(this.serverName, "client"),
     );
 
-    const redirectUris =
-      info && "redirect_uris" in info && Array.isArray(info.redirect_uris)
-        ? info.redirect_uris
-        : undefined;
+    const redirectUris = this.redirectUrisForClient(info);
     if (redirectUris && !redirectUris.includes(this.redirectUrl)) {
       this.onLog?.(
         `[mcp:${this.serverName}] cached client redirect URIs do not include current redirectUrl; keeping cached client to allow refresh-token flow first current=${this.redirectUrl} cached=${JSON.stringify(redirectUris)}`,
@@ -248,6 +339,17 @@ export class McpOAuthProvider implements OAuthClientProvider {
     } else if (hasSavedTokens) {
       this.onLog?.(
         `[mcp:${this.serverName}] falling back to interactive OAuth with saved tokens but no refresh token available. client=${this.clientSummary(clientInfo)} tokens=${this.tokenSummary(existingTokens)}`,
+      );
+    }
+
+    const hasClientRedirectMismatch = this.hasRedirectUriMismatch(clientInfo);
+    if (hasClientRedirectMismatch) {
+      this.onLog?.(
+        `[mcp:${this.serverName}] stale oauth client registration detected before interactive auth; cached redirect URIs do not include active redirect. request retry with fresh client registration. current=${this.redirectUrl} client=${this.clientSummary(clientInfo)}`,
+      );
+      throw new McpOAuthError(
+        "stale_client_redirect",
+        `OAuth client registration for "${this.serverName}" does not match the active redirect URI`,
       );
     }
 

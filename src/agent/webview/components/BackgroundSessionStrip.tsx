@@ -12,6 +12,8 @@ export interface BgSessionInfoProps {
     | "cancelled"
     | "pending";
   currentTool?: string;
+  displayStatus?: string;
+  displayStatusSource?: "terminal" | "model" | "heuristic";
   resolvedMode?: string;
   resolvedModel?: string;
   resolvedProvider?: string;
@@ -20,9 +22,20 @@ export interface BgSessionInfoProps {
   fallbackUsed?: boolean;
   streamingText?: string;
   resultText?: string;
+  resultSummary?: string;
   errorMessage?: string;
   completedAt?: number;
   fullTranscript?: string;
+  summaryMeta?: {
+    inFlight: boolean;
+    generatedAt?: number;
+    sourceModel?: string;
+    fallbackUsed?: boolean;
+    confidence?: number;
+    lastAttemptAt?: number;
+    lastFailureAt?: number;
+    lastFailureReason?: string;
+  };
 }
 
 interface Props {
@@ -65,14 +78,15 @@ function statusIcon(status: BgSessionInfoProps["status"]): string {
 function statusText(
   status: BgSessionInfoProps["status"],
   currentTool?: string,
+  displayStatus?: string,
 ): string {
   switch (status) {
     case "pending":
       return "Starting…";
     case "streaming":
-      return currentTool ? currentTool : "Thinking…";
+      return displayStatus ?? (currentTool ? currentTool : "Thinking…");
     case "tool_executing":
-      return currentTool ? currentTool : "Running…";
+      return displayStatus ?? (currentTool ? currentTool : "Running…");
     case "awaiting_approval":
       return "Awaiting approval";
     case "idle":
@@ -202,9 +216,32 @@ export function BackgroundSessionStrip({
               </span>
               <span
                 class="bg-session-status"
-                title={statusText(s.status, s.currentTool)}
+                title={[
+                  statusText(s.status, s.currentTool, s.displayStatus),
+                  s.displayStatusSource
+                    ? `source: ${s.displayStatusSource}`
+                    : null,
+                  s.summaryMeta?.sourceModel
+                    ? `model: ${s.summaryMeta.sourceModel}`
+                    : null,
+                  s.summaryMeta?.generatedAt
+                    ? `age: ${Math.max(0, Math.round((Date.now() - s.summaryMeta.generatedAt) / 1000))}s`
+                    : null,
+                  s.summaryMeta?.lastFailureReason
+                    ? `last error: ${s.summaryMeta.lastFailureReason}`
+                    : null,
+                ]
+                  .filter((v): v is string => Boolean(v))
+                  .join("\n")}
               >
-                {statusText(s.status, s.currentTool)}
+                {statusText(s.status, s.currentTool, s.displayStatus)}
+                {s.summaryMeta?.inFlight && (
+                  <i
+                    class="codicon codicon-sync codicon-modifier-spin"
+                    style="margin-left:6px; opacity:0.8;"
+                    title="Refreshing summary"
+                  />
+                )}
               </span>
               {ACTIVE_STATUSES.has(s.status) && startedAt.has(s.id) && (
                 <span class="bg-session-timer">

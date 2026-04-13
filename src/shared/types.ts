@@ -95,6 +95,10 @@ export interface BgSessionInfo {
     | "cancelled";
   /** Most recently started tool name (while streaming). */
   currentTool?: string;
+  /** UI-ready status label selected from terminal/model/heuristic layers. */
+  displayStatus?: string;
+  /** Source for displayStatus selection. */
+  displayStatusSource?: "terminal" | "model" | "heuristic";
   /** Resolved execution mode after route selection. */
   resolvedMode?: string;
   /** Resolved model id after route selection. */
@@ -117,4 +121,17 @@ export interface BgSessionInfo {
   completedAt?: number;
   /** Full transcript of the bg agent conversation (all assistant text blocks). */
   fullTranscript?: string;
+  /** Concise summary for collapsed completion/result rendering. */
+  resultSummary?: string;
+  /** Model-summary metadata for strip/debug surfaces. */
+  summaryMeta?: {
+    inFlight: boolean;
+    generatedAt?: number;
+    sourceModel?: string;
+    fallbackUsed?: boolean;
+    confidence?: number;
+    lastAttemptAt?: number;
+    lastFailureAt?: number;
+    lastFailureReason?: string;
+  };
 }

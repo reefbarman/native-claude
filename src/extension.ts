@@ -939,6 +939,7 @@ export function activate(context: vscode.ExtensionContext): void {
         approvalManager.clearSession(s.id);
       }
       approvalManager.resetWriteApproval();
+      approvalManager.resetAgentWriteApproval();
       vscode.window.showInformationMessage("All session approvals cleared.");
     }),
     vscode.commands.registerCommand("agentlink.setOpenaiApiKey", async () => {

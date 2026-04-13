@@ -91,6 +91,7 @@ export class McpClientHub {
   private oauthDialogOpenCounts = new Map<string, number>();
   private invalidRedirectRecoveryAttempted = new Set<string>();
   private manualReauthRequired = new Set<string>();
+  private runtimeReconnectPending = new Set<string>();
   private static readonly MAX_AUTH_RETRIES = 3;
 
   constructor(globalState?: vscode.Memento) {
@@ -433,6 +434,7 @@ export class McpClientHub {
       this.oauthDialogOpenCounts.delete(cfg.name);
       this.invalidRedirectRecoveryAttempted.delete(cfg.name);
       this.manualReauthRequired.delete(cfg.name);
+      this.runtimeReconnectPending.delete(cfg.name);
 
       // Fetch tools, resources, prompts in parallel
       const [toolsResult, resourcesResult, promptsResult] = await Promise.all([
@@ -488,28 +490,31 @@ export class McpClientHub {
         );
 
         const isUnauthorized = normalizedErr === "unauthorized";
-        const isInvalidRedirectUri = normalizedErr.includes(
-          "invalid redirect uri",
-        );
+        const isStaleClientRedirect =
+          err instanceof McpOAuthError && err.kind === "stale_client_redirect";
+        const isInvalidRedirectUri =
+          this.isRedirectMismatchMessage(normalizedErr);
         if (
-          isInvalidRedirectUri &&
+          (isStaleClientRedirect || isInvalidRedirectUri) &&
           !this.invalidRedirectRecoveryAttempted.has(cfg.name)
         ) {
           this.invalidRedirectRecoveryAttempted.add(cfg.name);
           this.log(
-            `[mcp:${cfg.name}] attempting one-time recovery for invalid redirect URI by clearing cached oauth credentials`,
+            `[mcp:${cfg.name}] attempting one-time recovery for stale/invalid redirect URI by clearing cached oauth client registration`,
           );
           try {
-            await oauthProvider?.invalidateCredentials("all");
+            await oauthProvider?.invalidateCredentials("client");
           } catch (invalidateErr) {
             this.log(
-              `[mcp:${cfg.name}] failed to clear oauth credentials during invalid redirect recovery: ${invalidateErr}`,
+              `[mcp:${cfg.name}] failed to clear oauth client registration during redirect recovery: ${invalidateErr}`,
             );
           }
+          this.oauthDialogOpenCounts.delete(cfg.name);
+          this.authFailureCounts.delete(cfg.name);
           entry.status = "error";
-          entry.error = `Authentication did not succeed for '${cfg.name}' (invalid redirect URI). Retrying once with fresh OAuth client registration…`;
+          entry.error = `Authentication did not succeed for '${cfg.name}' (redirect URI/client registration mismatch). Retrying once with fresh OAuth client registration…`;
           void vscode.window.showWarningMessage(
-            `AgentLink: Authentication did not succeed for '${cfg.name}' (invalid redirect URI). Retrying once with fresh OAuth client registration…`,
+            `AgentLink: Authentication did not succeed for '${cfg.name}' (redirect URI/client registration mismatch). Retrying once with fresh OAuth client registration…`,
           );
           this.scheduleReconnect(cfg, retryCount + 1, "auth-failure");
           this.onStatusChange?.(this.getServerInfos());
@@ -598,6 +603,15 @@ export class McpClientHub {
     this.onStatusChange?.(this.getServerInfos());
   }
 
+  private isRedirectMismatchMessage(normalizedMessage: string): boolean {
+    return (
+      normalizedMessage.includes("invalid redirect uri") ||
+      normalizedMessage.includes("redirect_uri_mismatch") ||
+      normalizedMessage.includes("does not match the active redirect uri") ||
+      normalizedMessage.includes("redirect uri/client registration mismatch")
+    );
+  }
+
   private isAuthFailureError(err: unknown): boolean {
     if (err instanceof UnauthorizedError) return true;
     if (err instanceof McpOAuthError) return true;
@@ -607,8 +621,114 @@ export class McpClientHub {
       normalized.includes("oauth timeout waiting for callback") ||
       normalized.includes("did not include an authorization code") ||
       normalized.includes("oauth authorization failed") ||
-      normalized.includes("invalid redirect uri")
+      this.isRedirectMismatchMessage(normalized)
     );
+  }
+
+  private triggerRuntimeReconnect(cfg: McpServerConfig): void {
+    if (this.runtimeReconnectPending.has(cfg.name)) {
+      this.log(
+        `[mcp:${cfg.name}] runtime auth recovery reconnect already pending; skipping duplicate trigger`,
+      );
+      return;
+    }
+
+    this.runtimeReconnectPending.add(cfg.name);
+    this.log(
+      `[mcp:${cfg.name}] runtime auth recovery scheduling immediate reconnect`,
+    );
+    void (async () => {
+      try {
+        await this.disconnectServer(cfg.name);
+        await this.connectServer(cfg, 0);
+      } catch (reconnectErr) {
+        this.log(
+          `[mcp:${cfg.name}] runtime auth recovery reconnect failed: ${this.describeError(reconnectErr)}`,
+        );
+      } finally {
+        this.runtimeReconnectPending.delete(cfg.name);
+        this.onStatusChange?.(this.getServerInfos());
+      }
+    })();
+  }
+
+  private async handleRuntimeAuthFailure(
+    serverName: string,
+    err: unknown,
+  ): Promise<string> {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    const entry = this.servers.get(serverName);
+    if (!entry) return errMsg;
+
+    const normalizedErr = errMsg.toLowerCase();
+    if (!this.isAuthFailureError(err)) {
+      return errMsg;
+    }
+
+    const isStaleClientRedirect =
+      err instanceof McpOAuthError && err.kind === "stale_client_redirect";
+    const isInvalidRedirectUri = this.isRedirectMismatchMessage(normalizedErr);
+
+    if (
+      (isStaleClientRedirect || isInvalidRedirectUri) &&
+      !this.invalidRedirectRecoveryAttempted.has(serverName)
+    ) {
+      this.invalidRedirectRecoveryAttempted.add(serverName);
+      this.log(
+        `[mcp:${serverName}] runtime auth failure indicates stale/invalid redirect URI; clearing cached oauth client registration and reconnecting`,
+      );
+      try {
+        await this.oauthProviders
+          .get(serverName)
+          ?.invalidateCredentials("client");
+      } catch (invalidateErr) {
+        this.log(
+          `[mcp:${serverName}] failed to clear oauth client registration during runtime redirect recovery: ${invalidateErr}`,
+        );
+      }
+
+      this.oauthDialogOpenCounts.delete(serverName);
+      this.authFailureCounts.delete(serverName);
+      entry.status = "error";
+      entry.error = `Authentication did not succeed for '${serverName}' (redirect URI/client registration mismatch). Retrying once with fresh OAuth client registration…`;
+      this.onStatusChange?.(this.getServerInfos());
+      this.triggerRuntimeReconnect(entry.config);
+      return entry.error;
+    }
+
+    const wasUserCancel =
+      normalizedErr.includes("access_denied") ||
+      normalizedErr.includes("cancel");
+    const isManualReauthBlocked =
+      normalizedErr.includes("manual reauthentication required") ||
+      normalizedErr.includes("authorization blocked");
+
+    if (isManualReauthBlocked || wasUserCancel) {
+      const reason = isManualReauthBlocked
+        ? "Authentication is in manual reauthenticate mode"
+        : "Authentication was cancelled by the user";
+      const message = `${reason} for '${serverName}'. Use Reauthenticate to try again.`;
+      entry.status = "error";
+      entry.error = message;
+      this.authFailureCounts.delete(serverName);
+      this.oauthDialogOpenCounts.delete(serverName);
+      this.manualReauthRequired.add(serverName);
+      this.onStatusChange?.(this.getServerInfos());
+      void vscode.window.showErrorMessage(`AgentLink: ${message}`);
+      this.log(`[mcp:${serverName}] ${message}`);
+      return message;
+    }
+
+    const message = `Authentication did not succeed for '${serverName}'. Reconnecting automatically…`;
+    entry.status = "error";
+    entry.error = message;
+    this.authFailureCounts.delete(serverName);
+    this.oauthDialogOpenCounts.delete(serverName);
+    this.onStatusChange?.(this.getServerInfos());
+    void vscode.window.showWarningMessage(`AgentLink: ${message}`);
+    this.log(`[mcp:${serverName}] ${message}`);
+    this.triggerRuntimeReconnect(entry.config);
+    return message;
   }
 
   private scheduleReconnect(
@@ -688,6 +808,7 @@ export class McpClientHub {
   private async disconnectServer(name: string): Promise<void> {
     const entry = this.servers.get(name);
     if (!entry) return;
+    this.runtimeReconnectPending.delete(name);
     if (entry.retryTimer) clearTimeout(entry.retryTimer);
     entry.status = "disconnected";
     try {
@@ -730,6 +851,7 @@ export class McpClientHub {
     this.oauthDialogOpenCounts.delete(name);
     this.invalidRedirectRecoveryAttempted.delete(name);
     this.manualReauthRequired.delete(name);
+    this.runtimeReconnectPending.delete(name);
     await this.disconnectServer(name);
     await this.connectServer(cfg, 0);
     this.onStatusChange?.(this.getServerInfos());
@@ -745,6 +867,7 @@ export class McpClientHub {
     this.oauthDialogOpenCounts.delete(name);
     this.invalidRedirectRecoveryAttempted.delete(name);
     this.manualReauthRequired.delete(name);
+    this.runtimeReconnectPending.delete(name);
     await this.disconnectServer(name);
 
     const isHttpServer =
@@ -764,14 +887,23 @@ export class McpClientHub {
       await provider.start();
       try {
         await provider.forceReauth();
-      } finally {
+      } catch (err) {
         provider.stop();
+        throw err;
       }
-      // Store it so connectServer reuses it (and skips creating another)
+      // Keep the callback server alive for the immediate reconnect handoff.
+      // connectServer reuses this provider and avoids callback redirectUrl churn.
       this.oauthProviders.set(cfg.name, provider);
     }
 
-    await this.connectServer(cfg, 0);
+    try {
+      await this.connectServer(cfg, 0);
+    } finally {
+      const current = this.servers.get(cfg.name);
+      if (!current || current.status !== "connected") {
+        this.oauthProviders.get(cfg.name)?.stop();
+      }
+    }
     this.onStatusChange?.(this.getServerInfos());
   }
 
@@ -932,7 +1064,7 @@ export class McpClientHub {
 
       return { content: mapped };
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = await this.handleRuntimeAuthFailure(serverName, err);
       return {
         content: [{ type: "text", text: JSON.stringify({ error: msg }) }],
       };
@@ -974,7 +1106,7 @@ export class McpClientHub {
       }
       return { content: parts.length ? parts : [{ type: "text", text: "" }] };
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = await this.handleRuntimeAuthFailure(serverName, err);
       return {
         content: [{ type: "text", text: JSON.stringify({ error: msg }) }],
       };
@@ -1016,7 +1148,7 @@ export class McpClientHub {
         .join("\n\n");
       return { content: [{ type: "text", text: text || "" }] };
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = await this.handleRuntimeAuthFailure(serverName, err);
       return {
         content: [{ type: "text", text: JSON.stringify({ error: msg }) }],
       };

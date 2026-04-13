@@ -19,14 +19,15 @@ interface BgAgentBlockProps {
 function statusLabel(
   status: BgSessionInfoProps["status"],
   currentTool?: string,
+  displayStatus?: string,
 ): string {
   switch (status) {
     case "pending":
       return "starting…";
     case "streaming":
-      return currentTool ? currentTool : "thinking…";
+      return displayStatus ?? (currentTool ? currentTool : "thinking…");
     case "tool_executing":
-      return currentTool ? currentTool : "executing…";
+      return displayStatus ?? (currentTool ? currentTool : "executing…");
     case "awaiting_approval":
       return "awaiting approval";
     case "idle":
@@ -105,7 +106,11 @@ export function BgAgentBlock({
         )}
         {isRunning && (
           <span class="bg-agent-current-tool">
-            {statusLabel(status, bgSession?.currentTool)}
+            {statusLabel(
+              status,
+              bgSession?.currentTool,
+              bgSession?.displayStatus,
+            )}
           </span>
         )}
         {isRunning && onStop && (

@@ -10,6 +10,8 @@ interface ContextBarProps {
   softThresholdBudget?: number;
   hardBudget?: number;
   condenseThreshold?: number;
+  /** Running estimate of total context usage (from engine, includes tool results added between API calls). */
+  estimatedTotalUsed?: number;
 }
 
 function formatTokens(n: number): string {
@@ -28,8 +30,11 @@ export function ContextBar({
   softThresholdBudget,
   hardBudget,
   condenseThreshold,
+  estimatedTotalUsed = 0,
 }: ContextBarProps) {
-  const used = inputTokens + outputTokens;
+  // Use the higher of: last API total vs running estimate (which includes
+  // tool results accumulated since the last API response).
+  const used = Math.max(inputTokens + outputTokens, estimatedTotalUsed);
   const reserved = Math.min(
     outputReservation,
     Math.max(0, maxContextWindow - used),

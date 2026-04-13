@@ -889,6 +889,7 @@ export class ApprovalManager {
   getActiveSessions(): Array<{
     id: string;
     writeApproved: boolean;
+    agentWriteApproved: boolean;
     commandRuleCount: number;
     pathRuleCount: number;
     writeRuleCount: number;
@@ -897,6 +898,7 @@ export class ApprovalManager {
     return Array.from(this.sessions.entries()).map(([id, s]) => ({
       id,
       writeApproved: s.writeApproved,
+      agentWriteApproved: s.agentWriteApproved,
       commandRuleCount: s.commandRules.length,
       pathRuleCount: (s.pathRules ?? []).length,
       writeRuleCount: (s.writeRules ?? []).length,

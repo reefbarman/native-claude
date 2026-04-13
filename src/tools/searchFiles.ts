@@ -1,10 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 
-import {
-  resolveAndValidatePath,
-  tryGetFirstWorkspaceRoot,
-} from "../util/paths.js";
+import { resolveAndValidatePath } from "../util/paths.js";
 import {
   getRipgrepBinPath,
   execRipgrepSearch,
@@ -59,6 +56,7 @@ export function needsPcre2(regex: string): boolean {
 
 /** Glob metacharacters that indicate a true glob pattern (not a literal file path). */
 const GLOB_META = /[*?[\]{}]/;
+const DEFAULT_EXCLUDE_GLOBS = ["!**/.git/**", "!**/node_modules/**"] as const;
 
 /**
  * Expand a simple single brace group in a glob pattern, e.g. `*.{ts,tsx}`.
@@ -88,6 +86,12 @@ export function expandSimpleBraceGlob(filePattern: string): string[] {
   }
 
   return options.map((option) => `${prefix}${option}${suffix}`);
+}
+
+function addDefaultExcludeGlobs(args: string[]): void {
+  for (const glob of DEFAULT_EXCLUDE_GLOBS) {
+    args.push("--glob", glob);
+  }
 }
 
 function addFilePatternArgs(
@@ -225,7 +229,6 @@ export async function handleSearchFiles(
 
     // Ripgrep regex search
     const rgPath = await getRipgrepBinPath();
-    const cwd = tryGetFirstWorkspaceRoot() ?? path.resolve(".");
 
     // --- files_with_matches mode ---
     if (outputMode === "files_with_matches") {
@@ -261,6 +264,8 @@ export async function handleSearchFiles(
       args.push("--pcre2");
     }
 
+    addDefaultExcludeGlobs(args);
+
     // Handle file_pattern: if it looks like a literal file path that exists,
     // use it as the search target instead of --glob to avoid glob matching issues.
     // Normalize simple brace globs like src/**/*.{ts,tsx} into multiple --glob args.
@@ -270,7 +275,7 @@ export async function handleSearchFiles(
 
     let output: string;
     try {
-      output = await execRipgrepSearch(rgPath, args);
+      output = await execRipgrepSearch(rgPath, args, { cwd: dirPath });
     } catch (error) {
       // Ripgrep error — may be invalid regex syntax etc.
       const message = error instanceof Error ? error.message : String(error);
@@ -306,7 +311,7 @@ export async function handleSearchFiles(
 
     const { results: fileResults, totalMatches } = parseRipgrepOutput(
       output,
-      cwd,
+      dirPath,
     );
 
     // Format output — keep ## file.ts + "> linenum | content" format
@@ -401,12 +406,13 @@ async function searchFilesOnly(
   if (params.multiline || needsMultiline(sanitized))
     args.push("--multiline", "--multiline-dotall");
   if (needsPcre2(sanitized)) args.push("--pcre2");
+  addDefaultExcludeGlobs(args);
   const searchTarget = addFilePatternArgs(args, dirPath, params.file_pattern);
   args.push(searchTarget);
 
   let output: string;
   try {
-    output = await execRipgrepSearch(rgPath, args);
+    output = await execRipgrepSearch(rgPath, args, { cwd: dirPath });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const hint = getEscapingHint(params.regex);
@@ -470,12 +476,13 @@ async function searchCount(
   if (params.multiline || needsMultiline(sanitized))
     args.push("--multiline", "--multiline-dotall");
   if (needsPcre2(sanitized)) args.push("--pcre2");
+  addDefaultExcludeGlobs(args);
   const searchTarget = addFilePatternArgs(args, dirPath, params.file_pattern);
   args.push(searchTarget);
 
   let output: string;
   try {
-    output = await execRipgrepSearch(rgPath, args);
+    output = await execRipgrepSearch(rgPath, args, { cwd: dirPath });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const hint = getEscapingHint(params.regex);

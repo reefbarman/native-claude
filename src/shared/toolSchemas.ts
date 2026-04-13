@@ -37,6 +37,30 @@ export const readFileSchema = {
     .describe(
       "Semantic search query to jump to the most relevant section of the file. Uses the codebase index to find the best matching code chunk and auto-sets the offset. Ignored if offset is explicitly provided. Requires codebase index.",
     ),
+  anchor: z
+    .string()
+    .optional()
+    .describe(
+      "Literal anchor text to locate in the file and jump near it. Ignored if offset is explicitly provided.",
+    ),
+  anchor_regex: z
+    .string()
+    .optional()
+    .describe(
+      "Regex anchor pattern to locate in the file and jump near it. Ignored if offset is explicitly provided.",
+    ),
+  anchor_offset: z.coerce
+    .number()
+    .optional()
+    .describe(
+      "Line offset applied after resolving anchor/semantic match (e.g. -20 to show context above).",
+    ),
+  auto_follow_suggestion: z
+    .boolean()
+    .optional()
+    .describe(
+      "When true, if path is not found and exactly one high-confidence suggestion exists, automatically read that suggested file and include resolution metadata.",
+    ),
 };
 
 export const loadSkillSchema = {
@@ -210,6 +234,13 @@ export const findAndReplaceSchema = {
     .describe(
       "Treat 'find' as a regular expression. Supports capture groups ($1, $2) in 'replace'. Default: false.",
     ),
+  max_replacements: z.coerce
+    .number()
+    .int()
+    .optional()
+    .describe(
+      "Maximum allowed matches to replace. Must be a positive integer. If total matches exceed this value, no edits are applied and the tool returns a guardrail error payload.",
+    ),
 };
 
 export const renameSymbolSchema = {
@@ -298,6 +329,12 @@ export const executeCommandSchema = {
     .optional()
     .describe(
       "Timeout in seconds. Always set one for quick commands; omit it only when you intentionally want to wait indefinitely.",
+    ),
+  env: z
+    .record(z.string(), z.string())
+    .optional()
+    .describe(
+      'Environment variables to set for this command (e.g. {"CI":"1"}). Merged with the terminal\'s base execution environment.',
     ),
   output_head: z.coerce
     .number()

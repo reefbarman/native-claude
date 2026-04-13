@@ -1,4 +1,5 @@
 import { useState } from "preact/hooks";
+import { summarizeTextForPreview } from "../../../shared/textSummary";
 import { StreamingText } from "./StreamingText";
 
 interface BgAgentResultBlockProps {
@@ -6,6 +7,7 @@ interface BgAgentResultBlockProps {
   task: string;
   status: "completed" | "error" | "cancelled";
   resultText?: string;
+  summary?: string;
   onOpenTranscript?: (sessionId: string) => void;
 }
 
@@ -14,6 +16,7 @@ export function BgAgentResultBlock({
   task,
   status,
   resultText,
+  summary,
   onOpenTranscript,
 }: BgAgentResultBlockProps) {
   const [expanded, setExpanded] = useState(false);
@@ -39,11 +42,14 @@ export function BgAgentResultBlock({
         ? "failed"
         : "cancelled";
 
-  const preview =
-    !expanded && resultText
-      ? resultText.replace(/\s+/g, " ").trim().slice(0, 160) +
-        (resultText.length > 160 ? "…" : "")
-      : null;
+  const preview = !expanded
+    ? summary?.trim() ||
+      summarizeTextForPreview(resultText, {
+        maxLength: 220,
+        minSentenceLength: 20,
+      }) ||
+      null
+    : null;
 
   return (
     <div class={`tool-call-block ${statusClass}`}>

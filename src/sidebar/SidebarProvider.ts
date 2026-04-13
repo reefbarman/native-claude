@@ -220,21 +220,31 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
             .update("autoUpdateHooks", true, vscode.ConfigurationTarget.Global);
           break;
         case "resetWriteApproval":
+          // Reset both legacy and agent write approval tracks so sidebar control
+          // remains authoritative regardless of which track was previously used.
           this.approvalManager?.resetWriteApproval();
+          this.approvalManager?.resetAgentWriteApproval();
           break;
         case "setWriteApproval":
           if (this.approvalManager && message.mode) {
             const mode = message.mode as string;
-            // Reset everything first, then set the new level
+            // Reset everything first, then set the new level.
+            // Keep legacy + agent tracks in sync for compatibility.
             this.approvalManager.resetWriteApproval();
+            this.approvalManager.resetAgentWriteApproval();
             if (mode !== "prompt") {
               // For session scope, approve all active sessions
               if (mode === "session") {
                 for (const s of this.approvalManager.getActiveSessions()) {
                   this.approvalManager.setWriteApproval(s.id, "session");
+                  this.approvalManager.setAgentWriteApproval(s.id, "session");
                 }
               } else {
                 this.approvalManager.setWriteApproval(
+                  "_sidebar",
+                  mode as "project" | "global",
+                );
+                this.approvalManager.setAgentWriteApproval(
                   "_sidebar",
                   mode as "project" | "global",
                 );
@@ -550,11 +560,25 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
     if (this.approvalManager) {
       const sessions = this.approvalManager.getActiveSessions();
-      // Show the "best" write approval state across all sessions
-      const writeState = this.approvalManager.getWriteApprovalState("_none");
-      if (writeState === "global" || writeState === "project") {
-        this.state.writeApproval = writeState;
-      } else if (sessions.some((s) => s.writeApproved)) {
+      // Show the "best" write approval state across all sessions.
+      // Consider both legacy write approval and agent write approval tracks.
+      const agentWriteState =
+        this.approvalManager.getAgentWriteApprovalState("_none");
+      const legacyWriteState =
+        this.approvalManager.getWriteApprovalState("_none");
+      if (
+        agentWriteState === "global" ||
+        agentWriteState === "project" ||
+        legacyWriteState === "global" ||
+        legacyWriteState === "project"
+      ) {
+        this.state.writeApproval =
+          agentWriteState === "global" || legacyWriteState === "global"
+            ? "global"
+            : "project";
+      } else if (
+        sessions.some((s) => s.writeApproved || s.agentWriteApproved)
+      ) {
         this.state.writeApproval = "session";
       } else {
         this.state.writeApproval = "prompt";
@@ -579,6 +603,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         return {
           id: s.id,
           writeApproved: s.writeApproved,
+          agentWriteApproved: s.agentWriteApproved,
           commandRules: this.approvalManager!.getCommandRules(s.id).session,
           pathRules: this.approvalManager!.getPathRules(s.id).session,
           writeRules: this.approvalManager!.getWriteRules(s.id).session,

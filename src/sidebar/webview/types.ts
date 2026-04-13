@@ -16,6 +16,7 @@ export interface PathRule {
 export interface SessionInfo {
   id: string;
   writeApproved: boolean;
+  agentWriteApproved?: boolean;
   commandRules: CommandRule[];
   pathRules: PathRule[];
   writeRules: PathRule[];

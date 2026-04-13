@@ -37,15 +37,13 @@ if [[ "$tool_name" =~ $file_tools_re ]]; then
   fi
 fi
 
-# Allow Read for non-text file types that agentlink can't handle
-# (images, PDFs, notebooks — Claude's built-in Read handles these natively)
+# Allow Read only for non-text file types that read_file still does not handle
+# (PDFs and notebooks — use read_file for local image files)
 if [ "$tool_name" = "Read" ]; then
   file_path=$(echo "$input" | jq -r '.tool_input.file_path // ""')
   ext="${file_path##*.}"
   ext_lower=$(echo "$ext" | tr '[:upper:]' '[:lower:]')
   case "$ext_lower" in
-    # Images (Claude is multimodal — built-in Read displays these visually)
-    png|jpg|jpeg|gif|bmp|svg|webp|ico|tiff|tif|avif)  exit 0 ;;
     # PDFs (built-in Read supports pages parameter)
     pdf)  exit 0 ;;
     # Jupyter notebooks (built-in Read renders cells + outputs)
