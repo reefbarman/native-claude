@@ -963,6 +963,24 @@ describe("AgentEngine", () => {
         // 503 errors use the longer rate-limit backoff (15s per attempt)
         expect(warnings[0]?.message).toContain("retrying in 15s");
         expect(warnings[1]?.message).toContain("retrying in 30s");
+        expect(warnings[0]).toMatchObject({
+          type: "warning",
+          retryDelayMs: 15_000,
+          retryAttempt: 1,
+          retryMaxAttempts: 3,
+        });
+        expect(warnings[1]).toMatchObject({
+          type: "warning",
+          retryDelayMs: 30_000,
+          retryAttempt: 2,
+          retryMaxAttempts: 3,
+        });
+        expect((warnings[0] as { retryAt?: number }).retryAt).toBeTypeOf(
+          "number",
+        );
+        expect((warnings[1] as { retryAt?: number }).retryAt).toBeTypeOf(
+          "number",
+        );
         // Should recover successfully
         expect(events.find((e) => e.type === "error")).toBeUndefined();
       } finally {

@@ -837,7 +837,8 @@ export function activate(context: vscode.ExtensionContext): void {
     mcpHub: chatViewProvider.getMcpHub(),
     onModeSwitch: (mode, reason) =>
       chatViewProvider.handleModeSwitch(mode, reason),
-    onApprovalRequest: (request) => chatViewProvider.requestApproval(request),
+    onApprovalRequest: (request, sessionId) =>
+      chatViewProvider.requestApproval(request, sessionId),
     onQuestion: (questions, sessionId) =>
       chatViewProvider.requestQuestion(questions, sessionId),
     onFileRead: (filePath) => {

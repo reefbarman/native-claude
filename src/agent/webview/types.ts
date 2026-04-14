@@ -175,6 +175,10 @@ export type ExtensionMessage =
       type: "agentWarning";
       sessionId: string;
       message: string;
+      retryDelayMs?: number;
+      retryAt?: number;
+      retryAttempt?: number;
+      retryMaxAttempts?: number;
     }
   | {
       type: "agentStatusUpdate";
@@ -602,6 +606,12 @@ export interface ChatMessage {
   };
   /** Set when role === "warning" */
   warningMessage?: string;
+  warningRetry?: {
+    retryDelayMs?: number;
+    retryAt?: number;
+    retryAttempt?: number;
+    retryMaxAttempts?: number;
+  };
 }
 
 export interface TodoItem {

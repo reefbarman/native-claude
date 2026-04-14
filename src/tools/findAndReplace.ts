@@ -300,15 +300,18 @@ export async function handleFindAndReplace(
               `${f.path} (${f.changes} change${f.changes !== 1 ? "s" : ""})`,
           )
           .join("\n");
-        const decision = await onApprovalRequest({
-          kind: "rename",
-          title: `Replace \`${findStr}\` → \`${replaceStr}\`?`,
-          detail: `${totalChanges} match${totalChanges !== 1 ? "es" : ""} across ${filesPreview.length} file${filesPreview.length !== 1 ? "s" : ""}:\n${filesDetail}`,
-          choices: [
-            { label: "Accept all", value: "accept", isPrimary: true },
-            { label: "Reject", value: "reject", isDanger: true },
-          ],
-        });
+        const decision = await onApprovalRequest(
+          {
+            kind: "rename",
+            title: `Replace \`${findStr}\` → \`${replaceStr}\`?`,
+            detail: `${totalChanges} match${totalChanges !== 1 ? "es" : ""} across ${filesPreview.length} file${filesPreview.length !== 1 ? "s" : ""}:\n${filesDetail}`,
+            choices: [
+              { label: "Accept all", value: "accept", isPrimary: true },
+              { label: "Reject", value: "reject", isDanger: true },
+            ],
+          },
+          sessionId,
+        );
         if (decision === "reject") {
           previewPanel.close();
           previewPanel = undefined;

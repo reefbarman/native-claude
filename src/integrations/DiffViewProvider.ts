@@ -316,6 +316,7 @@ export class DiffViewProvider {
   async waitForUserDecision(
     approvalPanel: ApprovalPanelProvider,
     onApprovalRequest?: OnApprovalRequest,
+    sessionId?: string,
   ): Promise<DiffDecision> {
     // Track UI elements for cleanup — when the decision comes from outside
     // the panel/QuickPick (title bar buttons, editor close), the UI
@@ -371,11 +372,14 @@ export class DiffViewProvider {
         if (onApprovalRequest) {
           // Inline chat approval — show rich WriteCard in the webview
           const operation = this.editType === "create" ? "Create" : "Modify";
-          onApprovalRequest({
-            kind: "write",
-            title: `${operation} \`${this.relPath}\`?`,
-            choices: [],
-          }).then((raw) => {
+          onApprovalRequest(
+            {
+              kind: "write",
+              title: `${operation} \`${this.relPath}\`?`,
+              choices: [],
+            },
+            sessionId,
+          ).then((raw) => {
             if (resolved) return;
             // Extract decision from the rich response
             const decision = typeof raw === "string" ? raw : raw.decision;

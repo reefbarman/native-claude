@@ -108,15 +108,18 @@ export async function handleRenameSymbol(
               `${f.path} (${f.changes} change${f.changes !== 1 ? "s" : ""})`,
           )
           .join("\n");
-        const result = await onApprovalRequest({
-          kind: "rename",
-          title: `Rename \`${oldName}\` → \`${params.new_name}\`?`,
-          detail: `${totalChanges} change${totalChanges !== 1 ? "s" : ""} across ${filesPreview.length} file${filesPreview.length !== 1 ? "s" : ""}:\n${filesDetail}`,
-          choices: [
-            { label: "Accept", value: "accept", isPrimary: true },
-            { label: "Reject", value: "reject", isDanger: true },
-          ],
-        });
+        const result = await onApprovalRequest(
+          {
+            kind: "rename",
+            title: `Rename \`${oldName}\` → \`${params.new_name}\`?`,
+            detail: `${totalChanges} change${totalChanges !== 1 ? "s" : ""} across ${filesPreview.length} file${filesPreview.length !== 1 ? "s" : ""}:\n${filesDetail}`,
+            choices: [
+              { label: "Accept", value: "accept", isPrimary: true },
+              { label: "Reject", value: "reject", isDanger: true },
+            ],
+          },
+          sessionId,
+        );
         decision = typeof result === "string" ? result : result.decision;
         if (decision === "reject") {
           return {

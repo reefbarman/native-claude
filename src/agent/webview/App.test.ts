@@ -338,6 +338,29 @@ describe("webview App reducer background agent launch blocks", () => {
     ]);
   });
 
+  it("stores retry metadata on warning messages when provided", () => {
+    const retryAt = Date.now() + 2_000;
+    const state = reducer(initialState, {
+      type: "ADD_WARNING",
+      message:
+        "Codex API error unknown: Request timed out. — retrying in 2s (attempt 1/3)",
+      retryDelayMs: 2_000,
+      retryAt,
+      retryAttempt: 1,
+      retryMaxAttempts: 3,
+    });
+
+    const warning = state.messages[state.messages.length - 1];
+    expect(warning?.role).toBe("warning");
+    expect(warning?.warningMessage).toContain("retrying in 2s");
+    expect(warning?.warningRetry).toEqual({
+      retryDelayMs: 2_000,
+      retryAt,
+      retryAttempt: 1,
+      retryMaxAttempts: 3,
+    });
+  });
+
   it("maps checkpoint turn indices to the preceding user message", () => {
     let state = reducer(initialState, {
       type: "ADD_USER_MESSAGE",

@@ -28,7 +28,10 @@ export interface InlineApprovalRequest {
  * Function type for requesting inline approval.
  * Returns either a selected choice value or a rich decision payload.
  */
-export type OnApprovalRequest = (request: InlineApprovalRequest) => Promise<
+export type OnApprovalRequest = (
+  request: InlineApprovalRequest,
+  sessionId?: string,
+) => Promise<
   | string
   | {
       decision: string;

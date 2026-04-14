@@ -239,6 +239,10 @@ export type ExtensionToWebview =
       type: "agentWarning";
       sessionId: string;
       message: string;
+      retryDelayMs?: number;
+      retryAt?: number;
+      retryAttempt?: number;
+      retryMaxAttempts?: number;
     }
   | {
       type: "agentStatusUpdate";
@@ -517,6 +521,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     string,
     { resolve: (values: Record<string, unknown>) => void; cancel: () => void }
   >();
+  /** Tracks which pending-elicitation IDs belong to each session, for scoped cancellation on stop */
+  private elicitationSessionIndex = new Map<string, Set<string>>();
   private pendingApprovals = new Map<
     string,
     (
@@ -611,6 +617,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.mcpHub.onElicitation = (request, resolve, cancel) => {
       const id = `elicit_${Date.now()}_${Math.random().toString(36).slice(2)}`;
       this.pendingElicitations.set(id, { resolve, cancel });
+      // Best-effort attribution: MCP elicitation callbacks do not currently carry
+      // agent session context, so we associate with the foreground session.
+      // If background MCP tool calls start elicitation, precise attribution will
+      // require threading sessionId through McpClientHub.onElicitation.
+      const sessionId = this.sessionManager?.getForegroundSession()?.id;
+      if (sessionId) {
+        const sessionSet =
+          this.elicitationSessionIndex.get(sessionId) ?? new Set();
+        sessionSet.add(id);
+        this.elicitationSessionIndex.set(sessionId, sessionSet);
+      }
       this.postMessage({
         type: "agentElicitationRequest",
         id,
@@ -651,6 +668,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       cancel();
     }
     this.pendingElicitations.clear();
+    this.elicitationSessionIndex.clear();
 
     this.outputChannel.dispose();
     this.specialBlockPanel?.dispose();
@@ -882,19 +900,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * CommandCard, McpCard, ModeSwitchCard) with follow-up input and
    * rejection reasons.
    */
-  public requestApproval(request: {
-    kind: "mcp" | "write" | "rename" | "command" | "mode-switch";
-    title: string;
-    detail?: string;
-    choices: Array<{
-      label: string;
-      value: string;
-      isPrimary?: boolean;
-      isDanger?: boolean;
-    }>;
-    id?: string;
-    backgroundTask?: string;
-  }): Promise<
+  public requestApproval(
+    request: {
+      kind: "mcp" | "write" | "rename" | "command" | "mode-switch";
+      title: string;
+      detail?: string;
+      choices: Array<{
+        label: string;
+        value: string;
+        isPrimary?: boolean;
+        isDanger?: boolean;
+      }>;
+      id?: string;
+      backgroundTask?: string;
+    },
+    sessionId?: string,
+  ): Promise<
     | string
     | {
         decision: string;
@@ -910,8 +931,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // Build an ApprovalRequest for the rich card system
     const approvalRequest = this.buildApprovalRequest(id, request);
 
+    if (sessionId) {
+      const sessionSet = this.approvalSessionIndex.get(sessionId) ?? new Set();
+      sessionSet.add(id);
+      this.approvalSessionIndex.set(sessionId, sessionSet);
+    }
+
     return new Promise((resolve) => {
-      this.pendingApprovals.set(id, resolve);
+      this.pendingApprovals.set(id, (result) => {
+        if (sessionId) {
+          this.approvalSessionIndex.get(sessionId)?.delete(id);
+        }
+        resolve(result);
+      });
       this.postMessage({
         type: "showApproval",
         request: approvalRequest,
@@ -1412,6 +1444,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             }
             this.questionSessionIndex.delete(sessionId);
           }
+
+          // Reject only the pending approvals belonging to this session.
+          const approvalIds = this.approvalSessionIndex.get(sessionId);
+          if (approvalIds) {
+            for (const id of approvalIds) {
+              const resolve = this.pendingApprovals.get(id);
+              if (resolve) {
+                this.pendingApprovals.delete(id);
+                resolve("reject");
+              }
+            }
+            this.approvalSessionIndex.delete(sessionId);
+          }
+
+          // Cancel only the pending elicitation prompts belonging to this session.
+          const elicitationIds = this.elicitationSessionIndex.get(sessionId);
+          if (elicitationIds) {
+            for (const id of elicitationIds) {
+              const pending = this.pendingElicitations.get(id);
+              if (pending) {
+                this.pendingElicitations.delete(id);
+                pending.cancel();
+              }
+            }
+            this.elicitationSessionIndex.delete(sessionId);
+          }
           // Immediately notify the webview so it exits streaming state
           this.postMessage({
             type: "agentDone",
@@ -1618,6 +1676,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const pending = this.pendingElicitations.get(id);
         if (!pending) break;
         this.pendingElicitations.delete(id);
+        for (const ids of this.elicitationSessionIndex.values()) {
+          ids.delete(id);
+        }
         if (msg.cancelled) {
           pending.cancel();
         } else {
@@ -2356,6 +2417,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           type: "agentWarning",
           sessionId,
           message: event.message,
+          retryDelayMs: event.retryDelayMs,
+          retryAt: event.retryAt,
+          retryAttempt: event.retryAttempt,
+          retryMaxAttempts: event.retryMaxAttempts,
         });
         break;
 

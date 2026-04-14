@@ -136,7 +136,14 @@ export type AgentEvent =
       storeResponseState?: boolean;
       providerResponseId?: string;
     }
-  | { type: "warning"; message: string }
+  | {
+      type: "warning";
+      message: string;
+      retryDelayMs?: number;
+      retryAt?: number;
+      retryAttempt?: number;
+      retryMaxAttempts?: number;
+    }
   | { type: "status_update"; message: string }
   | {
       type: "error";

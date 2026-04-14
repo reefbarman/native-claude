@@ -623,35 +623,38 @@ export async function dispatchToolCall(
       const configPaths = getMcpConfigFilePaths(cwd);
 
       if (onApprovalRequest) {
-        const raw = await onApprovalRequest({
-          kind: "mcp",
-          title: `Allow MCP tool "${bareToolName}" from "${serverName}"?`,
-          detail: inputPreview,
-          choices: [
-            { label: "Allow once", value: "allow-once", isPrimary: true },
-            {
-              label: "Always allow tool (session)",
-              value: "always-tool-session",
-            },
-            {
-              label: "Always allow tool (project)",
-              value: "always-tool-project",
-            },
-            {
-              label: "Always allow tool (global)",
-              value: "always-tool-global",
-            },
-            {
-              label: `Always allow ${serverName} (project)`,
-              value: "always-server-project",
-            },
-            {
-              label: `Always allow ${serverName} (global)`,
-              value: "always-server-global",
-            },
-            { label: "Deny", value: "deny", isDanger: true },
-          ],
-        });
+        const raw = await onApprovalRequest(
+          {
+            kind: "mcp",
+            title: `Allow MCP tool "${bareToolName}" from "${serverName}"?`,
+            detail: inputPreview,
+            choices: [
+              { label: "Allow once", value: "allow-once", isPrimary: true },
+              {
+                label: "Always allow tool (session)",
+                value: "always-tool-session",
+              },
+              {
+                label: "Always allow tool (project)",
+                value: "always-tool-project",
+              },
+              {
+                label: "Always allow tool (global)",
+                value: "always-tool-global",
+              },
+              {
+                label: `Always allow ${serverName} (project)`,
+                value: "always-server-project",
+              },
+              {
+                label: `Always allow ${serverName} (global)`,
+                value: "always-server-global",
+              },
+              { label: "Deny", value: "deny", isDanger: true },
+            ],
+          },
+          sessionId,
+        );
         choice = typeof raw === "string" ? raw : raw.decision;
       } else {
         // Fallback VS Code modal (no inline card available)

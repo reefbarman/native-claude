@@ -848,6 +848,7 @@ export async function handleApplyDiff(
       const decision = await diffView.waitForUserDecision(
         approvalPanel,
         onApprovalRequest,
+        sessionId,
       );
 
       if (decision === "reject") {

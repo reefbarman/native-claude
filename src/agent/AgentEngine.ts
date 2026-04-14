@@ -956,9 +956,14 @@ export class AgentEngine {
             const delayMs = isRateLimit
               ? Math.min(retryCount * 15_000, 60_000)
               : Math.min(retryCount * 2_000, 10_000);
+            const retryAt = Date.now() + delayMs;
             yield {
               type: "warning",
               message: `${streamErrMsg} — retrying in ${delayMs / 1000}s (attempt ${retryCount}/${MAX_API_RETRIES})`,
+              retryDelayMs: delayMs,
+              retryAt,
+              retryAttempt: retryCount,
+              retryMaxAttempts: MAX_API_RETRIES,
             };
             await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
             if (signal.aborted) break;

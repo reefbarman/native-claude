@@ -245,7 +245,14 @@ type AppAction =
         condense?: boolean;
       };
     }
-  | { type: "ADD_WARNING"; message: string }
+  | {
+      type: "ADD_WARNING";
+      message: string;
+      retryDelayMs?: number;
+      retryAt?: number;
+      retryAttempt?: number;
+      retryMaxAttempts?: number;
+    }
   | { type: "SET_STATUS_OVERRIDE"; message: string | null }
   | { type: "SET_RESTORING_SESSION"; restoring: boolean }
   | {
@@ -1360,6 +1367,18 @@ export function reducer(state: AppState, action: AppAction): AppState {
             timestamp: Date.now(),
             blocks: [],
             warningMessage: action.message,
+            warningRetry:
+              action.retryDelayMs !== undefined ||
+              action.retryAt !== undefined ||
+              action.retryAttempt !== undefined ||
+              action.retryMaxAttempts !== undefined
+                ? {
+                    retryDelayMs: action.retryDelayMs,
+                    retryAt: action.retryAt,
+                    retryAttempt: action.retryAttempt,
+                    retryMaxAttempts: action.retryMaxAttempts,
+                  }
+                : undefined,
           },
         ],
       };
@@ -1974,6 +1993,10 @@ export function App({ vscodeApi }: { vscodeApi: VsCodeApi }) {
           dispatch({
             type: "ADD_WARNING",
             message: msg.message,
+            retryDelayMs: msg.retryDelayMs,
+            retryAt: msg.retryAt,
+            retryAttempt: msg.retryAttempt,
+            retryMaxAttempts: msg.retryMaxAttempts,
           });
           break;
 
