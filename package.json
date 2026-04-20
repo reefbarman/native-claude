@@ -2,7 +2,7 @@
   "name": "agentlink",
   "displayName": "AgentLink",
   "description": "MCP server that provides AI agents with native VS Code tools — diff-based file editing, integrated terminal, diagnostics",
-  "version": "1.10.15",
+  "version": "1.10.20",
   "publisher": "agentlink",
   "repository": {
     "type": "git",
@@ -243,10 +243,8 @@
               "codex"
             ]
           },
-          "default": [
-            "claude-code"
-          ],
-          "description": "Which AI agents to auto-configure MCP for. Each agent's config file is written on server start and cleaned up on stop."
+          "default": [],
+          "description": "Which AI agents to auto-configure MCP for. Leave empty to use only the built-in AgentLink agent. Each selected agent's config file is written on server start and cleaned up on stop."
         },
         "agentlink.autoUpdateInstructions": {
           "type": "boolean",

@@ -4,6 +4,10 @@
     {
       "pattern": "npm run lint",
       "mode": "prefix"
+    },
+    {
+      "pattern": "npm test",
+      "mode": "prefix"
     }
   ]
 }

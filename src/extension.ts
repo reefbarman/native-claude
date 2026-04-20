@@ -169,7 +169,11 @@ function readPortFromMcpJson(): number | undefined {
 }
 
 function getConfiguredAgentIds(): string[] {
-  return getConfig<string[]>("agents") ?? ["claude-code"];
+  return getConfig<string[]>("agents") ?? [];
+}
+
+function hasHookConfiguredAgent(agentIds: string[]): boolean {
+  return agentIds.some((id) => getAgentById(id)?.supportsHooks);
 }
 
 function updateAllAgentConfigs(port: number, authToken?: string): boolean {
@@ -340,7 +344,10 @@ async function startServer(context: vscode.ExtensionContext): Promise<void> {
         silent: true,
       });
     }
-    if (getConfig<boolean>("autoUpdateHooks")) {
+    if (
+      getConfig<boolean>("autoUpdateHooks") &&
+      hasHookConfiguredAgent(agentIds)
+    ) {
       installHooks(context.extensionUri, log, { silent: true });
     }
   };
@@ -1100,7 +1107,10 @@ export function activate(context: vscode.ExtensionContext): void {
                 silent: true,
               });
             }
-            if (getConfig<boolean>("autoUpdateHooks")) {
+            if (
+              getConfig<boolean>("autoUpdateHooks") &&
+              hasHookConfiguredAgent(ids)
+            ) {
               installHooks(context.extensionUri, log, { silent: true });
             }
           }

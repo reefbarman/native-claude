@@ -1,7 +1,12 @@
-import * as vscode from "vscode";
 import * as os from "os";
 import * as path from "path";
-import { randomUUID } from "crypto";
+import * as vscode from "vscode";
+
+import type {
+  AgentInfo,
+  IndexStatusInfo,
+  SidebarState,
+} from "./webview/types.js";
 import type {
   ApprovalManager,
   RuleScope,
@@ -10,14 +15,11 @@ import type {
   ToolCallTracker,
   TrackedCallInfo,
 } from "../server/ToolCallTracker.js";
-import { readFeedback, deleteFeedback } from "../util/feedbackStore.js";
+import { deleteFeedback, readFeedback } from "../util/feedbackStore.js";
+import { getAgentById, matchClientName } from "../agents/registry.js";
+
 import { editRuleViaQuickPick } from "./editRuleQuickPick.js";
-import { matchClientName, getAgentById } from "../agents/registry.js";
-import type {
-  AgentInfo,
-  IndexStatusInfo,
-  SidebarState,
-} from "./webview/types.js";
+import { randomUUID } from "crypto";
 
 export type { AgentInfo, SidebarState };
 
@@ -196,7 +198,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           vscode.commands.executeCommand("agentlink.resetOnboarding");
           break;
         case "dismissOnboarding":
-          this.dismissOnboarding();
+          void this.useBuiltInAgentOnly().catch((err) => {
+            this.log(`Failed to switch to built-in agent only: ${String(err)}`);
+          });
           break;
         case "setupInstructions":
           vscode.commands.executeCommand(
@@ -703,6 +707,26 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     vscode.commands.executeCommand("agentlink.applyAgentConfig", {
       skipAutoUpdate: true,
     });
+  }
+
+  private async useBuiltInAgentOnly(): Promise<void> {
+    const config = vscode.workspace.getConfiguration("agentlink");
+    await config.update("agents", [], vscode.ConfigurationTarget.Global);
+    await config.update(
+      "autoUpdateInstructions",
+      false,
+      vscode.ConfigurationTarget.Global,
+    );
+    await config.update(
+      "autoUpdateHooks",
+      false,
+      vscode.ConfigurationTarget.Global,
+    );
+    await vscode.commands.executeCommand("agentlink.applyAgentConfig", {
+      skipAutoUpdate: true,
+    });
+    this.log("Configured AgentLink for built-in agent only");
+    this.dismissOnboarding();
   }
 
   private dismissOnboarding(): void {
